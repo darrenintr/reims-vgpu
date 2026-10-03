@@ -2881,9 +2881,10 @@ impl ObjectCaches {
             err
         })?[0];
         counters.note_create(CreateSite::GraphicsPipeline);
-        // A fresh pipeline compile grew the VkPipelineCache — persist it so
-        // the next boot warm-starts (file write is off-thread, debounced).
-        ctx.persist_pipeline_cache();
+        // A fresh pipeline compile grew the VkPipelineCache. Persisted from
+        // the maintenance heartbeat once compiles go quiet, not here: see
+        // `DeviceContext::note_pipeline_cache_grew`.
+        ctx.note_pipeline_cache_grew();
         crate::runtime::drain::note_tranche_since(
             crate::runtime::drain::TrancheCost::PipeCreate,
             create_started,
@@ -2991,7 +2992,7 @@ impl ObjectCaches {
         })?[0];
         counters.note_create(CreateSite::ComputePipeline);
         // Same warm-start persistence as the graphics path.
-        ctx.persist_pipeline_cache();
+        ctx.note_pipeline_cache_grew();
         crate::runtime::drain::note_tranche_since(
             crate::runtime::drain::TrancheCost::PipeCreate,
             create_started,

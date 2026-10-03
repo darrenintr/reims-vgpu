@@ -6136,6 +6136,9 @@ pub fn maintain_resources(now_ms: u64) {
     unsafe {
         pools.advance_registry_maintenance(ctx, counters, now_ms);
     }
+    // On the heartbeat rather than after each compile, so a burst of new
+    // pipelines serializes the cache once, after it, outside every tranche.
+    ctx.persist_pipeline_cache_when_quiet(now_ms);
 }
 
 /// Snapshot of create/alloc/hit-miss counters (for tests and thrash proxies).
