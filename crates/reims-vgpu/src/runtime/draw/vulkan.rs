@@ -1479,8 +1479,43 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         ));
                     }
                     note_mapper_ref_texture_sample_rung("t11rung_resident_refused", guest_write);
+                    // Reconcile the two halves in the resident when it can take
+                    // the guest's bytes as they are, and serve it: no readback,
+                    // no wait, and only the guest's pages move. A view that
+                    // remaps channels cannot bind the resident at all, so it
+                    // keeps the merge and the byte rungs below.
+                    if may_bind_resident {
+                        if let Some(ranges) = guest_owned {
+                            if overlay_guest_writes_onto_resident(
+                                state,
+                                host,
+                                mid,
+                                w,
+                                h,
+                                &resident_id,
+                                ranges,
+                            ) {
+                                let format = resident_id.resident_format();
+                                return Some((
+                                    w,
+                                    h,
+                                    mid,
+                                    SampledSourceRequest::Target(resident_id, format),
+                                ));
+                            }
+                        }
+                    }
                     match guest_owned {
                         Some(ranges) => {
+                            // Named pages inside the window are the evidence the
+                            // latch asks for; it decides whether this surface is
+                            // a presented framebuffer.
+                            crate::runtime::writeback_debt::note_guest_framebuffer_write(
+                                state,
+                                mid,
+                                crate::runtime::writeback_debt::FramebufferWriteWitness::SampledBind,
+                                |_| true,
+                            );
                             // The merge is what makes falling through sound: it
                             // puts the resident's half into every page the guest
                             // did not write, so the rungs below read a surface
@@ -8393,13 +8428,20 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         let resident_epoch =
                             crate::backend::vulkan::engine::resident_content_epoch(&identity);
                         let mapping_id = req.colors.first().map(|c| c.mapping_id).unwrap_or(0);
+                        let epoch_current =
+                            mapper_ref_texture_resident_is_current(mapping_epoch, resident_epoch);
                         let guest_wrote =
                             mapper_ref_texture_guest_wrote_since_store(state, host, mapping_id);
-                        (
-                            mapper_ref_texture_resident_is_current(mapping_epoch, resident_epoch)
-                                && !guest_wrote,
-                            guest_wrote,
-                        )
+                        // The resident is the surface apart from what the guest
+                        // CPU painted since: lay that over it and the LOAD needs
+                        // no seed, instead of paying the debt back into the pages
+                        // and uploading the whole surface from them.
+                        let reconciled = epoch_current
+                            && guest_wrote
+                            && reconcile_guest_writes_for_load(
+                                state, host, mapping_id, w, h, &identity,
+                            );
+                        (epoch_current && (!guest_wrote || reconciled), guest_wrote)
                     });
                 if resident_current {
                     chain_load_from_target = true;
@@ -8423,6 +8465,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         crate::runtime::drain::note_store_route(
                             "mapper_ref_texture_seed_guest_wrote",
                         );
+                        let mapping_id = req.colors.first().map(|c| c.mapping_id).unwrap_or(0);
+                        note_load_seed_guest_write(state, &*host, mapping_id, w, h);
                     }
                 }
             }
@@ -10156,6 +10200,35 @@ pub(super) fn mapper_ref_texture_guest_wrote_since_store<M: HostOps>(
     }
 }
 
+/// The attachment-LOAD witness for
+/// [`crate::runtime::writeback_debt::note_guest_framebuffer_write`]: this pass
+/// re-seeds a copied resident's surface from the guest's pages because
+/// [`mapper_ref_texture_guest_wrote_since_store`] refused it.
+///
+/// That gate is deliberately coarse — it refuses on a write anywhere in the
+/// allocation and on every answer that is not about the guest — so the write is
+/// narrowed to the attachment's pixels here, and only when the latch can still
+/// move.
+fn note_load_seed_guest_write<M: HostOps>(
+    state: &mut DeviceState,
+    host: &M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+) {
+    crate::runtime::writeback_debt::note_guest_framebuffer_write(
+        state,
+        mapping_id,
+        crate::runtime::writeback_debt::FramebufferWriteWitness::AttachmentLoad,
+        |s| {
+            matches!(
+                surface_currency(s, host, mapping_id, width, height),
+                SurfaceCurrency::WrotePixels(_)
+            )
+        },
+    );
+}
+
 /// Put both halves of a surface the guest wrote under a live resident into the
 /// guest's own pages, and withdraw the resident's claim to be the surface.
 ///
@@ -10236,6 +10309,192 @@ fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
     // recomputes; it is a parameter here because the readback needs it.
     crate::runtime::drain::note_store_route("t11sample_resident_merged");
     true
+}
+
+/// Whether a resident whose epoch still matches its surface can carry an
+/// attachment LOAD although the guest wrote the surface's allocation since.
+///
+/// The coarse witness moves for a write anywhere in the allocation, so it is
+/// narrowed to the pixel window first, under the strict standard a LOAD seed
+/// needs — a stale seed is held, because the pass composites onto it and its
+/// Store publishes the composite back over the guest's pages:
+///
+/// - written elsewhere (a header, a sibling plane, padding): the window's
+///   texels are the resident's; the stamp is left alone because other host
+///   copies of the allocation are not this caller's to vouch for;
+/// - written inside the window with named pages: those pages are laid over the
+///   resident ([`overlay_guest_writes_onto_resident`]), which re-takes the stamp;
+/// - anything the host cannot name: not current, and the seed reads the pages.
+fn reconcile_guest_writes_for_load<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+) -> bool {
+    if !resident_overlay_allowed() {
+        return false;
+    }
+    match surface_currency(state, host, mapping_id, width, height) {
+        SurfaceCurrency::WroteElsewhere => {
+            crate::runtime::drain::note_store_route("load_seed_guest_wrote_elsewhere");
+            true
+        }
+        SurfaceCurrency::WrotePixels(ranges) => {
+            let landed = overlay_guest_writes_onto_resident(
+                state, host, mapping_id, width, height, identity, &ranges,
+            );
+            if landed {
+                crate::runtime::drain::note_store_route("load_seed_overlaid");
+            }
+            landed
+        }
+        SurfaceCurrency::Unwritten(_) | SurfaceCurrency::WroteUnknown => false,
+    }
+}
+
+/// Whether [`overlay_guest_writes_onto_resident`] may run, as
+/// [`crate::config::RESIDENT_OVERLAY`] narrows it. Latched: the answer must not
+/// change between two binds of one surface.
+fn resident_overlay_allowed() -> bool {
+    static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        let narrowed = matches!(
+            crate::config::read(crate::config::RESIDENT_OVERLAY).0,
+            crate::config::Switch::Off
+        );
+        if narrowed {
+            crate::observe::off(format!(
+                "resident_overlay narrowed=1 var={} (guest writes under a live resident \
+                 take the whole-frame merge)",
+                crate::config::RESIDENT_OVERLAY
+            ));
+        }
+        !narrowed
+    })
+}
+
+/// Lay the pages the guest wrote under a live resident over that resident, on
+/// the GPU, and keep the resident as the surface.
+///
+/// The GPU-side twin of [`merge_guest_writes_into_pages`], with the same
+/// page-granular answer: every page the guest wrote comes from guest RAM, every
+/// other page from the resident. The merge builds that answer in the guest's
+/// pages — a whole-frame readback, a wait, a whole-frame scatter into guest RAM,
+/// and then a whole-frame upload for the draw — and this builds it in the
+/// resident by copying only the guest's pages in. See
+/// `engine::overlay_guest_bytes_onto_resident` for what that removed.
+///
+/// # What stays true afterwards
+///
+/// - The resident holds both halves, so the guest-write stamp is re-taken: the
+///   device has adopted the guest's stores, exactly as the merge's skipping
+///   write does.
+/// - The host byte cache does not hold them, so it is dropped — the stamp would
+///   otherwise vouch for it.
+/// - The mapping's content epoch does not move and no writeback debt is paid or
+///   superseded: the resident is still the surface it was, now with the guest's
+///   stores in it, and a later payment lands those unchanged.
+///
+/// Returns `false`, having changed nothing, whenever the copy cannot land the
+/// guest's bytes unconverted; the caller then merges as before.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the surface, its geometry, the resident, and the ranges the guest owns"
+)]
+fn overlay_guest_writes_onto_resident<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    guest_owned: &[(u64, u64)],
+) -> bool {
+    use crate::backend::vulkan::engine::{ResidentOverlay, ResidentOverlaySpan};
+    if !resident_overlay_allowed() {
+        return false;
+    }
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return false;
+    };
+    let Some((base_off, bpr, format)) = mapping_write::resident_gpu_plane(m, width, height) else {
+        crate::runtime::drain::note_store_route("resident_overlay_no_plane");
+        return false;
+    };
+    if format != pixel_format::MTL_FORMAT_BGRA8_UNORM
+        && format != pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB
+    {
+        crate::runtime::drain::note_store_route("resident_overlay_plane_not_bgra8");
+        return false;
+    }
+    if width == 0 || height == 0 {
+        return false;
+    }
+    let pitch = u64::from(bpr);
+    let extent_end = u64::from(height - 1) * pitch + u64::from(width) * u64::from(RGBA8_BPP);
+    let (spans, staged) = ResidentOverlaySpan::from_guest_owned(guest_owned, base_off, extent_end);
+    let _overlay_cost = OverlayCost(std::time::Instant::now());
+    // A GPU copy into guest pages still in flight would tear the read below.
+    crate::backend::vulkan::engine::quiesce_guest_writes();
+    let mut bytes = vec![0u8; staged as usize];
+    for span in &spans {
+        let lo = span.staged_offset as usize;
+        let hi = lo + (span.window_end - span.window_start) as usize;
+        if !crate::runtime::mapper::read_guest_owned_bytes(
+            state,
+            host,
+            mapping_id,
+            base_off + span.window_start,
+            &mut bytes[lo..hi],
+        ) {
+            crate::runtime::drain::note_store_route("resident_overlay_read_failed");
+            return false;
+        }
+    }
+    let overlay = ResidentOverlay {
+        bytes: &bytes,
+        spans: &spans,
+        pitch_bytes: pitch,
+        width,
+        height,
+    };
+    match crate::backend::vulkan::engine::overlay_guest_bytes_onto_resident(identity, &overlay) {
+        Ok(Ok(_regions)) => {}
+        Ok(Err(decline)) => {
+            crate::runtime::drain::note_store_route(decline.slug());
+            return false;
+        }
+        Err(e) => {
+            crate::observe::fail(format!(
+                "resident_overlay_fail mid={mapping_id} {width}x{height} spans={} bytes={} err={e:?}",
+                spans.len(),
+                bytes.len()
+            ));
+            return false;
+        }
+    }
+    crate::runtime::surface_cache::forget(state, mapping_id);
+    for &(start, end) in guest_owned {
+        state.invalidate_storage_residency_window(mapping_id, start, end);
+    }
+    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+    crate::runtime::drain::note_store_route("t11sample_resident_overlaid");
+    true
+}
+
+/// Charges an overlay's wall clock to the running tranche on every exit,
+/// including the declines that fall back to the merge.
+struct OverlayCost(std::time::Instant);
+
+impl Drop for OverlayCost {
+    fn drop(&mut self) {
+        crate::runtime::drain::note_tranche_since(
+            crate::runtime::drain::TrancheCost::Overlay,
+            self.0,
+        );
+    }
 }
 
 /// Census only: which rung of the backing sampled ladder served this bind, and,
@@ -12344,6 +12603,75 @@ mod vulkan_split_tests {
             .expect("the native row pitch describes this image");
         assert_eq!(seed.source.total_len, span);
         assert_eq!(seed.source.row_length_texels, row_length_texels);
+    }
+
+    /// The attachment LOAD latches the framebuffer copy only on a guest write
+    /// inside a presented surface's pixels.
+    ///
+    /// The LOAD gate it rides on refuses on far more than that — no stamp, an
+    /// unreadable token, a write anywhere in the allocation — and a latch that
+    /// took the gate's word would pay every presented surface at every swap for
+    /// the rest of the boot.
+    #[test]
+    fn a_load_seed_latches_the_framebuffer_copy_only_on_a_presented_surfaces_pixels() {
+        use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::runtime::host::HostOps;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let mid = 917u32;
+        let pfn = 0x2bu32;
+        let gpa = (pfn as u64) << PAGE_SHIFT_X86;
+        host.map_range(gpa, 0x4000, 0);
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).expect("mapped above");
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+            m.scanout_presented = true;
+        }
+        let (w, h) = (4u32, 2u32);
+        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+
+        // Never stamped: the gate refuses, and that says nothing about the guest.
+        note_load_seed_guest_write(&mut state, &host, mid, w, h);
+        assert!(
+            !state.guest_copies_framebuffers,
+            "an unstamped surface is not evidence of a guest write"
+        );
+
+        let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, mid)
+            .expect("FakeHost observes guest writes");
+        state
+            .mappings
+            .get_mut(&mid)
+            .expect("mapped above")
+            .guest_write_gen_at_store = host.guest_write_gen(token).expect("a live token has one");
+        host.guest_wrote_page(gpa);
+
+        state
+            .mappings
+            .get_mut(&mid)
+            .expect("mapped above")
+            .scanout_presented = false;
+        note_load_seed_guest_write(&mut state, &host, mid, w, h);
+        assert!(
+            !state.guest_copies_framebuffers,
+            "a surface no DisplaySwap presented is not one of WindowServer's framebuffers"
+        );
+
+        state
+            .mappings
+            .get_mut(&mid)
+            .expect("mapped above")
+            .scanout_presented = true;
+        note_load_seed_guest_write(&mut state, &host, mid, w, h);
+        assert!(
+            state.guest_copies_framebuffers,
+            "a guest write inside a presented framebuffer's pixels is the copy"
+        );
     }
 
     #[test]

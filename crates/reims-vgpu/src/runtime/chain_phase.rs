@@ -344,15 +344,41 @@ impl Drop for CostSpan {
     }
 }
 
+/// Charge `ns` to `phase`: into the window, and into the running drain
+/// tranche's anatomy under the column that names its lever.
+///
+/// The tranche keeps nine columns rather than seventeen. The carved-out spans
+/// are folded back into the bar they were carved from, except the two that are
+/// shader translation — those are the cost a first-seen pipeline adds, and a
+/// hitch line has to be able to say so.
+fn charge(phase: Phase, ns: u64) {
+    use crate::runtime::drain::TrancheCost as C;
+    ACC[phase as usize].fetch_add(ns, Ordering::Relaxed);
+    let cost = match phase {
+        Phase::Prep | Phase::PrepPages => return,
+        Phase::Pipeline | Phase::PipelineGen | Phase::PipelineDesc | Phase::PipelineMtlb => {
+            C::ChPipeline
+        }
+        Phase::PipelineAir => C::ChAir,
+        Phase::PipelineXlate => C::ChXlate,
+        Phase::Binds => C::ChBinds,
+        Phase::Sampled => C::ChSampled,
+        Phase::Seed => C::ChSeed,
+        Phase::Assemble | Phase::AssembleTarget | Phase::AssembleDepth | Phase::AssembleTrail => {
+            C::ChAssemble
+        }
+        Phase::Engine => C::ChEngine,
+        Phase::Store => C::ChStore,
+    };
+    crate::runtime::drain::note_tranche_cost(cost, ns);
+}
+
 /// Close the open phase and open `next`. Inert when no [`ChainTimer`] is live.
 pub fn enter(next: Phase) {
     OPEN.with(|open| {
         let now = Instant::now();
         if let Some((phase, since)) = open.get() {
-            ACC[phase as usize].fetch_add(
-                charge_ns(now.saturating_duration_since(since)),
-                Ordering::Relaxed,
-            );
+            charge(phase, charge_ns(now.saturating_duration_since(since)));
             open.set(Some((next, now)));
         }
     });
@@ -391,10 +417,7 @@ impl Drop for ChainTimer {
         let now = Instant::now();
         OPEN.with(|open| {
             if let Some((phase, since)) = open.get() {
-                ACC[phase as usize].fetch_add(
-                    charge_ns(now.saturating_duration_since(since)),
-                    Ordering::Relaxed,
-                );
+                charge(phase, charge_ns(now.saturating_duration_since(since)));
             }
             open.set(self.outer.map(|(phase, _)| (phase, now)));
         });

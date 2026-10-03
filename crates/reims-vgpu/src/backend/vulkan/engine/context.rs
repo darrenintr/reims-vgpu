@@ -111,6 +111,19 @@ const PIPELINE_CACHE_HEADER_ONE_LEN: usize = 32;
 /// costs more than that and reports nothing.
 const PIPELINE_CACHE_MAX_WARM_BYTES: usize = 8 * 1024 * 1024;
 
+/// How long compiles must stop before a grown pipeline cache is serialized.
+///
+/// Long enough that one animation's burst of first-seen pipelines is persisted
+/// once, after it, rather than once per pipeline inside it; short enough that a
+/// killed VM loses at most the last second's compiles to a cold start.
+const PIPELINE_CACHE_QUIET_MS: u64 = 1_000;
+
+/// Whether a cache that grew at `grew_at_ms` (`0`: has not grown) is due to be
+/// persisted at `now_ms`.
+fn pipeline_cache_persist_due(grew_at_ms: u64, now_ms: u64) -> bool {
+    grew_at_ms != 0 && now_ms.saturating_sub(grew_at_ms) >= PIPELINE_CACHE_QUIET_MS
+}
+
 /// The largest blob a single boot has been measured to settle at: 3.85 MB on
 /// macos-13, 3.4 MB on macos-15, rounded up to a whole MiB.
 ///
@@ -800,6 +813,10 @@ pub(crate) struct DeviceContext {
     /// Byte length of the last persisted cache blob — the growth debounce
     /// for [`Self::persist_pipeline_cache`].
     pub pipeline_cache_saved_len: AtomicUsize,
+    /// When a compile last grew the cache and nothing has persisted it since,
+    /// in [`crate::observe::elapsed_ms`]; `0` when the blob on disk is current.
+    /// See [`Self::note_pipeline_cache_grew`].
+    pub pipeline_cache_grew_at_ms: AtomicU64,
     /// `VK_KHR_swapchain` was enabled for the engine-owned host window.
     #[cfg(feature = "host-window")]
     pub swapchain: bool,
@@ -1481,18 +1498,61 @@ impl DeviceContext {
             queue_owner,
             pipeline_cache_path: Some(pipeline_cache_path),
             pipeline_cache_saved_len: AtomicUsize::new(initial_len),
+            pipeline_cache_grew_at_ms: AtomicU64::new(0),
             #[cfg(feature = "host-window")]
             swapchain,
         })
     }
 
+    /// A compile has grown the pipeline cache: persist it once compiles go quiet.
+    ///
+    /// # Why not persist here
+    ///
+    /// This used to call [`Self::persist_pipeline_cache`] directly, after every
+    /// compile. That serializes the **whole** cache — up to
+    /// [`PIPELINE_CACHE_MAX_WARM_BYTES`] through two `vkGetPipelineCacheData`
+    /// calls — on the drain worker, under the engine lock, once per miss. Misses
+    /// arrive in bursts exactly when an animation the guest has not shown before
+    /// starts (Mission Control, Launchpad, a first window open), so a burst of
+    /// N new pipelines paid N whole-cache serializations inside the very tranche
+    /// that was already the visible hitch. Only the last of them was ever needed:
+    /// each one supersedes the one before.
+    ///
+    /// So a compile only records the instant, and
+    /// [`Self::persist_pipeline_cache_when_quiet`] serializes once, from the
+    /// maintenance heartbeat, after [`PIPELINE_CACHE_QUIET_MS`] with no compile.
+    ///
+    /// # What it can cost
+    ///
+    /// Persisting is still not left to context destroy, for the reason the save
+    /// path gives: the testing boot SIGKILLs QEMU. The heartbeat ticks for the
+    /// life of the VM, so the only pipelines that miss the disk are ones compiled
+    /// within the quiet interval before a kill — a cold compile of those next
+    /// boot, never a wrong one.
+    pub(crate) fn note_pipeline_cache_grew(&self) {
+        let now = (crate::observe::elapsed_ms() as u64).max(1);
+        self.pipeline_cache_grew_at_ms.store(now, Ordering::Relaxed);
+    }
+
+    /// Persist the cache if a compile grew it and none has since for
+    /// [`PIPELINE_CACHE_QUIET_MS`]. Called from the maintenance heartbeat,
+    /// under the engine lock — the same lock every compile holds, so no compile
+    /// can land between the check and the serialize.
+    pub(crate) fn persist_pipeline_cache_when_quiet(&self, now_ms: u64) {
+        let grew_at = self.pipeline_cache_grew_at_ms.load(Ordering::Relaxed);
+        if !pipeline_cache_persist_due(grew_at, now_ms) {
+            return;
+        }
+        self.pipeline_cache_grew_at_ms.store(0, Ordering::Relaxed);
+        self.persist_pipeline_cache();
+    }
+
     /// Persist the pipeline cache to disk when it has grown since the last
-    /// save. Called after each actual pipeline creation (cache misses only —
-    /// warm hits never reach this). The serialize under the engine lock is a
-    /// memcpy; the filesystem work is handed to [`persist`], the process's one
-    /// persistence owner, so nothing on the draw path blocks on disk. Saving on
-    /// creation rather than at context destroy is deliberate: the testing boot
-    /// SIGKILLs QEMU, so destroy never runs there.
+    /// save. Reached from [`Self::persist_pipeline_cache_when_quiet`], never from
+    /// a compile; see [`Self::note_pipeline_cache_grew`] for why. The serialize
+    /// under the engine lock is a memcpy; the filesystem work is handed to
+    /// [`persist`], the process's one persistence owner, so nothing blocks on
+    /// disk.
     pub(crate) fn persist_pipeline_cache(&self) {
         let Some(path) = self.pipeline_cache_path.clone() else {
             return;
@@ -2634,6 +2694,35 @@ mod draw_span_probe_tests {
             u64::MAX,
             "64 valid bits must not shift out of range"
         );
+    }
+}
+
+/// A grown cache is persisted once compiles stop, not once per compile.
+#[cfg(test)]
+mod pipeline_cache_quiet_tests {
+    use super::*;
+
+    #[test]
+    fn a_cache_that_has_not_grown_is_never_due() {
+        assert!(!pipeline_cache_persist_due(0, 0));
+        assert!(!pipeline_cache_persist_due(0, u64::MAX));
+    }
+
+    #[test]
+    fn a_grown_cache_waits_for_compiles_to_go_quiet() {
+        let grew = 5_000;
+        assert!(!pipeline_cache_persist_due(grew, grew));
+        assert!(!pipeline_cache_persist_due(
+            grew,
+            grew + PIPELINE_CACHE_QUIET_MS - 1
+        ));
+        assert!(pipeline_cache_persist_due(
+            grew,
+            grew + PIPELINE_CACHE_QUIET_MS
+        ));
+        // A clock read before the compile's (another thread's earlier sample)
+        // is not a negative interval that wraps into "due".
+        assert!(!pipeline_cache_persist_due(grew, grew - 1));
     }
 }
 
