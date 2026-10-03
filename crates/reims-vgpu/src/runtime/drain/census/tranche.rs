@@ -47,6 +47,7 @@
 //! | `lock_wait` | the drain worker blocked on the engine lock (the window thread holds it) |
 //! | `debt_pay` | lazy-writeback payments: a resident's frame landing in guest pages |
 //! | `overlay` | guest CPU writes laid over a live resident |
+//! | `alloc` | `vkAllocateMemory` — new residents, staging and pool growth |
 //!
 //! `top_op`/`top_us` is the single most expensive packet of the tranche, so a
 //! line also says whether the time was one packet or spread over `packets`.
@@ -116,10 +117,11 @@ pub enum TrancheCost {
     LockWait,
     DebtPay,
     Overlay,
+    Alloc,
 }
 
 impl TrancheCost {
-    pub const COUNT: usize = TrancheCost::Overlay as usize + 1;
+    pub const COUNT: usize = TrancheCost::Alloc as usize + 1;
 
     pub const ALL: [TrancheCost; Self::COUNT] = [
         TrancheCost::Setup,
@@ -158,6 +160,7 @@ impl TrancheCost {
         TrancheCost::LockWait,
         TrancheCost::DebtPay,
         TrancheCost::Overlay,
+        TrancheCost::Alloc,
     ];
 
     /// The costs whose sum, with `other`, is `drain_us`.
@@ -213,6 +216,7 @@ impl TrancheCost {
             TrancheCost::LockWait => "lock_wait",
             TrancheCost::DebtPay => "debt_pay",
             TrancheCost::Overlay => "overlay",
+            TrancheCost::Alloc => "alloc",
         }
     }
 }
