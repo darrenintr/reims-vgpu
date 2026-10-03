@@ -22,6 +22,9 @@
 // here mentions a rail.
 use super::DISPLAY_VBL_MIN_INTERVAL_US;
 use crate::backend::{Backend as _, CensusSite};
+
+mod tranche;
+pub use tranche::{note_tranche_cost, note_tranche_since, TrancheCost};
 /// Delivered-VBL rate, reported from the branch that decides it.
 ///
 /// VBL is what paces the guest's compositor: WindowServer produces a frame off
@@ -2696,6 +2699,7 @@ static TRANCHE_START_US: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// Mark the start of a drain tranche, for [`tranche_elapsed_us`].
 pub fn note_tranche_started(now_us: u64) {
     TRANCHE_START_US.store(now_us, std::sync::atomic::Ordering::Relaxed);
+    tranche::tranche_begin();
 }
 
 /// How long the tranche now running has been running.
@@ -2746,21 +2750,26 @@ fn list_lookup_age_route(hit: bool, us: u64) -> &'static str {
 /// boundary, both inside `drain_us` and inside no [`DrainPhase`].
 pub fn note_drain_tail(tail_us: u64, boundary_us: u64) {
     DRAIN_DUTY.note_tail(tail_us, boundary_us);
+    note_tranche_cost(TrancheCost::Tail, tail_us.saturating_mul(1000));
+    note_tranche_cost(TrancheCost::Boundary, boundary_us.saturating_mul(1000));
 }
 
 /// Attribute one ring snapshot read, in nanoseconds.
 pub fn note_drain_ring(ns: u64) {
     DRAIN_DUTY.note_ring(ns);
+    note_tranche_cost(TrancheCost::Ring, ns);
 }
 
 /// Attribute one packet decode, in nanoseconds.
 pub fn note_drain_decode(ns: u64) {
     DRAIN_DUTY.note_decode(ns);
+    note_tranche_cost(TrancheCost::Decode, ns);
 }
 
 /// Attribute one `process_child_packet` dispatch, in nanoseconds, by opcode.
 pub fn note_drain_proc(opcode: u16, ns: u64) {
     DRAIN_DUTY.note_proc(opcode, ns);
+    tranche::note_tranche_packet(opcode, ns);
 }
 
 /// Attribute one span inside `process_exec_indirect2`, in nanoseconds.
@@ -2790,11 +2799,13 @@ pub fn note_preflight_pipe() {
 /// Attribute one access around a packet, in nanoseconds, by which one it was.
 pub fn note_drain_regs(op: RegsOp, ns: u64) {
     DRAIN_DUTY.note_regs(op, ns);
+    note_tranche_cost(TrancheCost::Regs, ns);
 }
 
 /// Attribute one `drain_child_fifo` prologue, in nanoseconds.
 pub fn note_drain_setup(ns: u64) {
     DRAIN_DUTY.note_setup(ns);
+    note_tranche_cost(TrancheCost::Setup, ns);
 }
 
 /// Accumulate one completed drain tranche; emits at most once per second.
@@ -2804,8 +2815,16 @@ pub fn note_drain_tranche(
     drain_us: u64,
     publish_us: u64,
 ) {
+    // Before the window can report, so the tranche that closes a window is
+    // among the ones that window's `drain_worst` chooses from.
+    tranche::tranche_end(drain_us, publish_us);
     if let Some(line) = DRAIN_DUTY.note(drain_us, publish_us, crate::observe::elapsed_ms() as u64) {
         crate::observe::off(line);
+        // Immediately after `drain_duty`, whose `max_tranche_us` it explains:
+        // its `total_us` is that figure, broken into what the tranche did.
+        if let Some(worst) = tranche::take_worst_tranche(DRAIN_DUTY.last_window_ms()) {
+            crate::observe::off(worst);
+        }
         // The rail this device is running on, asked four times below at the
         // points its lines have to be read from. Taken once so the four asks
         // cannot land on two different rails.
@@ -3065,12 +3084,31 @@ pub fn note_drain_exit(busy_end_us: u64, skipped: bool) {
 
 /// Attribute elapsed time since `started` to one phase of the current tranche.
 pub fn note_drain_phase(phase: DrainPhase, started: std::time::Instant) {
-    DRAIN_DUTY.note_phase(phase, started.elapsed().as_micros() as u64);
+    let elapsed = started.elapsed();
+    DRAIN_DUTY.note_phase(phase, elapsed.as_micros() as u64);
+    let cost = match phase {
+        DrainPhase::Draw => TrancheCost::Draw,
+        DrainPhase::Compute => TrancheCost::Compute,
+        DrainPhase::Flush(FlushRail::Render) => TrancheCost::FlushRender,
+        DrainPhase::Flush(FlushRail::Gva) => TrancheCost::FlushGva,
+        DrainPhase::Flush(FlushRail::Linear) => TrancheCost::FlushLinear,
+        DrainPhase::Flush(FlushRail::Storage) => TrancheCost::FlushStorage,
+    };
+    note_tranche_cost(cost, elapsed.as_nanos() as u64);
 }
 
 /// Attribute one slice of a render-rail flush to the part of it that was spent.
 pub fn note_readback_phase(phase: ReadbackPhase, us: u64) {
     DRAIN_DUTY.note_readback(phase, us);
+    let cost = match phase {
+        ReadbackPhase::Submit => TrancheCost::RbSubmit,
+        ReadbackPhase::Fence => TrancheCost::RbFence,
+        ReadbackPhase::Map => TrancheCost::RbMap,
+        ReadbackPhase::Write => TrancheCost::RbWrite,
+        ReadbackPhase::Vouch => TrancheCost::RbVouch,
+        ReadbackPhase::Resolve => TrancheCost::RbResolve,
+    };
+    note_tranche_cost(cost, us.saturating_mul(1000));
 }
 
 /// Record the two GPU-side spans of one readback command buffer, read from its
@@ -3085,6 +3123,8 @@ pub fn note_readback_phase(phase: ReadbackPhase, us: u64) {
 /// is involved and the subtraction is exact.
 pub fn note_readback_gpu_us(barrier_us: u64, copy_us: u64) {
     DRAIN_DUTY.note_readback_gpu(barrier_us, copy_us);
+    note_tranche_cost(TrancheCost::RbGpuBar, barrier_us.saturating_mul(1000));
+    note_tranche_cost(TrancheCost::RbGpuCopy, copy_us.saturating_mul(1000));
 }
 
 /// Count one guest-Store routing decision, by route name.

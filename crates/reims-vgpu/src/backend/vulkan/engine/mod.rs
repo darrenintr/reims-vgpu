@@ -1049,7 +1049,14 @@ fn lock_engine_at(site: EngineLockSite) -> EngineGuard {
         None => {
             let blocked_at = std::time::Instant::now();
             let guard = ENGINE.lock();
-            ENGINE_LOCK.note_wait(site, blocked_at.elapsed().as_micros() as u64);
+            let waited = blocked_at.elapsed();
+            ENGINE_LOCK.note_wait(site, waited.as_micros() as u64);
+            // Only the worker's wait belongs to a tranche; the ledger ignores a
+            // charge from any other thread, so this needs no site test.
+            crate::runtime::drain::note_tranche_cost(
+                crate::runtime::drain::TrancheCost::LockWait,
+                waited.as_nanos() as u64,
+            );
             guard
         }
     };

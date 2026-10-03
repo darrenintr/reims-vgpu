@@ -10435,6 +10435,7 @@ fn overlay_guest_writes_onto_resident<M: HostMemory + HostOps>(
     let pitch = u64::from(bpr);
     let extent_end = u64::from(height - 1) * pitch + u64::from(width) * u64::from(RGBA8_BPP);
     let (spans, staged) = ResidentOverlaySpan::from_guest_owned(guest_owned, base_off, extent_end);
+    let _overlay_cost = OverlayCost(std::time::Instant::now());
     // A GPU copy into guest pages still in flight would tear the read below.
     crate::backend::vulkan::engine::quiesce_guest_writes();
     let mut bytes = vec![0u8; staged as usize];
@@ -10481,6 +10482,19 @@ fn overlay_guest_writes_onto_resident<M: HostMemory + HostOps>(
     crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
     crate::runtime::drain::note_store_route("t11sample_resident_overlaid");
     true
+}
+
+/// Charges an overlay's wall clock to the running tranche on every exit,
+/// including the declines that fall back to the merge.
+struct OverlayCost(std::time::Instant);
+
+impl Drop for OverlayCost {
+    fn drop(&mut self) {
+        crate::runtime::drain::note_tranche_since(
+            crate::runtime::drain::TrancheCost::Overlay,
+            self.0,
+        );
+    }
 }
 
 /// Census only: which rung of the backing sampled ladder served this bind, and,

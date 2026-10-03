@@ -1464,27 +1464,34 @@ impl ResourcePools {
             ));
         }
         let fence = self.slots[index].fence;
-        ctx.device
-            .wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS)
-            .map_err(|e| {
-                // The wait that every macos-11 freeze lands in. Until now the
-                // failure said only that *a* wait timed out; this names the
-                // submission it timed out on, which is the question two
-                // sessions of switch-bisecting could not reach. Emitted before
-                // the error is mapped, because `wait_error` may turn it into a
-                // device loss and the teardown that follows clears the ring.
-                let held = match crate::runtime::gpu_hang_trail::submission(index) {
-                    Some(note) => format!("{note}"),
-                    None => "none (this slot's work was never recorded)".to_string(),
-                };
-                crate::observe::fail(format!(
-                    "vk_engine_fence_wedged slot={index} result={e:?} held={held}"
-                ));
-                if let Some(rest) = crate::runtime::gpu_hang_trail::outstanding() {
-                    crate::observe::fail(format!("vk_engine_fence_wedged_queue {rest}"));
-                }
-                Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesRetire)
-            })?;
+        let wait_started = std::time::Instant::now();
+        let waited = ctx.device.wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS);
+        // Charged to the tranche that blocked, success or not: a ring wait is
+        // the GPU still running work queued earlier, and a hitch line has to be
+        // able to tell that from host-side cost.
+        crate::runtime::drain::note_tranche_since(
+            crate::runtime::drain::TrancheCost::RingWait,
+            wait_started,
+        );
+        waited.map_err(|e| {
+            // The wait that every macos-11 freeze lands in. Until now the
+            // failure said only that *a* wait timed out; this names the
+            // submission it timed out on, which is the question two
+            // sessions of switch-bisecting could not reach. Emitted before
+            // the error is mapped, because `wait_error` may turn it into a
+            // device loss and the teardown that follows clears the ring.
+            let held = match crate::runtime::gpu_hang_trail::submission(index) {
+                Some(note) => format!("{note}"),
+                None => "none (this slot's work was never recorded)".to_string(),
+            };
+            crate::observe::fail(format!(
+                "vk_engine_fence_wedged slot={index} result={e:?} held={held}"
+            ));
+            if let Some(rest) = crate::runtime::gpu_hang_trail::outstanding() {
+                crate::observe::fail(format!("vk_engine_fence_wedged_queue {rest}"));
+            }
+            Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesRetire)
+        })?;
         ctx.device
             .reset_fences(&[fence])
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsResetFencesRetire, e)))?;
@@ -2150,9 +2157,13 @@ impl ResourcePools {
                 DeviceLostOp::PoolsWaitFencesEntry,
             ));
         }
-        ctx.device
-            .wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS)
-            .map_err(|e| Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesEntry))
+        let wait_started = std::time::Instant::now();
+        let waited = ctx.device.wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS);
+        crate::runtime::drain::note_tranche_since(
+            crate::runtime::drain::TrancheCost::EntryWait,
+            wait_started,
+        );
+        waited.map_err(|e| Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesEntry))
     }
 
     /// Record that the command buffer being built reads guest RAM when it

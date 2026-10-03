@@ -1774,14 +1774,20 @@ fn pay<M: HostMemory + HostOps>(
         return;
     }
     crate::runtime::drain::note_store_route(route);
-    if !rail.pay_surface_writeback(
+    let pay_started = std::time::Instant::now();
+    let paid = rail.pay_surface_writeback(
         state,
         host,
         mapping_id,
         &debt.target,
         debt.width,
         debt.height,
-    ) {
+    );
+    crate::runtime::drain::note_tranche_since(
+        crate::runtime::drain::TrancheCost::DebtPay,
+        pay_started,
+    );
+    if !paid {
         // The rail reports its own loss on the failure channel; this names the
         // rail that owed it, because a debt paid late and refused is a different
         // investigation from a Store refused where it was issued.
@@ -1885,10 +1891,26 @@ fn guest_owned_plane_ranges<B: crate::backend::Backend, M: HostOps>(
     Some(ranges)
 }
 
+/// [`pay_gva_untimed`], charged to the running tranche's `debt_pay` like a
+/// surface payment.
+fn pay_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
+    rail: B,
+    state: &mut DeviceState,
+    host: &mut M,
+    plane: GvaPlaneKey,
+    debt: GvaWritebackDebt,
+    site: GvaPaySite,
+) -> bool {
+    let started = std::time::Instant::now();
+    let paid = pay_gva_untimed(rail, state, host, plane, debt, site);
+    crate::runtime::drain::note_tranche_since(crate::runtime::drain::TrancheCost::DebtPay, started);
+    paid
+}
+
 /// Materialize one host-authoritative GVA resource into its retained transfer
 /// backing. After explicit discard, synchronize lazily recreates that backing;
 /// ordinary virtual-memory unmap does not participate in resource lifetime.
-fn pay_gva<B: crate::backend::Backend, M: HostMemory + HostOps>(
+fn pay_gva_untimed<B: crate::backend::Backend, M: HostMemory + HostOps>(
     rail: B,
     state: &mut DeviceState,
     host: &mut M,
