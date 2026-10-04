@@ -334,6 +334,28 @@ fn needs_present(presented: Option<u64>, redraw_required: bool, incoming: Option
     redraw_required || presented != incoming
 }
 
+/// Whether the next draw is owed whether or not the guest publishes a frame.
+///
+/// `needs_present` asks whether the guest has produced something new, and that is
+/// the wrong question for any outcome that is the *swapchain's* to resolve. A
+/// `Busy` present may be a rebuild armed by an out-of-date report, and an `Err`
+/// may be a rebuild that failed and is owed again; in both the guest can be
+/// perfectly quiet — a still desktop publishes nothing — and what is owed is a
+/// swapchain, not a frame. Leaving the answer to `last_presented_seq` made
+/// recovery depend on the guest happening to draw, which is how a window that
+/// failed to rebuild stayed black until something moved on screen.
+///
+/// So the owed redraw is a flag the outcome sets, and only a present that
+/// reached the screen without asking for another clears it. It is one-shot per
+/// draw and rides the redraw backstop, not an event: a presenter that stays
+/// busy is retried at the backstop's pace and never in a loop.
+fn redraw_owed_after<E>(result: &Result<WindowPresentOutcome, E>) -> bool {
+    match result {
+        Ok(WindowPresentOutcome::Presented { suboptimal, .. }) => *suboptimal,
+        Ok(WindowPresentOutcome::Busy) | Err(_) => true,
+    }
+}
+
 /// The absolute pointer event a window position becomes: `(x, y, width,
 /// height)` for [`HostAction::input_pointer_move`], whose consumer scales `x`
 /// against `width` (`min_in = 0`, `max_in = dim`).
@@ -786,6 +808,15 @@ struct App {
     pending_guest_resize: Option<PendingGuestResize>,
     /// What this event loop actually did, per second. See [`LoopCensus`].
     loop_census: LoopCensus,
+    /// The size of the last `Resized`, held until the next draw hands it to the
+    /// rail. A burst of resizes between two draws is one call against the last of
+    /// them, which is also one acquisition of the rail's lock instead of one per
+    /// event — the lock the drain holds for a whole render tranche. Cleared on
+    /// take, so an extent is never applied twice.
+    pending_resize: Option<(u32, u32)>,
+    /// The budget for naming resize, scale and occlusion events. See
+    /// [`crate::observe::LineBudget`].
+    event_trace: crate::observe::LineBudget,
 }
 
 /// How often the window's event loop looked for a guest frame, and what it
@@ -961,15 +992,26 @@ impl ApplicationHandler<FramePublished> for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                let applied = (size.width.max(1), size.height.max(1));
-                if self.presenter_attached {
-                    crate::backend::selected().window_resize(applied.0, applied.1);
-                    self.note_guest_resize_applied(applied);
+                self.trace_window_event("resized", format!("size={}x{}", size.width, size.height));
+                self.note_resized((size.width.max(1), size.height.max(1)));
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // No action of its own: the physical size it implies arrives as
+                // a `Resized`, which is what rebuilds anything. Named because
+                // the order the two arrive in is part of what a maximize does.
+                self.trace_window_event(
+                    "scale_factor_changed",
+                    format!("new_scale={scale_factor:.3}"),
+                );
+            }
+            WindowEvent::Occluded(occluded) => {
+                self.trace_window_event("occluded", format!("occluded={}", u8::from(occluded)));
+                if !occluded {
+                    // The window system may have dropped what was on screen
+                    // while it was hidden, and a still guest publishes nothing
+                    // to replace it.
+                    self.force_redraw();
                 }
-                // Fresh swapchain images hold nothing; the seq gate would
-                // otherwise skip until the guest happened to produce a new
-                // frame, leaving the resized window blank.
-                self.force_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
@@ -1150,6 +1192,8 @@ impl App {
             guest_extent: None,
             pending_guest_resize: None,
             loop_census: LoopCensus::new(),
+            pending_resize: None,
+            event_trace: crate::observe::LineBudget::new(std::time::Instant::now()),
         }
     }
 
@@ -1221,6 +1265,62 @@ impl App {
     fn force_redraw(&mut self) {
         self.redraw_required = true;
         self.frame_pending = true;
+    }
+
+    /// A `Resized` arrived: remember the size, settle any guest-driven resize it
+    /// answers, and make sure a draw carries it.
+    ///
+    /// The rail is told at the next draw and not here, which is what makes a
+    /// burst of events one call. The guest-resize hold is settled *here*, though:
+    /// `draw` holds while one is outstanding, so deferring its settlement to
+    /// `draw` would be waiting on itself.
+    fn note_resized(&mut self, applied: (u32, u32)) {
+        if self.presenter_attached {
+            self.pending_resize = Some(applied);
+            self.note_guest_resize_applied(applied);
+        }
+        // Fresh swapchain images hold nothing; the seq gate would otherwise skip
+        // until the guest happened to produce a new frame, leaving the resized
+        // window blank.
+        self.force_redraw();
+    }
+
+    /// The size to hand the rail, once per burst.
+    fn take_pending_resize(&mut self) -> Option<(u32, u32)> {
+        self.pending_resize.take()
+    }
+
+    /// Name a window-system event on the census channel, within the budget.
+    ///
+    /// Carries the window's own answers to "how big, how scaled, maximized" at
+    /// the moment the event is handled, because the event's payload alone does
+    /// not say whether it belongs to a maximize.
+    fn trace_window_event(&mut self, kind: &str, detail: String) {
+        let Some(suppressed) = self.event_trace.admit(std::time::Instant::now()) else {
+            return;
+        };
+        let state = self.window.as_ref().map_or_else(
+            || "window=none".to_string(),
+            |window| {
+                let inner = window.inner_size();
+                format!(
+                    "inner={}x{} maximized={} fullscreen={} scale={:.3}",
+                    inner.width,
+                    inner.height,
+                    u8::from(window.is_maximized()),
+                    u8::from(window.fullscreen().is_some()),
+                    window.scale_factor()
+                )
+            },
+        );
+        let gap = if suppressed == 0 {
+            String::new()
+        } else {
+            format!(" suppressed_before={suppressed}")
+        };
+        crate::observe::off(format!(
+            "host_window_event kind={kind} {detail} {state}{gap}"
+        ));
     }
 
     fn request_shutdown(&mut self) {
@@ -1384,6 +1484,9 @@ impl App {
         if !self.presenter_attached {
             return;
         }
+        if let Some((width, height)) = self.take_pending_resize() {
+            crate::backend::selected().window_resize(width, height);
+        }
         let frame = self.frames.lock().ok().and_then(|guard| guard.clone());
         self.request_guest_geometry(frame.as_deref());
         if self.pending_guest_resize.is_some() {
@@ -1406,6 +1509,10 @@ impl App {
             frame.as_ref().and_then(|frame| frame.resident.as_ref()),
             frame.as_deref().map(window_cpu_frame),
         );
+        // Set before the arms below, which may refine it: a present that is
+        // `Busy` or failed owes another draw whatever the guest publishes. See
+        // [`redraw_owed_after`].
+        self.redraw_required = redraw_owed_after(&result);
         match result {
             Ok(WindowPresentOutcome::Busy) => {}
             Ok(WindowPresentOutcome::Presented {
@@ -1750,6 +1857,185 @@ mod tests {
             needs_present(Some(7), true, Some(7)),
             "a resize must repaint the same frame into new swapchain images"
         );
+    }
+
+    /// Drive the window's own redraw bookkeeping through a present sequence, as
+    /// `draw` does: gate on `needs_present`, then take the owed flag from the
+    /// outcome. Returns the draws that reached the presenter.
+    fn drive(outcomes: &[Result<WindowPresentOutcome, ()>], guest_seq: Option<u64>) -> usize {
+        let mut last_presented = None;
+        let mut redraw_required = false;
+        let mut reached = 0;
+        for outcome in outcomes {
+            if !needs_present(last_presented, redraw_required, guest_seq) {
+                continue;
+            }
+            reached += 1;
+            redraw_required = redraw_owed_after(outcome);
+            if matches!(outcome, Ok(WindowPresentOutcome::Presented { .. })) {
+                last_presented = guest_seq;
+            }
+        }
+        reached
+    }
+
+    fn presented(suboptimal: bool) -> Result<WindowPresentOutcome, ()> {
+        Ok(WindowPresentOutcome::Presented {
+            direct: true,
+            width: 1,
+            height: 1,
+            buffers: 3,
+            suboptimal,
+        })
+    }
+
+    /// The recovery property: a rebuild that is owed is drawn again with the guest
+    /// completely quiet, however stale `last_presented_seq` is.
+    ///
+    /// The guest published frame 7, it was presented, and then nothing — a still
+    /// desktop. `last_presented_seq` equals the incoming seq for the rest of the
+    /// run, so the seq gate alone says "nothing new" on every redraw the backstop
+    /// asks for. A resize or an out-of-date report arms a rebuild; each outcome
+    /// below leaves it owed, and each must keep the next draw reaching the
+    /// presenter until one succeeds.
+    #[test]
+    fn an_owed_swapchain_is_retried_while_the_guest_is_quiet() {
+        let quiet = Some(7);
+        for (name, owed) in [
+            (
+                "busy: an out-of-date report armed a rebuild",
+                Ok(WindowPresentOutcome::Busy),
+            ),
+            ("a rebuild that failed", Err(())),
+        ] {
+            let mut sequence = vec![owed; 7];
+            sequence.push(presented(false));
+            sequence.push(presented(false));
+            let mut last_presented = Some(7);
+            let mut redraw_required = true;
+            let mut reached = 0;
+            for outcome in &sequence {
+                if !needs_present(last_presented, redraw_required, quiet) {
+                    continue;
+                }
+                reached += 1;
+                redraw_required = redraw_owed_after(outcome);
+                if matches!(outcome, Ok(WindowPresentOutcome::Presented { .. })) {
+                    last_presented = quiet;
+                }
+            }
+            assert_eq!(
+                reached, 8,
+                "{name}: seven owed ticks and the recovering present, then the \
+                 stale tick after it is skipped"
+            );
+        }
+    }
+
+    /// Without the owed flag the same sequence is skipped at the seq gate, which
+    /// is the defect: the outcome says a swapchain is owed and nothing acts on it.
+    #[test]
+    fn the_seq_gate_alone_would_have_stranded_the_rebuild() {
+        // What `draw` did before: `redraw_required` untouched by Busy and Err.
+        assert!(!needs_present(Some(7), false, Some(7)));
+        // What it does now.
+        let owed = redraw_owed_after::<()>(&Ok(WindowPresentOutcome::Busy));
+        assert!(needs_present(Some(7), owed, Some(7)));
+    }
+
+    /// A suboptimal present is an owed rebuild too, and buys exactly one more
+    /// draw — the property that keeps it from becoming a loop.
+    #[test]
+    fn a_suboptimal_present_owes_one_redraw_and_a_clean_one_clears_it() {
+        assert!(redraw_owed_after::<()>(&presented(true)));
+        assert!(!redraw_owed_after::<()>(&presented(false)));
+        assert_eq!(
+            drive(
+                &[presented(true), presented(false), presented(false)],
+                Some(3)
+            ),
+            2,
+            "the suboptimal present and the one redraw it bought, then quiet"
+        );
+    }
+
+    /// A healthy presenter against a quiet guest is never drawn again: the owed
+    /// flag is not a standing redraw.
+    #[test]
+    fn a_healthy_present_does_not_owe_a_redraw() {
+        assert!(!redraw_owed_after::<()>(&presented(false)));
+        let ticks = vec![presented(false); 50];
+        assert_eq!(drive(&ticks, Some(9)), 1);
+    }
+
+    fn app() -> App {
+        App::new(
+            WindowConfig {
+                title: String::new(),
+                width: 1280,
+                height: 800,
+                mode: WindowMode::Sized,
+            },
+            Arc::new(|_| {}),
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// A burst of `Resized` between two draws is one call against the last size.
+    ///
+    /// Event by event it was a call per event — dozens a second through a drag,
+    /// each one a rebuild armed against an extent the next event made obsolete.
+    #[test]
+    fn a_burst_of_resizes_reaches_the_rail_once_with_the_last_size() {
+        let mut app = app();
+        app.presenter_attached = true;
+        for step in 0..40u32 {
+            app.note_resized((900 + step, 600 + step));
+        }
+        assert_eq!(app.take_pending_resize(), Some((939, 639)));
+        assert_eq!(
+            app.take_pending_resize(),
+            None,
+            "an extent is applied once and not again"
+        );
+    }
+
+    /// Every `Resized` still forces a redraw: coalescing the call must not
+    /// coalesce away the repaint the fresh images need.
+    #[test]
+    fn a_resize_still_forces_a_redraw_without_a_new_frame() {
+        let mut app = app();
+        app.presenter_attached = true;
+        app.redraw_required = false;
+        app.frame_pending = false;
+        app.note_resized((1920, 1080));
+        assert!(app.redraw_required);
+        assert!(app.frame_pending);
+    }
+
+    /// With no presenter there is nothing to tell the rail, and a size is not
+    /// kept to be applied to one that appears later: attach reads the window.
+    #[test]
+    fn a_resize_before_attach_is_not_held_for_the_rail() {
+        let mut app = app();
+        app.note_resized((1920, 1080));
+        assert_eq!(app.take_pending_resize(), None);
+    }
+
+    /// The guest-driven resize hold is settled by the event, not by the draw:
+    /// `draw` holds while one is outstanding, so deferring the settlement to it
+    /// would wait on itself forever.
+    #[test]
+    fn a_resized_event_settles_the_guest_resize_hold_immediately() {
+        let mut app = app();
+        app.presenter_attached = true;
+        app.pending_guest_resize = Some(PendingGuestResize {
+            target: (1920, 1080),
+            requested_at: std::time::Instant::now(),
+        });
+        app.note_resized((1921, 1079));
+        assert!(app.pending_guest_resize.is_none());
     }
 
     /// One value of every [`WindowError`] variant.
