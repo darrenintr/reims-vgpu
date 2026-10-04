@@ -1571,6 +1571,48 @@ impl std::fmt::Debug for ComputeImageDestination {
     }
 }
 
+/// A cached mapped readback slot borrowed from the engine until the caller has
+/// scattered its bytes into guest memory.
+///
+/// This is intentionally an owning guard rather than a borrowed slice: the
+/// engine lock is released before the runtime writes guest pages, while the
+/// readback pool must not recycle the slot underneath that write. Dropping the
+/// guard returns its token through the pool's lock-free return channel.
+pub struct ComputeReadbackLease {
+    token: u64,
+    ptr: usize,
+    len: usize,
+}
+
+impl ComputeReadbackLease {
+    pub(crate) fn new(token: u64, ptr: usize, len: usize) -> Self {
+        Self { token, ptr, len }
+    }
+
+    /// The tight storage-image rows produced by the dispatch.
+    pub fn bytes(&self) -> &[u8] {
+        // SAFETY: construction is restricted to the engine after the producing
+        // submission's fence has retired. The pool removes this exact slot from
+        // circulation for the lifetime of the token, and teardown waits for
+        // every outstanding token before freeing the persistent mapping.
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+    }
+}
+
+impl std::fmt::Debug for ComputeReadbackLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ComputeReadbackLease")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ComputeReadbackLease {
+    fn drop(&mut self) {
+        super::pools::return_readback_lease(self.token);
+    }
+}
+
 /// What one storage image's dispatch produced, paired with the destination that
 /// was asked for.
 #[derive(Debug)]
@@ -1578,6 +1620,9 @@ pub enum ComputeImageResult {
     /// Readback pixels, for [`ComputeImageDestination::Host`]. Tight rows: the
     /// caller re-pitches them into the guest's window.
     Bytes(Vec<u8>),
+    /// The same host-readback result borrowed directly from a cached persistent
+    /// mapping instead of copied into a temporary `Vec`.
+    Leased(ComputeReadbackLease),
     /// The copy into the guest's own pages is on the queue, for
     /// [`ComputeImageDestination::GuestPages`]. There are no bytes to hand back
     /// because none were read.
@@ -1600,6 +1645,7 @@ impl ComputeImageResult {
     pub fn bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Bytes(bytes) => Some(bytes),
+            Self::Leased(lease) => Some(lease.bytes()),
             Self::Landed { .. } => None,
         }
     }
