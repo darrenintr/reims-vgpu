@@ -1068,73 +1068,90 @@ pub(crate) unsafe fn execute_compute_inner(
     }
 
     // Upload storage-image misses, or transition a generation-matched resident
-    // image directly from the prior readback layout into GENERAL.
-    for prepared in &simg_slots {
-        let img = &prepared.slot;
-        let range = super::color_subresource_range();
-        let (src_stage, src_access) = prepared.initial_access.source_scope();
-        if let Some(st) = &prepared.seed {
-            let barrier = [vk::ImageMemoryBarrier::default()
-                .src_access_mask(src_access)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .old_layout(prepared.initial_access.layout())
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .image(img.image)
-                .subresource_range(range)];
-            ctx.device.cmd_pipeline_barrier(
-                cb,
-                src_stage,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &barrier,
-            );
-            let copy = [vk::BufferImageCopy::default()
-                .image_subresource(super::color_subresource_layers())
-                .image_extent(vk::Extent3D {
-                    width: prepared.width,
-                    height: prepared.height,
-                    depth: 1,
-                })];
-            ctx.device.cmd_copy_buffer_to_image(
-                cb,
-                st.buffer,
-                img.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &copy,
-            );
-        }
-        let old_layout = if prepared.seed.is_some() {
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL
-        } else {
-            prepared.initial_access.layout()
-        };
-        let old_access = if prepared.seed.is_some() {
-            vk::AccessFlags::TRANSFER_WRITE
-        } else {
-            src_access
-        };
-        let old_stage = if prepared.seed.is_some() {
-            vk::PipelineStageFlags::TRANSFER
-        } else {
-            src_stage
-        };
-        let barrier = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(old_access)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-            .old_layout(old_layout)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .image(img.image)
-            .subresource_range(super::color_subresource_range())];
+    // image directly from its previous layout into GENERAL.
+    //
+    // All pre-seed transitions can share one dependency. Each image keeps its
+    // own access mask and destination layout; only the stage masks are widened
+    // to the union required by the batch. This replaces up to two barrier
+    // commands per storage binding with at most two for the whole dispatch.
+    if !simg_slots.is_empty() {
+        let mut src_stages = vk::PipelineStageFlags::empty();
+        let pre_seed: Vec<_> = simg_slots
+            .iter()
+            .map(|prepared| {
+                let (src_stage, src_access) = prepared.initial_access.source_scope();
+                src_stages |= src_stage;
+                let seeded = prepared.seed.is_some();
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(src_access)
+                    .dst_access_mask(if seeded {
+                        vk::AccessFlags::TRANSFER_WRITE
+                    } else {
+                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE
+                    })
+                    .old_layout(prepared.initial_access.layout())
+                    .new_layout(if seeded {
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL
+                    } else {
+                        vk::ImageLayout::GENERAL
+                    })
+                    .image(prepared.slot.image)
+                    .subresource_range(super::color_subresource_range())
+            })
+            .collect();
         ctx.device.cmd_pipeline_barrier(
             cb,
-            old_stage,
+            src_stages,
+            vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &pre_seed,
+        );
+    }
+
+    for prepared in &simg_slots {
+        let Some(st) = &prepared.seed else {
+            continue;
+        };
+        let copy = [vk::BufferImageCopy::default()
+            .image_subresource(super::color_subresource_layers())
+            .image_extent(vk::Extent3D {
+                width: prepared.width,
+                height: prepared.height,
+                depth: 1,
+            })];
+        ctx.device.cmd_copy_buffer_to_image(
+            cb,
+            st.buffer,
+            prepared.slot.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &copy,
+        );
+    }
+
+    let seeded_to_general: Vec<_> = simg_slots
+        .iter()
+        .filter(|prepared| prepared.seed.is_some())
+        .map(|prepared| {
+            vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .image(prepared.slot.image)
+                .subresource_range(super::color_subresource_range())
+        })
+        .collect();
+    if !seeded_to_general.is_empty() {
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::COMPUTE_SHADER,
             vk::DependencyFlags::empty(),
             &[],
             &[],
-            &barrier,
+            &seeded_to_general,
         );
     }
 
