@@ -643,6 +643,29 @@ pub const GATHER_AUDIT_ALL: &str = "REIMS_VGPU_GATHER_AUDIT_ALL";
 /// Use it for a content investigation, never for a timing.
 pub const SAMPLED_FIELD_WITNESS: &str = "REIMS_VGPU_SAMPLED_FIELD_WITNESS";
 
+/// `on` folds every window the gather witness refuses to vouch for and compares
+/// the fold against the previous refused bind of the same window, so a census
+/// can say whether the bytes a re-gather moved had actually changed.
+///
+/// It reaches no image the default arm does not also reach: the fold decides
+/// nothing and is counted only on the `gather_storm` line
+/// (`crate::runtime::gather_storm`). Like [`GATHER_AUDIT_ALL`] it narrows by
+/// doing *more* work — one CPU read of every unvouched window — and is therefore
+/// a measurement of what a content witness could save during a token's arming
+/// window, never a shipping arm and never a timing.
+pub const GATHER_STORM_FOLD: &str = "REIMS_VGPU_GATHER_STORM_FOLD";
+
+/// `on` keeps a per-window table behind the `gather_storm` census and adds its
+/// `gather_storm_keys` line: the heaviest windows of each second, with their
+/// unarmed runs, tranche counts and evictions.
+///
+/// It changes nothing the device does and reaches no image the default arm does
+/// not. The aggregate `gather_storm*` lines are always on and lock-free; this is
+/// the part that is not — one lock and one hash-map update per gather — so it is
+/// a diagnostic for naming *which* windows a burst was made of, and a timing run
+/// leaves it off.
+pub const GATHER_STORM_KEYS: &str = "REIMS_VGPU_GATHER_STORM_KEYS";
+
 /// `off` narrows a draw chain's pipeline resolution back to the full walk —
 /// object list, descriptor, decode, MTLB read, AIR carve and content hash, for
 /// the pipeline and both of its functions, on every draw.
@@ -1752,6 +1775,8 @@ mod tests {
             COMPUTE_GATHER,
             SAMPLED_IDENTITY,
             GATHER_AUDIT_ALL,
+            GATHER_STORM_FOLD,
+            GATHER_STORM_KEYS,
         ] {
             assert!(ALL.contains(&name), "{name} is not in the registry");
             let short = name
