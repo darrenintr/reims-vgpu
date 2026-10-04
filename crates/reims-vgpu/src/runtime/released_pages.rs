@@ -161,7 +161,7 @@ const CENSUS_INTERVAL_MS: u64 = 1_000;
 /// latches onto, so its phase must not drift; this is a sample of a level, where
 /// landing exactly on a grid buys nothing and back-dating would let a burst of
 /// tranches after a long stall each emit a line.
-fn claim_census_interval(last_ms: &std::sync::atomic::AtomicU64, now_ms: u64) -> bool {
+pub(crate) fn claim_census_interval(last_ms: &std::sync::atomic::AtomicU64, now_ms: u64) -> bool {
     use std::sync::atomic::Ordering;
     let last = last_ms.load(Ordering::Relaxed);
     if now_ms.saturating_sub(last) < CENSUS_INTERVAL_MS {
