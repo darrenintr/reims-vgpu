@@ -774,6 +774,12 @@ fn apply_setup_shared_state<H: HostMemory + HostOps>(
     let reinit = state.display.online_acked as u8;
     state.display.display_index = index;
     state.display.shared_gpa = state.pfn_gpa(pfn);
+    state.display.descriptor_generation = state.display.descriptor_generation.wrapping_add(1);
+    if state.display.descriptor_generation == 0 {
+        // Zero is the pristine/unpublished value. Skip it on wrap so every
+        // descriptor that reaches the guest has a distinct non-zero identity.
+        state.display.descriptor_generation = 1;
+    }
     state.display.online_acked = false;
     state.display.online_tries = 0;
     state.display.poll_ctr = 0;
@@ -786,7 +792,13 @@ fn apply_setup_shared_state<H: HostMemory + HostOps>(
     // before completion so createDisplayAttributes sees TimingElements.
     // Do **not** pulse ONLINE here — enable() has not set +0x104 yet
     // (archive poll waits for mask bit 2, then pending+IRQ).
-    fill_display_descriptor(host, state.display.shared_gpa, index, state.page_size());
+    fill_display_descriptor(
+        host,
+        state.display.shared_gpa,
+        index,
+        state.display.descriptor_generation,
+        state.page_size(),
+    );
 }
 
 fn apply_delete_task(state: &mut DeviceState, payload: &[u8], channel: Option<u32>) {
@@ -4316,6 +4328,7 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
     host: &mut H,
     gpa: u64,
     index: u32,
+    generation: u32,
     page_size: u64,
 ) {
     if gpa == 0 {
@@ -4404,6 +4417,10 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
         }
         let _ = gpa_map::write_bytes(host, gpa + off, &encoded, psz);
     }
+
+    // The generation is the commit word for this descriptor refill, so publish
+    // it only after every timing entry is complete.
+    shared_w32(host, gpa, DISPLAY_DESC_GENERATION, generation, psz);
 }
 
 /// Sample cursor x/y/show from the display shared-state page (GPA +0xe00).
