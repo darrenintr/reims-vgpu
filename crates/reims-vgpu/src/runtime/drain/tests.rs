@@ -286,11 +286,16 @@ fn display_descriptor_advertises_four_modes_incl_4k() {
     let mut host = FakeHost::new();
     let gpa = 0x7a000000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-    fill_display_descriptor(&mut host, gpa, 0, PAGE_SIZE_ARM64E);
+    let generation = 7u32;
+    fill_display_descriptor(&mut host, gpa, 0, generation, PAGE_SIZE_ARM64E);
     let mut count = [0u8; 2];
     host.read_gpa(gpa + DISPLAY_DESC_TIMING_COUNT, &mut count)
         .unwrap();
     assert_eq!(u16::from_le_bytes(count), 4);
+    let mut gen = [0u8; 4];
+    host.read_gpa(gpa + DISPLAY_DESC_GENERATION, &mut gen)
+        .unwrap();
+    assert_eq!(u32::from_le_bytes(gen), generation);
     let read16 = |host: &mut FakeHost, off: u64| {
         let mut b = [0u8; 2];
         host.read_gpa(gpa + off, &mut b).unwrap();
@@ -2946,6 +2951,11 @@ fn display_lifecycle_events_are_always_logged() {
 
     // First setup: reinit=0 (initial display registration).
     process_child_packet(&mut state, &mut host, 4, &setup);
+    assert_eq!(state.display.descriptor_generation, 1);
+    let mut descriptor_generation = [0u8; 4];
+    host.read_gpa(gpa + DISPLAY_DESC_GENERATION, &mut descriptor_generation)
+        .unwrap();
+    assert_eq!(u32::from_le_bytes(descriptor_generation), 1);
     // Guest ack.
     let ack = Packet {
         opcode: CHILD_OP_ONLINE_ACK,
@@ -2969,6 +2979,10 @@ fn display_lifecycle_events_are_always_logged() {
     // Second setup while previously ONLINE: reinit=1 (the post-converge rebuild).
     state.display.online_acked = true;
     process_child_packet(&mut state, &mut host, 4, &setup);
+    assert_eq!(state.display.descriptor_generation, 2);
+    host.read_gpa(gpa + DISPLAY_DESC_GENERATION, &mut descriptor_generation)
+        .unwrap();
+    assert_eq!(u32::from_le_bytes(descriptor_generation), 2);
 
     let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
     assert!(
