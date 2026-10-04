@@ -114,6 +114,12 @@ pub struct DependencyGraph {
     /// signature owns.
     scratch: Vec<usize>,
     waits: Vec<IngressOrdinal>,
+    /// The ordinal of the newest entry ever inserted, which is what the
+    /// ingress-order assertion compares against. Not `entries.last()`:
+    /// compaction drops retired entries, and the newest may be one of them.
+    newest: Option<IngressOrdinal>,
+    /// Old entry index to new, refilled by [`Self::compact`].
+    remap: Vec<usize>,
 }
 
 impl DependencyGraph {
@@ -161,11 +167,21 @@ impl DependencyGraph {
         accesses: &[AccessIntent],
     ) -> Vec<IngressOrdinal> {
         assert!(
-            self.entries
-                .last()
-                .is_none_or(|last| ordinal > last.ordinal),
+            self.newest.is_none_or(|newest| ordinal > newest),
             "transactions are admitted in ingress order; {ordinal:?} arrived after a later one"
         );
+        // Retired entries can never create an edge, but every one left in an
+        // index is compared against by every later access to its backing,
+        // heap or domain. Left alone they accumulate for the life of the
+        // session and admission costs grow with uptime rather than with the
+        // work in flight. So the graph drops them itself, here, on the path
+        // that pays for scanning them, whenever they outnumber the live
+        // entries: a compaction costs O(entries) and follows more retirements
+        // than there are live entries, so it is O(1) amortized per retirement,
+        // and the indexes never hold more than twice the live entries plus one.
+        if self.entries.len() - self.live > self.live {
+            self.compact();
+        }
         // Taken out so the gathering below can borrow the indexes; put back
         // before returning, so the next admission finds the capacity this one
         // grew. Both are cleared here rather than at the end, because a
@@ -210,6 +226,7 @@ impl DependencyGraph {
                 }
             }
             self.insert(ordinal, *intent);
+            self.newest = Some(ordinal);
         }
         self.scratch = scratch;
         let out = waits.clone();
@@ -305,22 +322,42 @@ impl DependencyGraph {
     /// Separate from [`Self::retire`] because retirement is on the completion
     /// path and this is not: an index rebuild in a completion handler is work
     /// charged to the thing that finished rather than to the thing that grew.
+    /// [`Self::admit`] runs it once retired entries outnumber live ones, so a
+    /// caller never has to; calling it is still allowed and changes no answer.
+    ///
+    /// In place, and allocation-free once warm: every index list keeps its own
+    /// order and capacity and has its entries renumbered through one reused
+    /// map, so running this on the admission path does not undo the
+    /// structural zero [`Self::scratch`] exists for. The census is a running
+    /// total across the graph's life and is not touched: compaction is
+    /// bookkeeping, and it did not admit anything.
     pub fn compact(&mut self) {
-        let live: Vec<_> = self.entries.iter().copied().filter(|e| e.live).collect();
-        self.entries.clear();
-        self.by_backing.clear();
-        self.by_heap.clear();
-        self.by_domain.clear();
-        self.domain_only.clear();
-        self.by_ordinal.clear();
-        self.live = 0;
-        // The census is a running total across the graph's life and is not
-        // rebuilt: compaction is bookkeeping, and it did not admit anything.
-        let saved = self.census;
-        for e in live {
-            self.insert(e.ordinal, e.intent);
+        let mut remap = std::mem::take(&mut self.remap);
+        remap.clear();
+        let mut next = 0usize;
+        for entry in &self.entries {
+            if entry.live {
+                remap.push(next);
+                next += 1;
+            } else {
+                remap.push(usize::MAX);
+            }
         }
-        self.census = saved;
+        self.entries.retain(|e| e.live);
+        debug_assert_eq!(self.entries.len(), self.live);
+        let renumber = |list: &mut Vec<usize>| {
+            list.retain_mut(|idx| {
+                *idx = remap[*idx];
+                *idx != usize::MAX
+            });
+            !list.is_empty()
+        };
+        self.by_backing.retain(|_, list| renumber(list));
+        self.by_heap.retain(|_, list| renumber(list));
+        self.by_domain.retain(|_, list| renumber(list));
+        self.domain_only.retain(|_, list| renumber(list));
+        self.by_ordinal.retain(|_, list| renumber(list));
+        self.remap = remap;
     }
 }
 
@@ -566,6 +603,41 @@ mod tests {
         assert_eq!(after.retired_scanned - before.retired_scanned, 2);
         assert_eq!(after.own_scanned - before.own_scanned, 1);
         assert_eq!(g.live_accesses(), 3);
+    }
+
+    /// Retired entries cannot accumulate. A session that admits and retires a
+    /// write to one backing over and over used to keep every one of them in
+    /// that backing's index, so the n-th admission compared against n-1 dead
+    /// entries and the session paid n²/2 comparisons for n transactions.
+    #[test]
+    fn retired_entries_do_not_accumulate_across_admissions() {
+        let mut g = DependencyGraph::new();
+        let k = AccessKey::Whole(res(1));
+        let n = 10_000u64;
+        // One long-lived reader, so the graph is never simply empty.
+        g.admit(ord(1), &[intent(k, AccessMode::Read)]);
+        for i in 2..n {
+            g.admit(ord(i), &[intent(k, AccessMode::Read)]);
+            g.retire(ord(i));
+            assert!(
+                g.retained_entries() <= 2 * g.live_accesses() + 1,
+                "{} retained for {} live",
+                g.retained_entries(),
+                g.live_accesses()
+            );
+        }
+        let census = g.census();
+        assert!(
+            census.retired_scanned < 2 * n as usize,
+            "{} comparisons against retired entries for {n} admissions",
+            census.retired_scanned
+        );
+        // And the order contract still holds after the newest entry was
+        // compacted away.
+        let late = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            g.admit(ord(n - 2), &[intent(k, AccessMode::Read)])
+        }));
+        assert!(late.is_err(), "an ordinal older than one already admitted");
     }
 
     /// Compaction is bookkeeping. It must not change an answer, and it must not
