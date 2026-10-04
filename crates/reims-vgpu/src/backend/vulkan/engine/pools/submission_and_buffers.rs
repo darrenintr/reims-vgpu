@@ -3794,15 +3794,20 @@ impl ResourcePools {
     ///
     /// The engine lock is held while this search runs, so a free slot cannot be
     /// acquired by another command between retirement and removal.
-    pub(crate) fn lease_retired_readback(&mut self, buffer: vk::Buffer) -> Option<ReadbackLease> {
-        let mut found = None;
-        for (bucket, list) in &self.readback_free {
-            if let Some(index) = list.iter().position(|slot| slot.buffer == buffer) {
-                found = Some((*bucket, index));
-                break;
-            }
-        }
-        let (bucket, index) = found?;
+    pub(crate) fn lease_retired_readback(
+        &mut self,
+        buffer: vk::Buffer,
+        slot_size: u64,
+    ) -> Option<ReadbackLease> {
+        // Free readbacks are bucketed by their allocation size, and the handle
+        // we retained carries that exact size. Search only that bucket instead
+        // of walking every bucket in the pool.
+        let bucket = Self::bucket(slot_size);
+        let index = self
+            .readback_free
+            .get(&bucket)?
+            .iter()
+            .position(|slot| slot.buffer == buffer)?;
         let slot = self.readback_free.get_mut(&bucket)?.swap_remove(index);
         if self
             .readback_free
