@@ -4569,7 +4569,9 @@ fn load_cursor_glyph<H: HostMemory + HostOps>(
     state.cursor.hot_y = hot_y as u16;
     state.cursor.pixels = pixels;
     state.cursor.glyph_ready = true;
+    state.cursor.glyph_serial = state.cursor.glyph_serial.wrapping_add(1);
     sample_cursor_position(state, host);
+    state.cursor.revision = state.cursor.revision.wrapping_add(1);
     true
 }
 
@@ -6281,6 +6283,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
             Ok(show) => {
                 state.cursor.show = show;
                 sample_cursor_position(state, host);
+                state.cursor.revision = state.cursor.revision.wrapping_add(1);
                 host.enqueue(HostAction::cursor(state.cursor.x, state.cursor.y, show));
             }
             Err(short) => note_short_payload("cursor_show", Some(channel_id), &short),

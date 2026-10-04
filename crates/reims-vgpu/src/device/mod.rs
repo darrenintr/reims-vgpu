@@ -579,6 +579,11 @@ pub fn device_drain(id: u64) -> bool {
     // Off the QEMU main loop; a small dedicated mutex, never the render lock.
     #[cfg(feature = "host-window")]
     window_publish::publish_window_frame(&slot, &mut device.state);
+    // The guest's pointer image, beside the frame and by the same route: a small
+    // mutex of its own, and a wake. Not part of `publish_us` — it is a compare
+    // and, once per cursor change, a copy.
+    #[cfg(feature = "host-window")]
+    window_publish::publish_window_cursor(&slot, &device.state);
     crate::runtime::drain::note_drain_tranche(
         &device.state,
         &host,

@@ -71,6 +71,9 @@ pub(crate) struct WindowLink {
     /// deduplicated. It remains zero on Linux, preserving the verified
     /// `(mapping_id, generation)` publication contract there.
     last: WindowFrameKey,
+    /// What the window has been sent of the guest's cursor. See
+    /// [`CursorPublished`].
+    cursor: CursorPublished,
     /// Monotonic frame sequence stamped onto each published [`Frame`] so the
     /// window uploads only new frames (skips the per-vblank re-upload of
     /// unchanged content). Bumped on every write.
@@ -94,6 +97,96 @@ pub(crate) struct WindowLink {
     /// window and its Vulkan objects.
     #[cfg(target_os = "macos")]
     exited: crate::host_window::present::ExitedFlag,
+}
+
+/// What the window has been sent of the guest's cursor, and how to tell what it
+/// is owed.
+///
+/// The device's [`CursorState`](crate::model::CursorState) changes on guest
+/// commands, and the window must hear about the ones that change what it shows
+/// — an image, or a show/hide — and not about the pointer moving, which it
+/// places itself. `revision` is the device's count of exactly those commands, so
+/// the question "has anything changed" is one integer compare and not a walk of a
+/// sprite that can be a megabyte.
+#[cfg(feature = "host-window")]
+#[derive(Debug, Default)]
+pub(crate) struct CursorPublished {
+    /// [`CursorState::revision`](crate::model::CursorState::revision) of the last
+    /// snapshot sent, or zero before any.
+    revision: u64,
+    /// Publication count, stamped onto each snapshot as its `seq`.
+    seq: u64,
+    /// The glyph the last snapshot carried. Kept so a show/hide reuses the pixels
+    /// instead of copying them again.
+    glyph: Option<crate::host_window::cursor::CursorGlyph>,
+}
+
+/// What, if anything, the window is owed for `cursor`.
+///
+/// `None` is nothing owed. `Some(None)` is the pristine state — the guest has
+/// said nothing since the device was created or reset — which the window reads as
+/// "no guest cursor" and answers with the host's arrow; it is *sent* because a
+/// reset must take back a glyph the window is still showing. `Some(Some(_))` is a
+/// snapshot.
+///
+/// Pure over the device's state and the link's memory, so what reaches the window
+/// is asserted without one.
+#[cfg(feature = "host-window")]
+pub(crate) fn cursor_publication(
+    cursor: &crate::model::CursorState,
+    sent: &mut CursorPublished,
+) -> Option<Option<Arc<crate::host_window::cursor::CursorSnapshot>>> {
+    use crate::host_window::cursor::{CursorGlyph, CursorSnapshot};
+    if cursor.revision == sent.revision {
+        return None;
+    }
+    sent.revision = cursor.revision;
+    if cursor.revision == 0 {
+        sent.glyph = None;
+        return Some(None);
+    }
+    let glyph = if cursor.glyph_ready && !cursor.pixels.is_empty() {
+        match sent.glyph.take() {
+            // Same glyph, so the same pixels: a show/hide must not copy a sprite.
+            Some(held) if held.serial == cursor.glyph_serial => Some(held),
+            _ => Some(CursorGlyph {
+                serial: cursor.glyph_serial,
+                width: cursor.width,
+                height: cursor.height,
+                hot_x: cursor.hot_x,
+                hot_y: cursor.hot_y,
+                argb: cursor.pixels.as_slice().into(),
+            }),
+        }
+    } else {
+        None
+    };
+    sent.glyph = glyph.clone();
+    sent.seq = sent.seq.wrapping_add(1);
+    Some(Some(Arc::new(CursorSnapshot {
+        seq: sent.seq,
+        visible: cursor.show,
+        glyph,
+        guest_pos: (cursor.x, cursor.y),
+    })))
+}
+
+/// Publish the guest's cursor to the window if it has changed, and wake the
+/// window to apply it.
+///
+/// Runs on the drain worker at the end of a tranche, beside
+/// [`publish_window_frame`], and takes the window link's own mutex and the
+/// cursor slot's — never anything the window thread can be made to wait on by
+/// the device lock. The window thread reads the slot; it never reads this state.
+#[cfg(feature = "host-window")]
+pub(crate) fn publish_window_cursor(slot: &BoundDevice, state: &crate::model::DeviceState) {
+    let mut guard = slot.window.lock();
+    let Some(link) = guard.as_mut() else {
+        return;
+    };
+    if let Some(publication) = cursor_publication(&state.cursor, &mut link.cursor) {
+        link.wake.publish_cursor(publication);
+    }
 }
 
 /// Registered early-boot framebuffer (BAR1 GOP host RAM) the C shim hands the
@@ -221,6 +314,7 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
     *link = Some(WindowLink {
         frames,
         wake,
+        cursor: CursorPublished::default(),
         last: (u32::MAX, u32::MAX, u32::MAX, u64::MAX),
         seq: 0,
         bgra_short_geom: None,
@@ -596,4 +690,171 @@ fn copy_early_bar1(slot: &BoundDevice, dst: &mut [u8], dst_stride: u32, w: u32, 
         dst[doff..doff + row].copy_from_slice(&src[so..so + row]);
     }
     true
+}
+
+#[cfg(all(test, feature = "host-window"))]
+mod cursor_publication_tests {
+    use super::*;
+    use crate::model::CursorState;
+
+    /// A device cursor after the guest sent a glyph: the state a drain leaves.
+    fn with_glyph(serial: u64, width: u16, height: u16, hot: (u16, u16), fill: u32) -> CursorState {
+        CursorState {
+            show: true,
+            width,
+            height,
+            hot_x: hot.0,
+            hot_y: hot.1,
+            pixels: vec![fill; usize::from(width) * usize::from(height)],
+            glyph_ready: true,
+            revision: serial,
+            glyph_serial: serial,
+            ..CursorState::default()
+        }
+    }
+
+    /// The default `show` is true and means nothing: the device starts with it
+    /// set, so a window that took it for the guest's word would hide or draw a
+    /// pointer nobody chose.
+    #[test]
+    fn a_guest_that_has_said_nothing_owes_the_window_nothing() {
+        let mut sent = CursorPublished::default();
+        let pristine = CursorState {
+            show: true,
+            ..CursorState::default()
+        };
+        assert!(cursor_publication(&pristine, &mut sent).is_none());
+    }
+
+    /// The window learns the image, its size and its hotspot exactly, and the
+    /// guest's own position rides along for diagnosis.
+    #[test]
+    fn a_glyph_publishes_its_pixels_size_and_hotspot() {
+        let mut sent = CursorPublished::default();
+        let mut cursor = with_glyph(1, 9, 17, (4, 8), 0xFF11_2233);
+        cursor.x = 640;
+        cursor.y = 360;
+        let snapshot = cursor_publication(&cursor, &mut sent)
+            .expect("a glyph is owed")
+            .expect("a snapshot, not a clear");
+        assert_eq!(snapshot.seq, 1);
+        assert!(snapshot.visible);
+        assert_eq!(snapshot.guest_pos, (640, 360));
+        let glyph = snapshot.glyph.as_ref().expect("the glyph");
+        assert_eq!((glyph.width, glyph.height), (9, 17));
+        assert_eq!((glyph.hot_x, glyph.hot_y), (4, 8));
+        assert_eq!(glyph.serial, 1);
+        assert_eq!(glyph.argb.len(), 9 * 17);
+        assert!(glyph.argb.iter().all(|&p| p == 0xFF11_2233));
+    }
+
+    /// Pointer movement changes `x`/`y` and nothing the window shows, so it is
+    /// not a publication — the property that keeps a cursor change from being a
+    /// per-move wake.
+    #[test]
+    fn pointer_movement_publishes_nothing() {
+        let mut sent = CursorPublished::default();
+        let mut cursor = with_glyph(1, 4, 4, (0, 0), 0xFF00_0000);
+        cursor_publication(&cursor, &mut sent).expect("first publication");
+        for step in 0..100 {
+            cursor.x = step;
+            cursor.y = step * 2;
+            assert!(
+                cursor_publication(&cursor, &mut sent).is_none(),
+                "move {step}"
+            );
+        }
+    }
+
+    /// A hide and a show keep the glyph and do not copy it again: the second
+    /// snapshot's pixels are the first's allocation.
+    #[test]
+    fn show_and_hide_reuse_the_glyphs_pixels() {
+        let mut sent = CursorPublished::default();
+        let mut cursor = with_glyph(1, 64, 64, (1, 1), 0xFFAB_CDEF);
+        let first = cursor_publication(&cursor, &mut sent)
+            .expect("owed")
+            .expect("snapshot");
+        cursor.show = false;
+        cursor.revision += 1;
+        let hidden = cursor_publication(&cursor, &mut sent)
+            .expect("owed")
+            .expect("snapshot");
+        assert!(!hidden.visible);
+        assert!(hidden.seq > first.seq);
+        assert!(
+            Arc::ptr_eq(
+                &first.glyph.as_ref().expect("glyph").argb,
+                &hidden.glyph.as_ref().expect("glyph kept while hidden").argb
+            ),
+            "a show/hide copied the sprite"
+        );
+        cursor.show = true;
+        cursor.revision += 1;
+        let shown = cursor_publication(&cursor, &mut sent)
+            .expect("owed")
+            .expect("snapshot");
+        assert!(shown.visible);
+        assert!(Arc::ptr_eq(
+            &first.glyph.as_ref().expect("glyph").argb,
+            &shown.glyph.as_ref().expect("glyph").argb
+        ));
+    }
+
+    /// A hide the guest sends before any glyph is still published: the window
+    /// has to be able to tell "hidden" from "never said".
+    #[test]
+    fn a_hide_before_any_glyph_is_published_as_a_hide() {
+        let mut sent = CursorPublished::default();
+        let cursor = CursorState {
+            show: false,
+            revision: 1,
+            ..CursorState::default()
+        };
+        let snapshot = cursor_publication(&cursor, &mut sent)
+            .expect("owed")
+            .expect("snapshot");
+        assert!(!snapshot.visible);
+        assert!(snapshot.glyph.is_none());
+    }
+
+    /// A new glyph is new pixels with a new serial, even one that looks the same:
+    /// the serial is the device's count of glyphs sent.
+    #[test]
+    fn a_replacement_glyph_is_a_new_serial_and_new_pixels() {
+        let mut sent = CursorPublished::default();
+        let arrow = with_glyph(1, 12, 19, (0, 0), 0xFF00_0000);
+        let ibeam = with_glyph(2, 9, 17, (4, 8), 0xFFFF_FFFF);
+        let a = cursor_publication(&arrow, &mut sent)
+            .expect("owed")
+            .expect("snapshot");
+        let b = cursor_publication(&ibeam, &mut sent)
+            .expect("owed")
+            .expect("snapshot");
+        let (a, b) = (
+            a.glyph.as_ref().expect("glyph"),
+            b.glyph.as_ref().expect("glyph"),
+        );
+        assert_ne!(a.serial, b.serial);
+        assert_eq!((b.width, b.height, b.hot_x, b.hot_y), (9, 17, 4, 8));
+    }
+
+    /// A guest reset takes the cursor back to nothing said, and the window must be
+    /// told, or it keeps showing a glyph the guest no longer has.
+    #[test]
+    fn a_reset_is_published_as_a_clear() {
+        let mut sent = CursorPublished::default();
+        cursor_publication(&with_glyph(3, 4, 4, (0, 0), 0xFF00_0000), &mut sent).expect("owed");
+        let reset = CursorState {
+            show: true,
+            ..CursorState::default()
+        };
+        assert_eq!(
+            cursor_publication(&reset, &mut sent),
+            Some(None),
+            "the pristine state, sent so the window can drop what it holds"
+        );
+        // And once told, it is not told again.
+        assert!(cursor_publication(&reset, &mut sent).is_none());
+    }
 }

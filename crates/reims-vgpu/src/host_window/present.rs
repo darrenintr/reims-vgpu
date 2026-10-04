@@ -39,6 +39,9 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
 use super::capture::{Capture, CaptureEngaged, CaptureMode};
+use super::cursor::{
+    self, CursorGlyph, CursorPolicy, CursorSlot, CursorSnapshot, Shown, Transition,
+};
 use super::input_map;
 use super::keyboard::{Grab, KeyEffect, Keyboard};
 use crate::backend::window::WindowPresentOutcome;
@@ -236,14 +239,21 @@ pub struct Frame {
 /// 8 MiB deep copy of an unchanged frame.
 pub type FrameSlot = Arc<Mutex<Option<Arc<Frame>>>>;
 
-/// The one user event this window's loop takes: the device wrote a new frame
-/// into the [`FrameSlot`].
+/// What the device is asking the window's loop to look at.
 ///
-/// Carries nothing. The slot is latest-wins and the loop reads it under its own
-/// lock, so a payload here could only be a second, staler copy of what
-/// [`App::draw`] is about to read anyway.
+/// Carries nothing beyond which slot changed. Each slot is latest-wins and read
+/// under its own lock, so a payload here could only be a second, staler copy of
+/// what the loop is about to read anyway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FramePublished;
+pub enum WindowWake {
+    /// The device wrote a new frame into the [`FrameSlot`].
+    Frame,
+    /// The device wrote a new guest cursor into the [`CursorSlot`]. A cursor
+    /// change is not a frame: it wakes the loop and asks for no redraw, because
+    /// a still desktop whose pointer turned into an I-beam has nothing new to
+    /// present.
+    Cursor,
+}
 
 /// How the device wakes the window's event loop when it publishes a frame.
 ///
@@ -267,8 +277,19 @@ pub struct FramePublished;
 /// lock is uncontended and taken once per published frame, at the ~26 Hz this
 /// workload peaks at, against the publisher's own two existing locks.
 pub struct WindowWaker {
-    proxy: Mutex<Option<winit::event_loop::EventLoopProxy<FramePublished>>>,
+    /// The loop's proxy, behind a closure so what it sends is testable without
+    /// a display.
+    send: Mutex<Option<WakeSend>>,
+    /// The guest's latest cursor, beside the frame slot and for the same reason:
+    /// the publisher already knows when it changed, so it says so, and the window
+    /// thread reads it without ever reaching the device. Held here rather than as
+    /// a fourth argument to every entry point because the waker is already the one
+    /// object the device and the window share before either has seen the other.
+    cursor: CursorSlot,
 }
+
+/// What a [`WindowWaker`] sends through: the loop's proxy, or a test's collector.
+type WakeSend = Box<dyn Fn(WindowWake) + Send>;
 
 /// A [`WindowWaker`] shared between the device's publisher and the window
 /// thread that arms it.
@@ -279,14 +300,29 @@ impl WindowWaker {
     /// built its event loop and called [`Self::arm`].
     pub fn new() -> WindowWakeHandle {
         Arc::new(Self {
-            proxy: Mutex::new(None),
+            send: Mutex::new(None),
+            cursor: CursorSlot::default(),
         })
     }
 
     /// Hand the loop's proxy over, once the loop exists to be woken.
-    fn arm(&self, proxy: winit::event_loop::EventLoopProxy<FramePublished>) {
-        if let Ok(mut slot) = self.proxy.lock() {
-            *slot = Some(proxy);
+    fn arm(&self, proxy: winit::event_loop::EventLoopProxy<WindowWake>) {
+        self.arm_with(Box::new(move |event| {
+            let _ = proxy.send_event(event);
+        }));
+    }
+
+    fn arm_with(&self, send: WakeSend) {
+        if let Ok(mut slot) = self.send.lock() {
+            *slot = Some(send);
+        }
+    }
+
+    fn send(&self, event: WindowWake) {
+        if let Ok(slot) = self.send.lock() {
+            if let Some(send) = slot.as_ref() {
+                send(event);
+            }
         }
     }
 
@@ -299,11 +335,23 @@ impl WindowWaker {
     /// does not land costs latency bounded by that constant rather than a frame
     /// — which is the property that lets this be a wake and not a protocol.
     pub fn wake(&self) {
-        if let Ok(slot) = self.proxy.lock() {
-            if let Some(proxy) = slot.as_ref() {
-                let _ = proxy.send_event(FramePublished);
-            }
-        }
+        self.send(WindowWake::Frame);
+    }
+
+    /// Publish the guest's cursor and wake the loop to apply it.
+    ///
+    /// Stored before the wake, so a publish that beats the loop is not lost: the
+    /// window reads the slot when it opens. Unlike a frame it has no backstop to
+    /// fall back on — a cursor nobody redraws is not retried — so the store is
+    /// what carries it, and the wake only says when to look.
+    pub fn publish_cursor(&self, snapshot: Option<Arc<CursorSnapshot>>) {
+        self.cursor.store(snapshot);
+        self.send(WindowWake::Cursor);
+    }
+
+    /// The latest guest cursor, for the window thread.
+    fn cursor(&self) -> Option<Arc<CursorSnapshot>> {
+        self.cursor.load()
     }
 }
 
@@ -633,7 +681,7 @@ pub fn run(
 ) -> Result<(), WindowError> {
     let event_loop = build_event_loop()?;
     wake.arm(event_loop.create_proxy());
-    let mut app = App::new(config, on_input, frames, stop);
+    let mut app = App::new(config, on_input, frames, stop, wake);
     event_loop
         .run_app(&mut app)
         .map_err(|e| WindowError::RunApp(e.to_string()))
@@ -642,7 +690,7 @@ pub fn run(
 #[cfg(target_os = "macos")]
 struct MainThreadWindow {
     id: u64,
-    event_loop: EventLoop<FramePublished>,
+    event_loop: EventLoop<WindowWake>,
     app: App,
     exited: ExitedFlag,
 }
@@ -680,7 +728,7 @@ pub fn start_main_thread(
         }
         let event_loop = build_event_loop()?;
         wake.arm(event_loop.create_proxy());
-        let app = App::new(config, on_input, frames, stop);
+        let app = App::new(config, on_input, frames, stop, wake);
         *slot = Some(MainThreadWindow {
             id,
             event_loop,
@@ -722,9 +770,9 @@ pub fn run_main_thread(id: u64) -> Result<(), WindowError> {
 /// Build an event loop that may run off the main thread (QEMU owns the main
 /// thread). X11 and Wayland both allow it via their platform extension.
 ///
-/// Carries [`FramePublished`] as its user event, which is what makes
+/// Carries [`WindowWake`] as its user event, which is what makes
 /// `create_proxy` a wake channel the device can hold — see [`WindowWaker`].
-fn build_event_loop() -> Result<EventLoop<FramePublished>, WindowError> {
+fn build_event_loop() -> Result<EventLoop<WindowWake>, WindowError> {
     let mut builder = EventLoop::with_user_event();
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -785,7 +833,7 @@ struct App {
     /// retried a few times and then left alone, rather than once per redraw for
     /// the life of the boot.
     presenter_rebuilds: u32,
-    /// A [`FramePublished`] arrived (or a present asked to be repeated) and no
+    /// A [`WindowWake::Frame`] arrived (or a present asked to be repeated) and no
     /// redraw has been requested for it yet. Consumed by `about_to_wait`, which
     /// is the one place that talks to the platform about redraws.
     frame_pending: bool,
@@ -817,6 +865,16 @@ struct App {
     /// The budget for naming resize, scale and occlusion events. See
     /// [`crate::observe::LineBudget`].
     event_trace: crate::observe::LineBudget,
+    /// The device's side of the wake channel, read for the guest's cursor.
+    wake: WindowWakeHandle,
+    /// Which pointer the window shows. See [`CursorPolicy`].
+    cursor_policy: CursorPolicy,
+    /// The winit cursor built from the glyph last shown, by serial, so a show
+    /// after a hide — or a recapture — is a `set_cursor` and not a rebuild.
+    custom_cursor: Option<(u64, winit::window::CustomCursor)>,
+    /// The budget for `host_window_cursor` lines. A guest changes its glyph at
+    /// UI-hover rate, so the lines are a trickle by the same rule as the events.
+    cursor_trace: crate::observe::LineBudget,
 }
 
 /// How often the window's event loop looked for a guest frame, and what it
@@ -898,7 +956,7 @@ impl LoopCensus {
     }
 }
 
-impl ApplicationHandler<FramePublished> for App {
+impl ApplicationHandler<WindowWake> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -946,6 +1004,9 @@ impl ApplicationHandler<FramePublished> for App {
                 // one, so without this the window would never draw.
                 window.request_redraw();
                 self.window = Some(window);
+                // The device may have published its cursor before this window
+                // existed; the slot kept it.
+                self.sync_cursor_from_slot(event_loop);
             }
             Err(error) => {
                 // One rule on every platform and every rail: a rail that
@@ -1023,6 +1084,9 @@ impl ApplicationHandler<FramePublished> for App {
                         // the escape hatch reach the guest as a stray Esc.
                         let effect = self.keyboard.key(evdev, down);
                         self.apply_key_effect(effect);
+                        // The ungrab chord is the one key that changes who owns
+                        // the pointer.
+                        self.sync_cursor_capture(event_loop);
                     }
                 }
             }
@@ -1034,6 +1098,7 @@ impl ApplicationHandler<FramePublished> for App {
                 // also where the desktop's shortcuts are taken and handed back.
                 let effect = self.keyboard.focus(focused);
                 self.apply_key_effect(effect);
+                self.sync_cursor_capture(event_loop);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer_move((position.x, position.y));
@@ -1059,7 +1124,7 @@ impl ApplicationHandler<FramePublished> for App {
         }
     }
 
-    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+    fn exiting(&mut self, event_loop: &ActiveEventLoop) {
         // Tear the presenter down while the native window is still alive.
         // Detaching destroys the swapchain and the `VkSurfaceKHR`, and the
         // driver services those through the Wayland/X (or AppKit) surface owned
@@ -1081,6 +1146,9 @@ impl ApplicationHandler<FramePublished> for App {
         // leave the whole session unable to type.
         let effect = self.keyboard.shutdown();
         self.apply_key_effect(effect);
+        // Hand the desktop its pointer back before the window goes: a guest
+        // cursor that was hidden must not outlive the window that hid it.
+        self.sync_cursor_capture(event_loop);
         self.capture = None;
         self.window = None;
     }
@@ -1136,15 +1204,18 @@ impl ApplicationHandler<FramePublished> for App {
         }
     }
 
-    /// A [`FramePublished`] from the device: the frame slot holds something the
-    /// loop has not looked at.
+    /// A [`WindowWake`] from the device.
     ///
-    /// Records the reason and returns. Requesting the redraw here instead would
-    /// put a second caller on the platform's redraw path, and the two would
-    /// disagree about the backstop — `about_to_wait` runs after this and after
-    /// every other event, so it is the one place that can hold that decision.
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: FramePublished) {
-        self.frame_pending = true;
+    /// A frame records the reason and returns. Requesting the redraw here
+    /// instead would put a second caller on the platform's redraw path, and the
+    /// two would disagree about the backstop — `about_to_wait` runs after this
+    /// and after every other event, so it is the one place that can hold that
+    /// decision. A cursor is applied here and now: it is not a redraw and has no
+    /// backstop, and the loop is awake because this event arrived.
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WindowWake) {
+        if self.note_wake(event) {
+            self.sync_cursor_from_slot(event_loop);
+        }
     }
 }
 
@@ -1165,7 +1236,13 @@ impl App {
     /// `start_main_thread` on macOS's main thread — and every field but the
     /// four they are given is fixed. Written out at each site, a field added
     /// to the struct could be initialised in one and missed in the other.
-    fn new(config: WindowConfig, on_input: InputSink, frames: FrameSlot, stop: StopFlag) -> Self {
+    fn new(
+        config: WindowConfig,
+        on_input: InputSink,
+        frames: FrameSlot,
+        stop: StopFlag,
+        wake: WindowWakeHandle,
+    ) -> Self {
         Self {
             config,
             on_input,
@@ -1194,6 +1271,10 @@ impl App {
             loop_census: LoopCensus::new(),
             pending_resize: None,
             event_trace: crate::observe::LineBudget::new(std::time::Instant::now()),
+            wake,
+            cursor_policy: CursorPolicy::new(),
+            custom_cursor: None,
+            cursor_trace: crate::observe::LineBudget::new(std::time::Instant::now()),
         }
     }
 
@@ -1265,6 +1346,126 @@ impl App {
     fn force_redraw(&mut self) {
         self.redraw_required = true;
         self.frame_pending = true;
+    }
+
+    /// Record a wake. Returns whether the cursor slot is to be read.
+    ///
+    /// A frame owes the redraw; a cursor owes none, and says so by leaving
+    /// `frame_pending` alone — the property that lets a cursor change reach a
+    /// still desktop without a frame having been published.
+    fn note_wake(&mut self, event: WindowWake) -> bool {
+        match event {
+            WindowWake::Frame => {
+                self.frame_pending = true;
+                false
+            }
+            WindowWake::Cursor => true,
+        }
+    }
+
+    /// Read the guest's latest cursor from its slot and apply what changed.
+    fn sync_cursor_from_slot(&mut self, event_loop: &ActiveEventLoop) {
+        let transition = self.cursor_policy.set_snapshot(self.wake.cursor());
+        self.apply_cursor(event_loop, transition);
+    }
+
+    /// The capture may have changed hands: ask the keyboard and apply what
+    /// changed. Called after every keyboard effect, because the grab is the
+    /// keyboard's to decide and the pointer follows it.
+    fn sync_cursor_capture(&mut self, event_loop: &ActiveEventLoop) {
+        let transition = self.cursor_policy.set_grabbed(self.keyboard.is_grabbed());
+        self.apply_cursor(event_loop, transition);
+    }
+
+    /// Put a [`Transition`] on the window.
+    ///
+    /// The one place winit's cursor API is called. The order within each arm is
+    /// the property that keeps the host arrow and the guest's glyph from both
+    /// being visible: a pointer is made visible only *after* the image it is to
+    /// show has been set, and the host arrow is set before it is made visible
+    /// again.
+    fn apply_cursor(&mut self, event_loop: &ActiveEventLoop, transition: Option<Transition>) {
+        let Some(transition) = transition else {
+            return;
+        };
+        let Some(window) = self.window.clone() else {
+            // No window, so nothing was shown: the platform's arrow is what any
+            // window starts with, and the policy must say so or it would believe
+            // a transition it never applied.
+            self.cursor_policy.applied(Shown::Host);
+            return;
+        };
+        let applied = match transition.shown {
+            Shown::Host => {
+                window.set_cursor(winit::window::CursorIcon::Default);
+                window.set_cursor_visible(true);
+                Shown::Host
+            }
+            Shown::Hidden => {
+                window.set_cursor_visible(false);
+                Shown::Hidden
+            }
+            Shown::Guest { serial } => {
+                let glyph = transition
+                    .snapshot
+                    .as_deref()
+                    .and_then(|snapshot| snapshot.glyph.as_ref());
+                match glyph.map(|glyph| self.guest_cursor(event_loop, glyph)) {
+                    Some(Ok(custom)) => {
+                        window.set_cursor(custom);
+                        window.set_cursor_visible(true);
+                        Shown::Guest { serial }
+                    }
+                    refused => {
+                        // The guest's glyph could not be shown, so the host arrow
+                        // is: one pointer, and a named reason for it.
+                        let reason = match refused {
+                            Some(Err(reason)) => reason,
+                            _ => "host_cursor_glyph_missing",
+                        };
+                        if crate::observe::first_sight(reason, 0) {
+                            crate::observe::fail(format!(
+                                "host_window_cursor FAIL reason={reason} serial={serial}"
+                            ));
+                        }
+                        window.set_cursor(winit::window::CursorIcon::Default);
+                        window.set_cursor_visible(true);
+                        Shown::Host
+                    }
+                }
+            }
+        };
+        if applied != transition.shown {
+            self.cursor_policy.applied(applied);
+        }
+        if self.cursor_trace.admit(std::time::Instant::now()).is_some() {
+            crate::observe::off(transition.line());
+        }
+    }
+
+    /// The winit cursor for `glyph`, built once per glyph.
+    fn guest_cursor(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        glyph: &CursorGlyph,
+    ) -> Result<winit::window::CustomCursor, &'static str> {
+        if let Some((serial, custom)) = self.custom_cursor.as_ref() {
+            if *serial == glyph.serial {
+                return Ok(custom.clone());
+            }
+        }
+        let rgba = cursor::argb_to_rgba(glyph).map_err(cursor::GlyphRefusal::slug)?;
+        let source = winit::window::CustomCursor::from_rgba(
+            rgba.rgba,
+            rgba.width,
+            rgba.height,
+            rgba.hot_x,
+            rgba.hot_y,
+        )
+        .map_err(|_| "host_cursor_winit_refused")?;
+        let custom = event_loop.create_custom_cursor(source);
+        self.custom_cursor = Some((glyph.serial, custom.clone()));
+        Ok(custom)
     }
 
     /// A `Resized` arrived: remember the size, settle any guest-driven resize it
@@ -1714,7 +1915,7 @@ mod wake_tests {
         waker.wake();
         waker.wake();
         assert!(
-            waker.proxy.lock().expect("fresh mutex").is_none(),
+            waker.send.lock().expect("fresh mutex").is_none(),
             "nothing armed it, so there is nothing to send through"
         );
     }
@@ -1979,7 +2180,110 @@ mod tests {
             Arc::new(|_| {}),
             Arc::new(Mutex::new(None)),
             Arc::new(AtomicBool::new(false)),
+            WindowWaker::new(),
         )
+    }
+
+    /// A cursor change wakes the loop and asks for no redraw.
+    ///
+    /// The device publishes a cursor with no frame behind it — the guest's pointer
+    /// turned into an I-beam over a still desktop — and the loop has to hear it.
+    /// What it hears is `WindowWake::Cursor`, which is the whole of the wake; a
+    /// frame wake would put a redraw on the platform for a picture that has not
+    /// changed.
+    #[test]
+    fn a_cursor_publish_wakes_the_loop_without_a_frame_publish() {
+        let waker = WindowWaker::new();
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&heard);
+        waker.arm_with(Box::new(move |event| {
+            sink.lock().expect("sink").push(event)
+        }));
+
+        waker.publish_cursor(Some(Arc::new(CursorSnapshot {
+            seq: 1,
+            visible: true,
+            glyph: None,
+            guest_pos: (0, 0),
+        })));
+        assert_eq!(
+            *heard.lock().expect("heard"),
+            vec![WindowWake::Cursor],
+            "one cursor wake, and no frame wake"
+        );
+        assert_eq!(waker.cursor().expect("stored").seq, 1);
+    }
+
+    /// A publish that beats the loop is not lost: the slot keeps it for the
+    /// window to read when it opens, and an unarmed waker sends nothing.
+    #[test]
+    fn a_cursor_published_before_the_loop_exists_is_kept() {
+        let waker = WindowWaker::new();
+        waker.publish_cursor(Some(Arc::new(CursorSnapshot {
+            seq: 4,
+            visible: false,
+            glyph: None,
+            guest_pos: (1, 2),
+        })));
+        assert_eq!(waker.cursor().expect("kept").seq, 4);
+        assert!(waker.send.lock().expect("fresh mutex").is_none());
+    }
+
+    /// The reverse: a frame wake reads no cursor and a cursor wake owes no frame.
+    #[test]
+    fn the_two_wakes_owe_different_things() {
+        let mut app = app();
+        app.frame_pending = false;
+        assert!(!app.note_wake(WindowWake::Frame));
+        assert!(app.frame_pending, "a frame owes a redraw");
+        app.frame_pending = false;
+        assert!(app.note_wake(WindowWake::Cursor));
+        assert!(!app.frame_pending, "a cursor owes none");
+    }
+
+    /// A resize or maximize does not touch the guest's cursor.
+    ///
+    /// The cursor is the policy's and the swapchain is the rail's; a `Resized`
+    /// reaches only the second. Checked at the one place a `Resized` lands, with a
+    /// guest glyph showing, through the burst a maximize can be — and through the
+    /// redraw the resize forces.
+    #[test]
+    fn resizing_and_maximizing_leave_the_guest_cursor_alone() {
+        let mut app = app();
+        app.presenter_attached = true;
+        let glyph = CursorGlyph {
+            serial: 9,
+            width: 12,
+            height: 19,
+            hot_x: 0,
+            hot_y: 0,
+            argb: vec![0xFF00_0000u32; 12 * 19].into(),
+        };
+        app.cursor_policy
+            .set_snapshot(Some(Arc::new(CursorSnapshot {
+                seq: 1,
+                visible: true,
+                glyph: Some(glyph),
+                guest_pos: (0, 0),
+            })));
+        app.cursor_policy.set_grabbed(true);
+        assert_eq!(app.cursor_policy.shown(), Shown::Guest { serial: 9 });
+
+        // Maximize: a Resized to the full output, a trimmed one, a scale-factor
+        // round trip's, then un-maximize.
+        for size in [(2560, 1440), (2560, 1400), (2560, 1400), (1280, 800)] {
+            app.note_resized(size);
+            app.take_pending_resize();
+            assert_eq!(
+                app.cursor_policy.shown(),
+                Shown::Guest { serial: 9 },
+                "{size:?}"
+            );
+        }
+        assert!(
+            app.cursor_policy.set_grabbed(true).is_none(),
+            "no transition was owed, so nothing was asked of the window"
+        );
     }
 
     /// A burst of `Resized` between two draws is one call against the last size.

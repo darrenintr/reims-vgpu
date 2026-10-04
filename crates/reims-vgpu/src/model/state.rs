@@ -2609,6 +2609,21 @@ pub struct CursorState {
     pub pixels: Vec<u32>,
     /// True when `pixels` holds a complete glyph for the host console.
     pub glyph_ready: bool,
+    /// How many times the guest has told this device something about its cursor
+    /// that a host window must hear: a show/hide, or a new glyph. Counted per
+    /// *command*, including one that repeats the state already held, because the
+    /// window must be able to tell "the guest hid the cursor" from "the guest has
+    /// never said anything" — the default `show` is true and means nothing.
+    ///
+    /// Zero is therefore the pristine state, and a publisher that sees it owes
+    /// the window no snapshot at all. Position moves are deliberately *not*
+    /// counted: they happen at pointer rate, and the host window places its own
+    /// pointer.
+    pub revision: u64,
+    /// Which glyph `pixels` holds: bumped by every glyph accepted. Distinct from
+    /// `revision` so a show/hide, which keeps the glyph, does not copy a
+    /// megabyte of pixels again to say so.
+    pub glyph_serial: u64,
 }
 
 /// Display shared-state handshake (archive setupSharedState + online poll).
