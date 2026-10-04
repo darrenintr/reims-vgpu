@@ -3034,10 +3034,22 @@ fn emit_sampled_phase() {
     let Some(w) = crate::runtime::sampled_phase::take_window() else {
         return;
     };
+    // The `sampled_field_*` columns are the field witness, nested inside
+    // `resolve_us` rather than beside it; see `sampled_phase`'s doc.
     crate::observe::off(format!(
         "sampled_phase sampled={} lookup_us={} alias_us={} resolve_us={} samplers_us={} \
-         reflect_us={}",
-        w.sampled, w.lookup_us, w.alias_us, w.resolve_us, w.samplers_us, w.reflect_us,
+         reflect_us={} sampled_field_witness_us={} sampled_field_witness_n={} \
+         sampled_field_read_gpa_n={} sampled_field_large_surface_n={}",
+        w.sampled,
+        w.lookup_us,
+        w.alias_us,
+        w.resolve_us,
+        w.samplers_us,
+        w.reflect_us,
+        w.field_witness_us,
+        w.field_witness_n,
+        w.field_read_gpa_n,
+        w.field_large_surface_n,
     ));
 }
 

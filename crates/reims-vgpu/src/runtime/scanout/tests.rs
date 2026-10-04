@@ -1443,3 +1443,34 @@ fn the_efi_console_paint_refuses_a_span_whose_hole_is_not_at_either_end() {
          read, not vouched for by its two endpoints"
     );
 }
+
+/// The sampled-surface field witness samples only when asked, and every other
+/// spelling — unset, `off`, a typo — is the quiet arm.
+#[test]
+fn the_sampled_field_witness_samples_only_when_asked() {
+    use crate::config::Switch;
+    assert!(sampled_field_witness_enabled_from(Switch::On));
+    for quiet in [Switch::Unset, Switch::Off, Switch::Unrecognized] {
+        assert!(!sampled_field_witness_enabled_from(quiet), "{quiet:?}");
+    }
+}
+
+/// On the quiet arm the witness does not even resolve its window, so a bind
+/// that reaches it pays the gate and nothing else — no page-list collect, no
+/// `read_gpa`, no lock.
+#[test]
+fn the_quiet_sampled_field_witness_resolves_no_window() {
+    if sampled_field_witness_enabled() {
+        // The suite was run with the witness asked for; the decision itself is
+        // pinned above.
+        return;
+    }
+    let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut resolved = false;
+    note_sampled_surface_field_window(&state, &host, 7, 1, "test", || {
+        resolved = true;
+        None
+    });
+    assert!(!resolved);
+}
