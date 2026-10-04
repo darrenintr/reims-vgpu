@@ -1484,18 +1484,35 @@ pub(crate) unsafe fn execute_compute_inner(
     for prepared in &simg_slots {
         match &prepared.dst {
             ComputeImageDst::Readback(readback) => {
-                let out = crate::backend::vulkan::engine::pools::read_back_slot(
+                let leased = crate::backend::vulkan::engine::pools::lease_read_back_slot(
                     ctx,
+                    pools,
                     readback,
                     prepared.len as u64,
-                    VkOp::ComputeExecMapImageReadback,
                     VkOp::ComputeExecInvalidateImageReadback,
                 )?;
                 counters.note_readback(
                     prepared.len as u64,
                     super::counters::ReadbackSource::ComputeImage,
                 );
-                images.push(super::types::ComputeImageResult::Bytes(out));
+                if let Some(lease) = leased {
+                    images.push(super::types::ComputeImageResult::Leased(
+                        super::types::ComputeReadbackLease::new(
+                            lease.token,
+                            lease.ptr,
+                            prepared.len,
+                        ),
+                    ));
+                } else {
+                    let out = crate::backend::vulkan::engine::pools::read_back_slot(
+                        ctx,
+                        readback,
+                        prepared.len as u64,
+                        VkOp::ComputeExecMapImageReadback,
+                        VkOp::ComputeExecInvalidateImageReadback,
+                    )?;
+                    images.push(super::types::ComputeImageResult::Bytes(out));
+                }
             }
             // Nothing was read, so nothing is charged to the readback census —
             // that is the saving this arm exists for, and a bump here would
