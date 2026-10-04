@@ -42,6 +42,7 @@ pub(crate) use ladder::{ladder_slug, ladder_slugs};
 /// Re-exported so call sites write `crate::observe::decline_display!(..)`
 /// next to the trait it implements, rather than reaching into the submodule.
 pub(crate) use reims_vgpu_observe::decline_display;
+pub(crate) use reims_vgpu_observe::LineBudget;
 pub use reims_vgpu_observe::{
     decline, driver_watch, emit, footprint, phase_clock, sink, slugs, Decline, Refusal,
 };

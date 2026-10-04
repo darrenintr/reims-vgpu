@@ -10,7 +10,7 @@
 //! one. That is what lets one boot be compared against the other with only the
 //! executor changed.
 //!
-//! Three pieces:
+//! The pieces:
 //! - [`input_map`] — winit event → neutral [`crate::runtime::HostAction`]. Pure
 //!   mapping, no window state, unit-tested off-VM.
 //! - [`keyboard`] — which keys the guest believes are held, and whether the
@@ -19,6 +19,9 @@
 //! - [`capture`] — the per-platform request that stops the desktop from
 //!   consuming shortcuts before the window sees them. A typed refusal where the
 //!   platform cannot honour it.
+//! - [`cursor`] — the guest's pointer image, the other direction from
+//!   [`input_map`]: an immutable snapshot the device publishes, the decision of
+//!   which pointer the window shows, and the RGBA conversion winit takes.
 //! - [`present`] — the window itself: event loop, native surface, and the
 //!   publish → fit → present loop. It also drives [`input_map`] and hands each
 //!   action to an `InputSink`; `lib.rs` wires that to the device's prompt action
@@ -29,6 +32,7 @@
 //! presenters need it too and `backend` may not reach up into this module.
 
 pub mod capture;
+pub mod cursor;
 pub mod input_map;
 pub mod keyboard;
 pub mod present;

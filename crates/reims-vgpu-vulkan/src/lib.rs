@@ -46,6 +46,8 @@
 //!   may branch on topology in a way the guest can observe.
 //! - [`raster`] — the fixed-function state a guest sets, and the two pieces of
 //!   it that are host capabilities rather than mappings.
+//! - [`recreate`] — when a swapchain is owed, in what order the old one goes, and
+//!   what the presenter holds when a step fails.
 //! - [`record`] — issuing the planned commands into a command buffer, and the
 //!   one choice it makes: which spelling of a barrier this host takes.
 //! - [`recording`] — everything one native recording owns, held as one value
@@ -110,6 +112,7 @@ pub mod queues;
 pub mod raster;
 pub mod record;
 pub mod recording;
+pub mod recreate;
 pub mod renderpass;
 pub mod resident;
 pub mod sampler;

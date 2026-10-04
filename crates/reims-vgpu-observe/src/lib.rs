@@ -35,6 +35,8 @@
 //!   produce a line without a reason.
 //! - [`slugs`] — which type claims each slug, and the collision report when two
 //!   do.
+//! - [`budget`] — how many lines of a burst of transitions are written, so a
+//!   maximize is a complete sequence and a drag is a trickle.
 //! - [`driver_watch`] — the one failure a census cannot report, because a census
 //!   line is written at the end of a drain tranche and this one is a tranche
 //!   that never ends: a host driver call that does not return while the drain
@@ -76,6 +78,8 @@
 
 extern crate alloc;
 
+#[cfg(feature = "std")]
+pub mod budget;
 pub mod decline;
 #[cfg(feature = "std")]
 pub mod driver_watch;
@@ -90,6 +94,8 @@ pub mod sink;
 #[cfg(feature = "std")]
 pub mod slugs;
 
+#[cfg(feature = "std")]
+pub use budget::LineBudget;
 pub use decline::{Decline, Refusal};
 #[cfg(feature = "std")]
 pub use emit::{first_sight, state_changed, Emit};

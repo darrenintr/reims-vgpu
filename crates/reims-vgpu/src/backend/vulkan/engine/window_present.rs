@@ -17,6 +17,7 @@ use super::pools::ResourcePools;
 use super::types::{DrawError, PresentRect, WindowPresentSource};
 use super::vk_call::{VkCall, VkOp};
 use crate::backend::vulkan::translate;
+use reims_vgpu_vulkan::recreate;
 
 /// Host-window present transactions submitted to the queue and not yet retired.
 ///
@@ -461,13 +462,32 @@ pub(crate) struct WindowPresenter {
     swapchain_loader: ash::khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
     images: Vec<vk::Image>,
+    /// The extent of the live swapchain. Meaningful only while one exists; the
+    /// blit's aspect-fit reads it.
     extent: vk::Extent2D,
-    desired_extent: vk::Extent2D,
-    recreate_pending: bool,
-    /// Why the next recreation was armed — carried into the always-on
-    /// `host_window_swapchain` line so a live log separates guest/user resizes
-    /// from suboptimal-surface self-heals.
-    recreate_reason: &'static str,
+    /// Whether a swapchain is owed, why, and what the live one was built for.
+    /// The one place those three are decided — see [`recreate::Lifecycle`] for
+    /// the invariant that a presenter with no swapchain always owes one.
+    lifecycle: recreate::Lifecycle,
+    /// The order a swapchain is replaced in, fixed at attach from the kind of
+    /// surface. See [`recreate::Replacement`].
+    replacement: recreate::Replacement,
+    /// Swapchains moved out of the live slot and not yet destroyed, with the
+    /// per-swapchain semaphores they carried. Destroyed only behind a queue
+    /// wait, so a replacement that failed halfway never leaks one and never
+    /// destroys one a present may still name.
+    retired: Vec<RetiredSwapchain>,
+    /// The last window size the presenter was told, before it was raised to at
+    /// least 1x1. Carried only for the attempt log, which has to say what winit
+    /// actually reported.
+    window_extent: (u32, u32),
+    /// The key of the last recreation failure that was reported, so a failure
+    /// retried every redraw is one line and a *different* failure is another.
+    last_recreate_failure: Option<String>,
+    /// How many successful attempts are named per second. Failures are not on
+    /// it — they are named once per distinct failure — and neither is the first
+    /// minimized attempt; see [`Self::report_attempt`].
+    attempt_budget: crate::observe::LineBudget,
     /// Consecutive presents whose acquire or present reported a suboptimal
     /// surface. Each one arms a recreation; see [`SUBOPTIMAL_ALARM_STREAK`].
     suboptimal_streak: u32,
@@ -557,6 +577,26 @@ pub(crate) struct WindowPresenter {
     /// a second query is a second answer that could disagree with the one
     /// attach already refused on.
     present_family_supported: bool,
+}
+
+/// The replacement order for the surface `window` will become.
+///
+/// The one property that decides it is whether that surface is a
+/// `CAMetalLayer`, which the native handle's kind says: AppKit and UIKit views
+/// are layer-backed, and nothing else here is. See [`recreate::Replacement`] for
+/// why it is that property and not the driver's name.
+fn replacement_for(window: RawWindowHandle) -> recreate::Replacement {
+    recreate::Replacement::for_surface(matches!(
+        window,
+        RawWindowHandle::AppKit(_) | RawWindowHandle::UiKit(_)
+    ))
+}
+
+/// A swapchain taken out of service, and what only it used.
+struct RetiredSwapchain {
+    swapchain: vk::SwapchainKHR,
+    /// One per image of that swapchain; see [`WindowPresenter::render_finished`].
+    render_finished: Vec<vk::Semaphore>,
 }
 
 /// Everything one in-flight present owns for as long as its blit is running.
@@ -690,6 +730,8 @@ impl WindowPresenter {
                 super::reason::DrawReason::SwapchainUnavailable,
             ));
         }
+        // Decided before the surface exists, from the handle that will make it.
+        let replacement = replacement_for(window);
         let surface = ash_window::create_surface(&ctx._entry, &ctx.instance, display, window, None)
             .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowCreateSurface, error)))?;
         let surface_loader = ash::khr::surface::Instance::new(&ctx._entry, &ctx.instance);
@@ -789,12 +831,12 @@ impl WindowPresenter {
             swapchain: vk::SwapchainKHR::null(),
             images: Vec::new(),
             extent: vk::Extent2D::default(),
-            desired_extent: vk::Extent2D {
-                width: width.max(1),
-                height: height.max(1),
-            },
-            recreate_pending: true,
-            recreate_reason: "init",
+            lifecycle: recreate::Lifecycle::new(vk::Extent2D { width, height }),
+            replacement,
+            retired: Vec::new(),
+            window_extent: (width, height),
+            last_recreate_failure: None,
+            attempt_budget: crate::observe::LineBudget::new(Instant::now()),
             suboptimal_streak: 0,
             slate_reason: None,
             slate_run: 0,
@@ -830,16 +872,16 @@ impl WindowPresenter {
         Ok(presenter)
     }
 
+    /// The window now has this size.
+    ///
+    /// Cheap on purpose — it records the extent and arms at most one rebuild,
+    /// and the rebuild itself waits for the next present. So any number of calls
+    /// between two presents is one rebuild against the last of them, and calls
+    /// that return to the extent the swapchain was built for cancel it. See
+    /// [`recreate::Lifecycle::request`].
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
-        let requested = vk::Extent2D {
-            width: width.max(1),
-            height: height.max(1),
-        };
-        if requested != self.desired_extent {
-            self.recreate_pending = true;
-            self.recreate_reason = "resize";
-        }
-        self.desired_extent = requested;
+        self.window_extent = (width, height);
+        self.lifecycle.request(vk::Extent2D { width, height });
     }
 
     /// Release every entry whose blit has finished, and say whether the entry
@@ -915,23 +957,85 @@ impl WindowPresenter {
         }
     }
 
-    /// Choose and build a swapchain for the surface as it is right now.
+    /// Build the swapchain the lifecycle owes, for the surface as it is right
+    /// now.
     ///
-    /// `Ok(false)` is a surface with no area — a minimized window — which is
-    /// not a failure and not a capability this host lacks: it resolves when the
-    /// window comes back. The presenter keeps `recreate_pending` and the caller
-    /// reports the frame busy rather than acquiring against a null swapchain.
+    /// `Ok(true)` means a swapchain is live and may be acquired from. `Ok(false)`
+    /// is a surface with no area — a minimized window — which is not a failure
+    /// and not a capability this host lacks: it resolves when the window comes
+    /// back, the debt stays owed, and the caller reports the frame busy rather
+    /// than acquiring against a swapchain the surface has outgrown. `Err` is a
+    /// failure whose state is already settled: the lifecycle still owes a
+    /// swapchain, so the next present tries again.
+    ///
+    /// Every attempt, whatever it ends in, is one `host_window_swapchain_attempt`
+    /// line — see [`AttemptRecord`].
     unsafe fn recreate_swapchain(&mut self, ctx: &DeviceContext) -> Result<bool, DrawError> {
-        ctx.queue_wait_idle()
-            .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowQueueWaitIdle, error)))?;
-        let caps = self
+        let Some(attempt) = self.lifecycle.begin() else {
+            return Ok(true);
+        };
+        let mut record = AttemptRecord::begin(
+            &attempt,
+            self.lifecycle.pending(),
+            self.window_extent,
+            self.replacement,
+            self.swapchain != vk::SwapchainKHR::null(),
+        );
+        let (settled, result) = self.rebuild(ctx, &attempt, &mut record);
+        self.lifecycle.settle(attempt, settled);
+        record.pending_after = self.lifecycle.pending();
+        self.report_attempt(&record, &result);
+        result
+    }
+
+    /// The body of [`Self::recreate_swapchain`]: ask the surface, choose, and
+    /// replace — returning how the lifecycle should settle alongside the result.
+    ///
+    /// Nothing before the replacement touches the live swapchain, and the
+    /// surface questions come *before* the queue wait. They used to come after
+    /// it, so a minimized window paid a `vkQueueWaitIdle` every redraw to learn
+    /// it still had no area.
+    unsafe fn rebuild(
+        &mut self,
+        ctx: &DeviceContext,
+        attempt: &recreate::Attempt,
+        record: &mut AttemptRecord,
+    ) -> (recreate::Settled, Result<bool, DrawError>) {
+        use recreate::{Previous, Settled};
+        let untouched = if attempt.from.is_some() {
+            Previous::Kept
+        } else {
+            Previous::None
+        };
+        let early = |record: &mut AttemptRecord, op: VkOp, error: vk::Result| {
+            let call = VkCall::new(op, error);
+            record.result = call.to_string();
+            (
+                Settled::Failed {
+                    previous: untouched,
+                },
+                Err(DrawError::VkCall(call)),
+            )
+        };
+        let caps = match self
             .surface_loader
             .get_physical_device_surface_capabilities(ctx.pd, self.surface)
-            .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowSurfaceCaps, error)))?;
-        let formats = self
+        {
+            Ok(caps) => caps,
+            Err(error) => return early(record, VkOp::WindowSurfaceCaps, error),
+        };
+        record.surface = Some((
+            caps.current_extent,
+            caps.min_image_extent,
+            caps.max_image_extent,
+        ));
+        let formats = match self
             .surface_loader
             .get_physical_device_surface_formats(ctx.pd, self.surface)
-            .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowSurfaceFormats, error)))?;
+        {
+            Ok(formats) => formats,
+            Err(error) => return early(record, VkOp::WindowSurfaceFormats, error),
+        };
         // A failed mode query arrives as an empty slice: FIFO is the only mode
         // the specification requires of every surface, so a surface that could
         // not be asked still gets the rung it is guaranteed to have.
@@ -953,7 +1057,7 @@ impl WindowPresenter {
             },
             reims_vgpu_vulkan::swapchain::Wanted {
                 format: translate::pixel::SCANOUT_FORMAT,
-                extent: self.desired_extent,
+                extent: attempt.requested,
                 // The composition blits the guest's frame in rather than
                 // rendering to the image.
                 transfer_destination: true,
@@ -968,124 +1072,126 @@ impl WindowPresenter {
                 // cadence line's `busy_no_area` carries the rate.
                 if !self.surface_had_no_area {
                     self.surface_had_no_area = true;
+                    record.first_not_ready = true;
                     crate::observe::off(format!("host_window_swapchain status=not_ready {why}"));
                 }
-                self.recreate_pending = true;
-                return Ok(false);
+                record.result = format!("not_ready {why}");
+                return (Settled::NotReady, Ok(false));
             }
             Err(refusal) => {
                 let reason = super::reason::DrawReason::SwapchainSurface(refusal);
-                crate::observe::Emit::decline("host_window_swapchain", &reason).fail();
-                return Err(DrawError::Unsupported(reason));
+                record.result = format!("refused {reason}");
+                return (
+                    Settled::Failed {
+                        previous: untouched,
+                    },
+                    Err(DrawError::Unsupported(reason)),
+                );
             }
         };
         self.surface_had_no_area = false;
-        let extent = plan.extent;
-        // Destroy the old swapchain BEFORE creating its replacement, and create
-        // the replacement without `old_swapchain`. MoltenVK (verified against
-        // v1.4.1 MVKSwapchain.mm) works around a Metal present-callback
-        // regression by setting the CAMetalLayer drawableSize to {1,1} when a
-        // swapchain that still has 1-2 unpresented images is retired; with
-        // `old_swapchain`, that clobber runs AFTER the new swapchain has
-        // already configured the layer, and nothing restores the size — every
-        // later present then succeeds (flagged suboptimal only) while the
-        // window displays a single stretched pixel. Destroy-first makes the new
-        // swapchain's layer configuration the final write, the ordering that
-        // workaround assumes. The queue idled above, so no submitted work
-        // references the old swapchain.
-        let from = self.extent;
-        if self.swapchain != vk::SwapchainKHR::null() {
-            self.swapchain_loader
-                .destroy_swapchain(self.swapchain, None);
-            self.swapchain = vk::SwapchainKHR::null();
-            self.images.clear();
-        }
-        // `SwapchainKHR::null()` rather than the swapchain destroyed above: the
-        // whole point of the paragraph above is that this one carries no old
-        // swapchain.
-        let swapchain = self
-            .swapchain_loader
-            .create_swapchain(
-                &plan.create_info(self.surface, vk::SwapchainKHR::null()),
-                None,
-            )
-            .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowCreateSwapchain, error)))?;
-        let images = self
-            .swapchain_loader
-            .get_swapchain_images(swapchain)
-            .map_err(|error| {
-                self.swapchain_loader.destroy_swapchain(swapchain, None);
-                DrawError::VkCall(VkCall::new(VkOp::WindowGetSwapchainImages, error))
-            })?;
-        // Fresh per-recreation semaphores: an acquire whose submit later failed
-        // leaves `image_available` with a signal nobody consumed, which is
-        // invalid to reuse on the new swapchain's first acquire. Created before
-        // the old pair is destroyed so a failure leaves the presenter
-        // consistent.
-        // Every entry gets a fresh pair, not just the one about to be used. The
-        // queue idled above, so no entry has work outstanding — but an entry
-        // whose acquire succeeded and whose submit then failed still holds an
-        // unconsumed signal on its `image_available`, and that is invalid to
-        // reuse against the new swapchain whichever entry it belongs to.
-        // One acquire semaphore per entry and one render semaphore per swapchain
-        // **image** — the two counts are independent and the image count is only
-        // known here, which is the other reason the render semaphores live with
-        // the swapchain rather than with the entries.
-        let mut fresh_acquire: Vec<vk::Semaphore> = Vec::with_capacity(self.frames.len());
-        let mut fresh_render: Vec<vk::Semaphore> = Vec::with_capacity(images.len());
-        let mut make = || -> Result<(), (VkOp, vk::Result)> {
-            for _ in 0..self.frames.len() {
-                fresh_acquire.push(
-                    ctx.device
-                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                        .map_err(|e| (VkOp::WindowCreateAcquireSemaphore, e))?,
-                );
-            }
-            for _ in 0..images.len() {
-                fresh_render.push(
-                    ctx.device
-                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                        .map_err(|e| (VkOp::WindowCreateRenderSemaphore, e))?,
-                );
-            }
-            Ok(())
+        record.plan = Some(plan.extent);
+        let mut rebuild = Rebuild {
+            presenter: self,
+            ctx,
+            plan,
+            prepare_op: VkOp::WindowGetSwapchainImages,
         };
-        if let Err((op, error)) = make() {
-            for semaphore in fresh_acquire.into_iter().chain(fresh_render) {
-                ctx.device.destroy_semaphore(semaphore, None);
+        match recreate::replace(rebuild.presenter.replacement, &mut rebuild) {
+            Ok(()) => {
+                record.result = "ok".to_string();
+                record.images = Some(rebuild.presenter.images.len());
+                record.previous = if attempt.from.is_some() {
+                    Previous::Replaced
+                } else {
+                    Previous::None
+                };
+                let (from, images, reason) = (
+                    attempt.from.unwrap_or_default(),
+                    rebuild.presenter.images.len(),
+                    attempt.reason,
+                );
+                if plan.extent != from {
+                    // A geometry change is progress; only a same-extent
+                    // suboptimal loop should keep accumulating toward the alarm.
+                    self.suboptimal_streak = 0;
+                }
+                crate::observe::off(swapchain_recreated_line(
+                    from,
+                    plan.extent,
+                    reason.slug(),
+                    plan.present_mode,
+                    images,
+                ));
+                (
+                    Settled::Built {
+                        extent: plan.extent,
+                    },
+                    Ok(true),
+                )
             }
-            self.swapchain_loader.destroy_swapchain(swapchain, None);
-            return Err(DrawError::VkCall(VkCall::new(op, error)));
+            Err(failure) => {
+                let op = match failure.step {
+                    recreate::Step::Idle => VkOp::WindowQueueWaitIdle,
+                    recreate::Step::Create => VkOp::WindowCreateSwapchain,
+                    recreate::Step::Prepare => rebuild.prepare_op,
+                };
+                let call = VkCall::new(op, failure.error);
+                record.result = call.to_string();
+                record.previous = failure.previous;
+                (
+                    Settled::Failed {
+                        previous: failure.previous,
+                    },
+                    Err(DrawError::VkCall(call)),
+                )
+            }
         }
-        for (frame, image_available) in self.frames.iter_mut().zip(fresh_acquire) {
-            ctx.device.destroy_semaphore(frame.image_available, None);
-            frame.image_available = image_available;
-            // The queue idled, so nothing is outstanding regardless of what the
-            // latch said before.
-            end_present_in_flight(frame);
+    }
+
+    /// Say what an attempt did.
+    ///
+    /// An attempt is a state transition, and a maximize is a handful of them, so
+    /// each one is a line on the census channel — within a per-second budget,
+    /// because a drag is the same transition sixty times a second and the line
+    /// after a gap says how many it did not name. A *failed* attempt is retried
+    /// every redraw until it succeeds, so it is a line on the always-on failure
+    /// channel once per distinct failure and again when the failure ends. A
+    /// minimized window repeats "no area" the same way, and is named by its first
+    /// attempt and by the attempt that ends it.
+    fn report_attempt(&mut self, record: &AttemptRecord, result: &Result<bool, DrawError>) {
+        match result {
+            Err(_) => {
+                let key = format!("{} {}", record.reason.slug(), record.result);
+                if self.last_recreate_failure.as_deref() != Some(key.as_str()) {
+                    crate::observe::fail(format!("{} FAIL", record.line()));
+                    self.last_recreate_failure = Some(key);
+                }
+            }
+            Ok(false) => {
+                // `rebuild` already said "not_ready" once per run; the attempt
+                // line adds the extents that explain it, and one is enough.
+                if record.first_not_ready {
+                    crate::observe::off(record.line());
+                }
+            }
+            Ok(true) => {
+                let recovered = std::mem::take(&mut self.last_recreate_failure).is_some();
+                // A recovery is never budgeted away: it is the line that closes
+                // the failure above it.
+                let admitted = self.attempt_budget.admit(Instant::now());
+                if recovered {
+                    crate::observe::off(format!("{} recovered=1", record.line()));
+                } else if let Some(suppressed) = admitted {
+                    let gap = if suppressed == 0 {
+                        String::new()
+                    } else {
+                        format!(" suppressed_before={suppressed}")
+                    };
+                    crate::observe::off(format!("{}{gap}", record.line()));
+                }
+            }
         }
-        for semaphore in self.render_finished.drain(..) {
-            ctx.device.destroy_semaphore(semaphore, None);
-        }
-        self.render_finished = fresh_render;
-        self.swapchain = swapchain;
-        self.images = images;
-        self.extent = extent;
-        self.desired_extent = extent;
-        self.recreate_pending = false;
-        if extent != from {
-            // A geometry change is progress; only a same-extent suboptimal
-            // loop should keep accumulating toward the alarm.
-            self.suboptimal_streak = 0;
-        }
-        crate::observe::off(swapchain_recreated_line(
-            from,
-            extent,
-            self.recreate_reason,
-            plan.present_mode,
-            self.images.len(),
-        ));
-        Ok(true)
     }
 
     pub(crate) unsafe fn begin_present(
@@ -1106,9 +1212,9 @@ impl WindowPresenter {
             self.note_cadence(false, false);
             return Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy));
         }
-        if self.swapchain == vk::SwapchainKHR::null() || self.recreate_pending {
+        if self.lifecycle.must_rebuild() {
             // A minimized window has no swapchain to acquire from and nothing
-            // is wrong: the recreation stays armed and this frame is busy. The
+            // is wrong: the recreation stays owed and this frame is busy. The
             // gate is counted apart from the other two because it has a
             // different fix from both — the fence gate says the engine queue is
             // behind and the acquire gate says the display is pacing us, while
@@ -1137,8 +1243,7 @@ impl WindowPresenter {
                 return Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy));
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                self.recreate_pending = true;
-                self.recreate_reason = "acquire_out_of_date";
+                self.lifecycle.arm(recreate::Reason::AcquireOutOfDate);
                 self.cadence_busy_acquire = self.cadence_busy_acquire.saturating_add(1);
                 self.note_cadence(false, false);
                 return Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy));
@@ -1470,8 +1575,7 @@ impl WindowPresenter {
                 // window that still counts successful presents.
                 let suboptimal = finished.acquire_suboptimal || present_suboptimal;
                 if suboptimal {
-                    self.recreate_pending = true;
-                    self.recreate_reason = "suboptimal";
+                    self.lifecycle.arm(recreate::Reason::Suboptimal);
                     self.suboptimal_streak = self.suboptimal_streak.saturating_add(1);
                     if self.suboptimal_streak == SUBOPTIMAL_ALARM_STREAK {
                         let decline = WindowPresentDecline::SuboptimalPersistent {
@@ -1496,8 +1600,7 @@ impl WindowPresenter {
                 ))
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                self.recreate_pending = true;
-                self.recreate_reason = "present_out_of_date";
+                self.lifecycle.arm(recreate::Reason::PresentOutOfDate);
                 self.note_cadence(false, false);
                 Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy))
             }
@@ -1819,12 +1922,295 @@ impl WindowPresenter {
             ctx.device.destroy_semaphore(semaphore, None);
         }
         ctx.device.destroy_command_pool(self.cmd_pool, None);
+        // Drained, like the entries above, because `destroy` may run twice. The
+        // queue idled at the top, so nothing names a swapchain parked here.
+        for retired in self.retired.drain(..) {
+            for semaphore in retired.render_finished {
+                ctx.device.destroy_semaphore(semaphore, None);
+            }
+            if retired.swapchain != vk::SwapchainKHR::null() {
+                self.swapchain_loader
+                    .destroy_swapchain(retired.swapchain, None);
+            }
+        }
         if self.swapchain != vk::SwapchainKHR::null() {
             self.swapchain_loader
                 .destroy_swapchain(self.swapchain, None);
             self.swapchain = vk::SwapchainKHR::null();
         }
         self.surface_loader.destroy_surface(self.surface, None);
+    }
+}
+
+/// What [`recreate::Prepared`](recreate::Swapchains::Prepared) is for a real
+/// swapchain: the images it reported and the semaphores built to match them.
+struct Prepared {
+    images: Vec<vk::Image>,
+    /// One per presenter entry, replacing each entry's `image_available`.
+    acquire: Vec<vk::Semaphore>,
+    /// One per swapchain image.
+    render_finished: Vec<vk::Semaphore>,
+}
+
+/// The presenter and the device, as [`recreate::replace`] sees them.
+struct Rebuild<'a> {
+    presenter: &'a mut WindowPresenter,
+    ctx: &'a DeviceContext,
+    plan: reims_vgpu_vulkan::swapchain::Plan,
+    /// Which call a failed [`recreate::Step::Prepare`] came from, because the
+    /// step is one and the calls are three.
+    prepare_op: VkOp,
+}
+
+impl recreate::Swapchains for Rebuild<'_> {
+    type Handle = vk::SwapchainKHR;
+    type Prepared = Prepared;
+
+    fn current(&self) -> Option<vk::SwapchainKHR> {
+        (self.presenter.swapchain != vk::SwapchainKHR::null()).then_some(self.presenter.swapchain)
+    }
+
+    fn idle(&mut self) -> Result<(), vk::Result> {
+        self.ctx.queue_wait_idle()
+    }
+
+    fn create(&mut self, old: Option<vk::SwapchainKHR>) -> Result<vk::SwapchainKHR, vk::Result> {
+        // `null` where there is no old swapchain, or where the ordering is the
+        // destroy-first one — which names none; see `recreate::Replacement`.
+        let create_info = self
+            .plan
+            .create_info(self.presenter.surface, old.unwrap_or_default());
+        // SAFETY: the surface and the loader belong to this presenter, and
+        // `old`, when named, is its live swapchain.
+        unsafe {
+            self.presenter
+                .swapchain_loader
+                .create_swapchain(&create_info, None)
+        }
+    }
+
+    fn prepare(&mut self, new: vk::SwapchainKHR) -> Result<Prepared, vk::Result> {
+        let ctx = self.ctx;
+        // SAFETY: `new` was just created by this presenter's loader.
+        let images = unsafe { self.presenter.swapchain_loader.get_swapchain_images(new) }
+            .inspect_err(|_| self.prepare_op = VkOp::WindowGetSwapchainImages)?;
+        // Fresh per-recreation semaphores: an acquire whose submit later failed
+        // leaves `image_available` with a signal nobody consumed, which is
+        // invalid to reuse on the new swapchain's first acquire. Every entry
+        // gets a fresh one, not just the one about to be used, because an entry
+        // whose acquire succeeded and whose submit then failed holds that signal
+        // whichever entry it is. One acquire semaphore per entry and one render
+        // semaphore per swapchain **image** — the two counts are independent and
+        // the image count is only known here, which is the other reason the
+        // render semaphores live with the swapchain rather than with the entries.
+        // Made before anything is replaced, so a failure leaves the presenter as
+        // it was.
+        let mut acquire = Vec::with_capacity(self.presenter.frames.len());
+        let mut render_finished = Vec::with_capacity(images.len());
+        let made = (|| -> Result<(), (VkOp, vk::Result)> {
+            for _ in 0..self.presenter.frames.len() {
+                // SAFETY: a plain semaphore on this presenter's device.
+                acquire.push(
+                    unsafe {
+                        ctx.device
+                            .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                    }
+                    .map_err(|e| (VkOp::WindowCreateAcquireSemaphore, e))?,
+                );
+            }
+            for _ in 0..images.len() {
+                // SAFETY: as above.
+                render_finished.push(
+                    unsafe {
+                        ctx.device
+                            .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                    }
+                    .map_err(|e| (VkOp::WindowCreateRenderSemaphore, e))?,
+                );
+            }
+            Ok(())
+        })();
+        if let Err((op, error)) = made {
+            for semaphore in acquire.into_iter().chain(render_finished) {
+                // SAFETY: made above and never handed to anything.
+                unsafe { ctx.device.destroy_semaphore(semaphore, None) };
+            }
+            self.prepare_op = op;
+            return Err(error);
+        }
+        Ok(Prepared {
+            images,
+            acquire,
+            render_finished,
+        })
+    }
+
+    fn discard(&mut self, new: vk::SwapchainKHR, prepared: Option<Prepared>) {
+        if let Some(prepared) = prepared {
+            for semaphore in prepared.acquire.into_iter().chain(prepared.render_finished) {
+                // SAFETY: made by `prepare` and never handed to anything.
+                unsafe { self.ctx.device.destroy_semaphore(semaphore, None) };
+            }
+        }
+        // SAFETY: `new` was never adopted, so no acquire or present names it.
+        unsafe {
+            self.presenter.swapchain_loader.destroy_swapchain(new, None);
+        }
+    }
+
+    fn retire_current(&mut self) {
+        let presenter = &mut *self.presenter;
+        let swapchain = std::mem::replace(&mut presenter.swapchain, vk::SwapchainKHR::null());
+        let render_finished = std::mem::take(&mut presenter.render_finished);
+        presenter.images.clear();
+        if swapchain != vk::SwapchainKHR::null() || !render_finished.is_empty() {
+            presenter.retired.push(RetiredSwapchain {
+                swapchain,
+                render_finished,
+            });
+        }
+    }
+
+    fn adopt(&mut self, new: vk::SwapchainKHR, prepared: Prepared) {
+        let presenter = &mut *self.presenter;
+        for (frame, image_available) in presenter.frames.iter_mut().zip(prepared.acquire) {
+            // SAFETY: called with the queue idle, so nothing waits on or signals
+            // the entry's old semaphore.
+            unsafe {
+                self.ctx
+                    .device
+                    .destroy_semaphore(frame.image_available, None);
+            }
+            frame.image_available = image_available;
+            // The queue idled, so nothing is outstanding regardless of what the
+            // latch said before.
+            end_present_in_flight(frame);
+        }
+        presenter.swapchain = new;
+        presenter.images = prepared.images;
+        presenter.render_finished = prepared.render_finished;
+        presenter.extent = self.plan.extent;
+    }
+
+    fn reap(&mut self) {
+        for retired in self.presenter.retired.drain(..) {
+            for semaphore in retired.render_finished {
+                // SAFETY: called with the queue idle.
+                unsafe { self.ctx.device.destroy_semaphore(semaphore, None) };
+            }
+            if retired.swapchain != vk::SwapchainKHR::null() {
+                // SAFETY: called with the queue idle, so no present names it.
+                unsafe {
+                    self.presenter
+                        .swapchain_loader
+                        .destroy_swapchain(retired.swapchain, None);
+                }
+            }
+        }
+    }
+}
+
+/// Everything one recreation attempt knew and did, in the order the log line
+/// reads it.
+///
+/// A value built up across the attempt and formatted once, so the line is the
+/// same whichever of the nine exits the attempt took. Pure — it holds no handle
+/// — so the line's fields are asserted without a device.
+struct AttemptRecord {
+    reason: recreate::Reason,
+    policy: recreate::Replacement,
+    /// What winit last reported, before it was raised to at least 1x1.
+    winit: (u32, u32),
+    /// What the lifecycle took that to be.
+    desired: vk::Extent2D,
+    /// The surface's `currentExtent`, `minImageExtent` and `maxImageExtent`, once
+    /// the surface has been asked.
+    surface: Option<(vk::Extent2D, vk::Extent2D, vk::Extent2D)>,
+    /// The extent the plan chose, once there is one.
+    plan: Option<vk::Extent2D>,
+    from: Option<vk::Extent2D>,
+    old_exists: bool,
+    result: String,
+    images: Option<usize>,
+    previous: recreate::Previous,
+    pending_before: Option<recreate::Reason>,
+    pending_after: Option<recreate::Reason>,
+    /// Whether this is the first attempt of a run against a surface with no
+    /// area, which is the one that is named.
+    first_not_ready: bool,
+}
+
+impl AttemptRecord {
+    fn begin(
+        attempt: &recreate::Attempt,
+        pending_before: Option<recreate::Reason>,
+        winit: (u32, u32),
+        policy: recreate::Replacement,
+        old_exists: bool,
+    ) -> Self {
+        Self {
+            reason: attempt.reason,
+            policy,
+            winit,
+            desired: attempt.requested,
+            surface: None,
+            plan: None,
+            from: attempt.from,
+            old_exists,
+            result: "unfinished".to_string(),
+            images: None,
+            // Until something says otherwise the attempt has not touched it.
+            previous: if attempt.from.is_some() {
+                recreate::Previous::Kept
+            } else {
+                recreate::Previous::None
+            },
+            pending_before,
+            pending_after: None,
+            first_not_ready: false,
+        }
+    }
+
+    fn line(&self) -> String {
+        fn extent(extent: Option<vk::Extent2D>) -> String {
+            // `u32::MAX` is the surface saying the swapchain chooses, and is
+            // printed as itself so it cannot be mistaken for a size.
+            extent.map_or_else(
+                || "none".to_string(),
+                |e| format!("{}x{}", e.width, e.height),
+            )
+        }
+        fn pending(reason: Option<recreate::Reason>) -> &'static str {
+            reason.map_or("none", recreate::Reason::slug)
+        }
+        let (current, min, max) = match self.surface {
+            Some((current, min, max)) => (Some(current), Some(min), Some(max)),
+            None => (None, None, None),
+        };
+        format!(
+            "host_window_swapchain_attempt trigger={} policy={} winit={}x{} desired={} \
+             surface_current={} surface_min={} surface_max={} plan={} previous_extent={} \
+             old_exists={} result={} images={} previous={} pending_before={} pending_after={}",
+            self.reason.slug(),
+            self.policy.slug(),
+            self.winit.0,
+            self.winit.1,
+            extent(Some(self.desired)),
+            extent(current),
+            extent(min),
+            extent(max),
+            extent(self.plan),
+            extent(self.from),
+            u8::from(self.old_exists),
+            // `result` carries free text from a refusal; the line is
+            // whitespace-delimited, so it is the one field that is quoted.
+            format_args!("{:?}", self.result),
+            self.images
+                .map_or_else(|| "none".to_string(), |n| n.to_string()),
+            self.previous.slug(),
+            pending(self.pending_before),
+            pending(self.pending_after),
+        )
     }
 }
 
@@ -2004,6 +2390,106 @@ mod tests {
             swapchain_recreated_line(from, to, "init", vk::PresentModeKHR::FIFO, 2)
                 .contains("present_mode=fifo images=2")
         );
+    }
+
+    fn ext(width: u32, height: u32) -> vk::Extent2D {
+        vk::Extent2D { width, height }
+    }
+
+    /// The Wayland maximize that motivated the line, with every field the
+    /// diagnosis asks for. The surface names no current extent
+    /// (`u32::MAX`), so the swapchain chooses and `desired` is what it was built
+    /// at; the line must say so rather than print a size that was never asked.
+    #[test]
+    fn an_attempt_line_names_every_field_a_maximize_is_diagnosed_from() {
+        let attempt = recreate::Attempt {
+            reason: recreate::Reason::Resize,
+            requested: ext(2560, 1400),
+            from: Some(ext(1280, 800)),
+        };
+        let mut record = AttemptRecord::begin(
+            &attempt,
+            Some(recreate::Reason::Resize),
+            (2560, 1400),
+            recreate::Replacement::Transactional,
+            true,
+        );
+        record.surface = Some((ext(u32::MAX, u32::MAX), ext(1, 1), ext(16384, 16384)));
+        record.plan = Some(ext(2560, 1400));
+        record.result = "ok".to_string();
+        record.images = Some(3);
+        record.previous = recreate::Previous::Replaced;
+        record.pending_after = None;
+        assert_eq!(
+            record.line(),
+            "host_window_swapchain_attempt trigger=resize policy=transactional \
+             winit=2560x1400 desired=2560x1400 surface_current=4294967295x4294967295 \
+             surface_min=1x1 surface_max=16384x16384 plan=2560x1400 \
+             previous_extent=1280x800 old_exists=1 result=\"ok\" images=3 \
+             previous=replaced pending_before=resize pending_after=none"
+        );
+    }
+
+    /// An attempt that failed before the surface answered still prints, with
+    /// `none` where it never learned — a line that omitted the fields would read
+    /// as a different, shorter record.
+    #[test]
+    fn a_failed_attempt_prints_none_for_what_it_never_learned() {
+        let attempt = recreate::Attempt {
+            reason: recreate::Reason::Init,
+            requested: ext(1280, 800),
+            from: None,
+        };
+        let mut record = AttemptRecord::begin(
+            &attempt,
+            Some(recreate::Reason::Init),
+            (1280, 800),
+            recreate::Replacement::DestroyFirst,
+            false,
+        );
+        record.result = "reason=vk_window_surface_caps error=ERROR_SURFACE_LOST_KHR".to_string();
+        record.pending_after = Some(recreate::Reason::Init);
+        let line = record.line();
+        assert!(line.contains("policy=destroy_first"), "{line}");
+        assert!(line.contains("surface_current=none"), "{line}");
+        assert!(line.contains("plan=none previous_extent=none"), "{line}");
+        assert!(line.contains("old_exists=0"), "{line}");
+        assert!(line.contains("images=none previous=none"), "{line}");
+        assert!(line.contains("pending_after=init"), "{line}");
+        // The free text is quoted, so the line stays one whitespace-delimited
+        // record.
+        assert!(
+            line.contains("result=\"reason=vk_window_surface_caps error=ERROR_SURFACE_LOST_KHR\""),
+            "{line}"
+        );
+    }
+
+    /// The surface kind is the whole of the policy decision, and only a
+    /// `CAMetalLayer` takes the destroy-first ordering.
+    #[test]
+    fn the_replacement_order_follows_the_surface_kind() {
+        use raw_window_handle::{
+            AppKitWindowHandle, UiKitWindowHandle, WaylandWindowHandle, XcbWindowHandle,
+            XlibWindowHandle,
+        };
+        use std::ptr::NonNull;
+        let ptr = NonNull::<std::ffi::c_void>::dangling();
+        let layer_backed = replacement_for;
+        assert_eq!(
+            layer_backed(RawWindowHandle::AppKit(AppKitWindowHandle::new(ptr))),
+            recreate::Replacement::DestroyFirst
+        );
+        assert_eq!(
+            layer_backed(RawWindowHandle::UiKit(UiKitWindowHandle::new(ptr))),
+            recreate::Replacement::DestroyFirst
+        );
+        for native in [
+            RawWindowHandle::Wayland(WaylandWindowHandle::new(ptr)),
+            RawWindowHandle::Xlib(XlibWindowHandle::new(1)),
+            RawWindowHandle::Xcb(XcbWindowHandle::new(std::num::NonZeroU32::MIN)),
+        ] {
+            assert_eq!(layer_backed(native), recreate::Replacement::Transactional);
+        }
     }
 
     #[test]

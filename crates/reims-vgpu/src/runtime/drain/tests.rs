@@ -1146,6 +1146,45 @@ fn translation_deferred_holds_sibling_unmap_head_and_stamp() {
     assert_eq!(state.translation_order_hold_mask, 0);
 }
 
+/// Every show/hide the guest sends is a revision, including one that repeats
+/// the state already held.
+///
+/// The host window distinguishes "the guest hid its cursor" from "the guest has
+/// never said anything" by this count, because the device's `show` starts true
+/// and means nothing. A command that changed no field still has to count: the
+/// first hide on a pristine device is the one that decides whether the pointer is
+/// drawn at all.
+#[test]
+fn every_cursor_show_command_advances_the_revision_the_window_listens_to() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    assert_eq!(state.cursor.revision, 0, "pristine: nothing said");
+    for (expected, flag) in [(1u64, 0u32), (2, 0), (3, 1)] {
+        let mut payload = vec![0u8; crate::protocol::fifo::CURSOR_SHOW_LEN];
+        payload[crate::protocol::fifo::CURSOR_SHOW_FLAG..][..4]
+            .copy_from_slice(&flag.to_le_bytes());
+        process_child_packet(
+            &mut state,
+            &mut host,
+            4,
+            &Packet {
+                opcode: CHILD_OP_CURSOR_SHOW,
+                stamp_waits: Vec::new(),
+                total_size: PACKET_HEADER_LEN + payload.len() as u32,
+                completion_stamp: 0,
+                payload,
+                next_head: 0,
+            },
+        );
+        assert_eq!(state.cursor.revision, expected);
+        assert_eq!(state.cursor.show, flag != 0);
+    }
+    assert_eq!(
+        state.cursor.glyph_serial, 0,
+        "a show/hide keeps the glyph and does not claim to have sent one"
+    );
+}
+
 /// A cursor pitch that does not fit a word must be refused, not wrapped.
 ///
 /// `CmdSetCursorGlyph` carries `stride` in eight bytes and the drain wanted
@@ -1202,6 +1241,11 @@ fn a_cursor_pitch_wider_than_a_word_is_refused_rather_than_truncated() {
         "a sprite read at a pitch the guest did not use is not a glyph"
     );
     assert!(state.cursor.pixels.is_empty());
+    assert_eq!(
+        (state.cursor.revision, state.cursor.glyph_serial),
+        (0, 0),
+        "a refused glyph is not a change the host window should hear"
+    );
     let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
     assert!(
         log.contains("reason=cursor_glyph_mapped_len"),
