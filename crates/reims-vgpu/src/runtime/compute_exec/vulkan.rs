@@ -1367,6 +1367,15 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     return e;
                 }
             }
+            ComputeImageResult::Leased(lease) => {
+                crate::runtime::drain::note_store_route("compute_wb_readback_leased");
+                if let Err(e) = writeback_texture_bytes(state, host, task_id, t, lease.bytes()) {
+                    return e;
+                }
+                // `lease` drops here, after the guest scatter has consumed the
+                // mapped bytes, returning the slot to the readback pool without
+                // taking the engine lock.
+            }
             // The engine copied straight into the guest's pages, so there is no
             // writeback to do and no bytes to do it from.
             ComputeImageResult::Landed { bytes } => {
