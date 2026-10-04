@@ -2635,6 +2635,13 @@ pub struct DisplayHandshake {
     pub online_tries: u32,
     /// Cadence counter for ONLINE re-drive (archive display_poll_ctr).
     pub poll_ctr: u32,
+    /// Configuration generation last published at descriptor +0x200.
+    ///
+    /// Zero is the pristine state before the first descriptor refill. Each
+    /// SETUP_SHARED_STATE advances it to the next non-zero value so a guest
+    /// re-registering the display can distinguish the new descriptor from the
+    /// one it previously acknowledged.
+    pub descriptor_generation: u32,
     /// Samples already logged per observed display-transaction wire shape,
     /// keyed by `(opcode, payload_len, pipe_index, task_field_is_set)`.
     ///
