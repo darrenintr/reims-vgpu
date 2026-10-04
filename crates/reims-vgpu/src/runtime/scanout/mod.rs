@@ -1392,6 +1392,11 @@ const SAMPLED_FIELD_MIN_TEXELS: u64 = 1 << 20;
 /// Reads guest pages and settles nothing, for [`note_present_field_witness`]'s
 /// reason: settling here would make the instrument cause the visibility it is
 /// trying to observe.
+///
+/// **Off unless [`crate::config::SAMPLED_FIELD_WITNESS`] asks for it.** It runs
+/// on fragment binds of the hot full-screen compositor layers, inside
+/// `sampled_phase`'s `ResolveSource` span, at up to 256 `read_gpa` calls a
+/// bind; see [`sampled_field_witness_enabled`].
 pub fn note_sampled_surface_field<M: HostMemory>(
     state: &DeviceState,
     host: &M,
@@ -1399,10 +1404,34 @@ pub fn note_sampled_surface_field<M: HostMemory>(
     texture_ref: u32,
     route: &str,
 ) {
-    let Some(window) = SampledFieldWindow::of_mapping(state, mapping_id) else {
-        return;
-    };
-    note_sampled_surface_field_window(state, host, mapping_id, texture_ref, route, window);
+    note_sampled_surface_field_window(state, host, mapping_id, texture_ref, route, || {
+        SampledFieldWindow::of_mapping(state, mapping_id)
+    });
+}
+
+/// Whether the sampled-surface field witness reads guest pages at all, which by
+/// default it does not.
+///
+/// Measured rather than cautious: on a driven Safari drag on the RX 7600 the
+/// witness sat inside `sampled_phase`'s `resolve_us` while that column read
+/// 405-412 ms/s, with no guest gather in the window to account for it. The
+/// `sampled_field_witness_*` columns on the same line are what attribute it.
+///
+/// Read once and cached, for [`crate::runtime::range_coverage::enabled`]'s
+/// reason: the alternative is an environment lookup per texture bind.
+pub fn sampled_field_witness_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        sampled_field_witness_enabled_from(crate::config::switch(
+            crate::config::SAMPLED_FIELD_WITNESS,
+        ))
+    })
+}
+
+/// The decision [`sampled_field_witness_enabled`] caches, split out so both
+/// arms are testable in one process.
+fn sampled_field_witness_enabled_from(asked: crate::config::Switch) -> bool {
+    asked == crate::config::Switch::On
 }
 
 /// The texels a sampled bind reads out of one mapping, and where they sit in it.
@@ -1458,7 +1487,32 @@ impl SampledFieldWindow {
 
 /// [`note_sampled_surface_field`] over an explicitly named window, for a bind
 /// whose texels are not the mapping's own geometry.
+///
+/// The window is a closure so the off arm does not resolve it either: the gate,
+/// the bind count and the timing are all here, and a caller cannot spend work
+/// on a witness that is not going to look.
 pub fn note_sampled_surface_field_window<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+    texture_ref: u32,
+    route: &str,
+    window: impl FnOnce() -> Option<SampledFieldWindow>,
+) {
+    crate::runtime::sampled_phase::note_field_witness();
+    if !sampled_field_witness_enabled() {
+        return;
+    }
+    let _span = crate::runtime::sampled_phase::WitnessSpan::open();
+    let Some(window) = window() else {
+        return;
+    };
+    sample_surface_field(state, host, mapping_id, texture_ref, route, window);
+}
+
+/// The witness itself, once [`note_sampled_surface_field_window`] has decided it
+/// runs.
+fn sample_surface_field<M: HostMemory>(
     state: &DeviceState,
     host: &M,
     mapping_id: u32,
@@ -1494,6 +1548,7 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
     let mut report = String::new();
     let mut first_texel = String::new();
     let mut verdicts: Vec<u8> = Vec::with_capacity(FIELD_PATCHES.len());
+    let mut reads = 0u64;
     for (i, (fx, fy)) in FIELD_PATCHES.iter().enumerate() {
         let cx = (width as f32 * fx) as u32;
         let cy = (height as f32 * fy) as u32;
@@ -1512,6 +1567,7 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
                     continue;
                 };
                 let mut texel = [0u8; 4];
+                reads += 1;
                 if host
                     .read_gpa(gpa + (off % page), &mut texel[..read])
                     .is_err()
@@ -1537,6 +1593,7 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
         }
         report.push_str(&format!("{verdict}:{mean:.0}/{sd:.0}"));
     }
+    crate::runtime::sampled_phase::note_field_witness_sample(reads);
     if verdicts.is_empty() {
         return;
     }

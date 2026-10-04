@@ -621,6 +621,28 @@ pub const SAMPLED_IDENTITY: &str = "REIMS_VGPU_SAMPLED_IDENTITY";
 /// through the alarm. Use it for a soundness sweep, never for a timing.
 pub const GATHER_AUDIT_ALL: &str = "REIMS_VGPU_GATHER_AUDIT_ALL";
 
+/// `on` makes `crate::runtime::scanout::note_sampled_surface_field` read the
+/// guest pages of every large sampled surface a fragment bind names. Default
+/// off: unset, `off` and anything else leave the witness silent.
+///
+/// The witness answers a content question — what a full-screen compositor
+/// layer's own pages held when a draw bound it — and it answers it with up to
+/// 256 `read_gpa` calls, a page-list collect and a lock per bind of every
+/// surface of a million texels or more. On a driven Safari drag those binds are
+/// the hot full-screen compositor layers, and the cost lands inside
+/// `sampled_phase`'s `resolve_us`, where it reads as product work. The
+/// `sampled_field_witness_*` columns on that line say how much of the column it
+/// was, so the two arms of this switch are the A/B that attributes it.
+///
+/// Not a widening in the sense the module doc forbids, for
+/// [`RANGE_COVERAGE`]'s reason: it reaches no capability the host did not
+/// report and changes nothing the guest observes. It reads guest pages and
+/// settles nothing, so either arm presents the same frames; what it changes is
+/// how much work the drain does, and the default is the side that does less.
+///
+/// Use it for a content investigation, never for a timing.
+pub const SAMPLED_FIELD_WITNESS: &str = "REIMS_VGPU_SAMPLED_FIELD_WITNESS";
+
 /// `off` narrows a draw chain's pipeline resolution back to the full walk —
 /// object list, descriptor, decode, MTLB read, AIR carve and content hash, for
 /// the pipeline and both of its functions, on every draw.

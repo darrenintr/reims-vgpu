@@ -115,6 +115,23 @@
 //! every draw chain reaches this phase; a chain declining earlier would show up
 //! here as a gap between the two, and none did.
 //!
+//! # The field witness inside `ResolveSource`
+//!
+//! `scanout::note_sampled_surface_field` is a content witness, not product work,
+//! and it ran inside the [`Part::ResolveSource`] span: on every fragment bind of
+//! a surface of a million texels or more it collected the mapping's page list,
+//! made up to 256 `read_gpa` calls, built strings and took a lock. A driven
+//! Safari drag on the RX 7600 read `resolve_us` at 405-412 ms/s — 98 % of
+//! `sampled_us` and half of all draw CPU — in windows whose `sampled_gathers`
+//! was zero, which no guest upload could account for.
+//!
+//! So the witness is off unless [`crate::config::SAMPLED_FIELD_WITNESS`] asks
+//! for it, and its cost is reported here as four `sampled_field_*` columns
+//! rather than by moving the span. The time is **nested inside** `resolve_us`,
+//! not beside it: subtracting `sampled_field_witness_us` from `resolve_us` is
+//! the resolve cost with the witness taken out, and the same boot carries both
+//! numbers. The two arms of the switch on one binary are the A/B.
+//!
 //! Like every phase census here it reports no loss. A slow resolve is not a
 //! declined one, and the decline paths inside the phase keep their own typed
 //! reasons. A bind that returns early from inside a span charges its remainder
@@ -166,6 +183,13 @@ const PARTS: usize = Part::LAST as usize + 1;
 static ACC: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
 static SAMPLED: AtomicU64 = AtomicU64::new(0);
 
+/// The field witness's own columns. Nanoseconds for the time, for [`ACC`]'s
+/// reason.
+static WITNESS_NS: AtomicU64 = AtomicU64::new(0);
+static WITNESS_N: AtomicU64 = AtomicU64::new(0);
+static WITNESS_READS: AtomicU64 = AtomicU64::new(0);
+static WITNESS_LARGE: AtomicU64 = AtomicU64::new(0);
+
 /// One window of the split, as taken by the per-second census.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SampledPhaseWindow {
@@ -176,6 +200,17 @@ pub struct SampledPhaseWindow {
     pub reflect_us: u64,
     /// Sampled phases entered in the window — the denominator the four share.
     pub sampled: u64,
+    /// Wall clock spent sampling guest pages in the field witness. Nested
+    /// inside `resolve_us` wherever the witness ran under that span; zero when
+    /// the witness is off.
+    pub field_witness_us: u64,
+    /// Binds that reached the field witness, sampled or not — so the off arm
+    /// still says how many binds it skipped.
+    pub field_witness_n: u64,
+    /// `HostMemory::read_gpa` calls the witness made.
+    pub field_read_gpa_n: u64,
+    /// Surfaces at or above the witness's texel floor that it sampled.
+    pub field_large_surface_n: u64,
 }
 
 /// Take and clear the window. `None` when no sampled phase ran, so an idle
@@ -189,6 +224,10 @@ pub fn take_window() -> Option<SampledPhaseWindow> {
         samplers_us: to_us(ACC[Part::Samplers as usize].swap(0, Ordering::Relaxed)),
         reflect_us: to_us(ACC[Part::Reflect as usize].swap(0, Ordering::Relaxed)),
         sampled,
+        field_witness_us: to_us(WITNESS_NS.swap(0, Ordering::Relaxed)),
+        field_witness_n: WITNESS_N.swap(0, Ordering::Relaxed),
+        field_read_gpa_n: WITNESS_READS.swap(0, Ordering::Relaxed),
+        field_large_surface_n: WITNESS_LARGE.swap(0, Ordering::Relaxed),
     };
     (sampled > 0).then_some(w)
 }
@@ -230,13 +269,58 @@ impl Drop for Span {
     }
 }
 
+/// Count one bind reaching the field witness, whichever arm it is on.
+pub fn note_field_witness() {
+    WITNESS_N.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count one large surface the field witness sampled, and the guest reads that
+/// sampling made.
+pub fn note_field_witness_sample(read_gpa: u64) {
+    WITNESS_LARGE.fetch_add(1, Ordering::Relaxed);
+    WITNESS_READS.fetch_add(read_gpa, Ordering::Relaxed);
+}
+
+/// Charges the wall clock of one field-witness run to `sampled_field_witness_us`.
+///
+/// Separate from [`Span`] because it is not a [`Part`]: it runs *inside*
+/// [`Part::ResolveSource`] and is charged there too. Making it a part would
+/// either double-charge the time or move it out of `resolve_us`, and the second
+/// is exactly the hiding the column exists to prevent.
+pub struct WitnessSpan {
+    started: Instant,
+}
+
+impl WitnessSpan {
+    pub fn open() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for WitnessSpan {
+    fn drop(&mut self) {
+        WITNESS_NS.fetch_add(charge_ns(self.started.elapsed()), Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The window is process-global, so two of these tests running in parallel
+    /// read each other's spans: a 4 ms `ResolveSource` in one lands in the
+    /// window another asserts is empty. Every test here holds this.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// An idle second emits nothing rather than a row of zeros.
     #[test]
     fn a_window_with_no_sampled_phase_is_none() {
+        let _serial = serial();
         let _ = take_window();
         assert!(take_window().is_none());
     }
@@ -246,6 +330,7 @@ mod tests {
     /// a single `sampled_us` bar let it do.
     #[test]
     fn each_part_is_charged_only_its_own_scope() {
+        let _serial = serial();
         let _ = take_window();
         note_sampled();
         {
@@ -271,6 +356,7 @@ mod tests {
     /// phase that got slower rather than as a span that stayed open.
     #[test]
     fn the_two_resolve_halves_are_charged_apart() {
+        let _serial = serial();
         let _ = take_window();
         note_sampled();
         {
@@ -287,6 +373,7 @@ mod tests {
     /// would report every draw as having resolved one.
     #[test]
     fn the_denominator_counts_phases_not_spans() {
+        let _serial = serial();
         let _ = take_window();
         note_sampled();
         note_sampled();
@@ -311,6 +398,7 @@ mod tests {
     /// above the false one, and load can only raise the true one.
     #[test]
     fn twenty_thousand_sub_microsecond_spans_are_not_free() {
+        let _serial = serial();
         let _ = take_window();
         for _ in 0..20_000 {
             note_sampled();
@@ -320,10 +408,39 @@ mod tests {
         assert!(w.lookup_us > 100, "{w:?}");
     }
 
+    /// The witness's time is nested inside the part that encloses it, not taken
+    /// out of it. Moving the cost to a column of its own would make
+    /// `resolve_us` fall on the witness-on arm too, and the A/B would say
+    /// nothing.
+    #[test]
+    fn the_field_witness_is_charged_inside_resolve_not_instead_of_it() {
+        let _serial = serial();
+        let _ = take_window();
+        note_sampled();
+        {
+            let _s = Span::open(Part::ResolveSource);
+            note_field_witness();
+            let _w = WitnessSpan::open();
+            note_field_witness_sample(256);
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+        note_field_witness();
+        let w = take_window().expect("a sampled phase was noted");
+        assert!(w.field_witness_us >= 3_000, "{w:?}");
+        assert!(w.resolve_us >= w.field_witness_us, "{w:?}");
+        // At least rather than exactly: the counters are process-global and a
+        // draw test elsewhere in this binary may bind a large surface
+        // concurrently.
+        assert!(w.field_witness_n >= 2, "{w:?}");
+        assert!(w.field_large_surface_n >= 1, "{w:?}");
+        assert!(w.field_read_gpa_n >= 256, "{w:?}");
+    }
+
     /// Taking the window resets it, so the line is a rate and not a running
     /// total since boot.
     #[test]
     fn taking_the_window_resets_it() {
+        let _serial = serial();
         let _ = take_window();
         note_sampled();
         {

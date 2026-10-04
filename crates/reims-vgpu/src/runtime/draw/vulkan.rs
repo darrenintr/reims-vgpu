@@ -1267,34 +1267,34 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // surface has its own format, extent and offset, and the
                 // mapping-derived window cannot describe it, which is why the
                 // video planes were absent from this record.
-                if let Some(bpp) = crate::protocol::pixel_format::bytes_per_pixel(view.pixel_format)
-                {
-                    if let Some((base_off, bpr, _)) = state.mappings.get(&mid).and_then(|m| {
-                        crate::runtime::mapping_write::ref_texture_sample_window(
-                            m,
-                            view.plane_index,
-                            view.width,
-                            view.height,
-                            view.pixel_format,
-                        )
-                    }) {
-                        crate::runtime::scanout::note_sampled_surface_field_window(
-                            state,
-                            &*host,
-                            mid,
-                            texture_ref,
-                            "ref_texture_view",
-                            crate::runtime::scanout::SampledFieldWindow {
-                                width: view.width,
-                                height: view.height,
-                                format: u32::from(view.pixel_format),
-                                base_off,
-                                bpr,
-                                bpp,
-                            },
-                        );
-                    }
-                }
+                crate::runtime::scanout::note_sampled_surface_field_window(
+                    state,
+                    &*host,
+                    mid,
+                    texture_ref,
+                    "ref_texture_view",
+                    || {
+                        let bpp =
+                            crate::protocol::pixel_format::bytes_per_pixel(view.pixel_format)?;
+                        let (base_off, bpr, _) = state.mappings.get(&mid).and_then(|m| {
+                            crate::runtime::mapping_write::ref_texture_sample_window(
+                                m,
+                                view.plane_index,
+                                view.width,
+                                view.height,
+                                view.pixel_format,
+                            )
+                        })?;
+                        Some(crate::runtime::scanout::SampledFieldWindow {
+                            width: view.width,
+                            height: view.height,
+                            format: u32::from(view.pixel_format),
+                            base_off,
+                            bpr,
+                            bpp,
+                        })
+                    },
+                );
                 // Zero-copy the decoded plane straight from guest pages when
                 // it samples byte-identically (video NV12 R8/RG8, BGRA8/
                 // RGBA8). This bypasses the ~1.5 MB/plane/frame CPU read +
