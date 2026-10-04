@@ -2077,6 +2077,7 @@ fn arrival_work<H: HostMemory + HostOps>(
     fifo: crate::runtime::ingress::Fifo,
     packet: &Packet,
 ) -> Arrived {
+    let _span = census::tranche_span(census::TrancheCost::AdmitArrival);
     let mut arrived = Arrived {
         submission: None,
         exec: crate::runtime::exec::ExecResult::default(),
@@ -2087,8 +2088,10 @@ fn arrival_work<H: HostMemory + HostOps>(
     }
     match packet.opcode {
         CHILD_OP_EXEC_INDIRECT2 => {
-            let (submission, exec) =
-                crate::runtime::exec::read_exec_submission(state, host, &packet.payload);
+            let (submission, exec) = {
+                let _span = census::tranche_span(census::TrancheCost::AdmitReadExec);
+                crate::runtime::exec::read_exec_submission(state, host, &packet.payload)
+            };
             arrived.exec = exec;
             arrived.submission = submission;
         }
@@ -2156,20 +2159,29 @@ fn admit_and_park<H: HostMemory + HostOps>(
 ) {
     use reims_vgpu_core::identity::StampSlot;
 
+    // Each step below is its own exclusive tiling span, so the admission
+    // record and the tranche line both say which step a slow admission spent
+    // its time in; `Admit` keeps only what falls between them. See
+    // `census::AdmissionAnatomy`.
+    use census::{tranche_span, TrancheCost};
+
     let arrived = arrival_work(state, host, fifo, &packet);
-    let session = state.session_generation();
-    let built = crate::runtime::ingress::device_packet(
-        state,
-        host,
-        fifo,
-        session,
-        StampSlot(stamp_slot_index(completion_slot)),
-        &packet,
-        crate::runtime::ingress::PacketReads {
-            submission: arrived.submission.as_ref(),
-            repointed: arrived.repointed,
-        },
-    );
+    let built = {
+        let _span = tranche_span(TrancheCost::AdmitBuildPacket);
+        let session = state.session_generation();
+        crate::runtime::ingress::device_packet(
+            state,
+            host,
+            fifo,
+            session,
+            StampSlot(stamp_slot_index(completion_slot)),
+            &packet,
+            crate::runtime::ingress::PacketReads {
+                submission: arrived.submission.as_ref(),
+                repointed: arrived.repointed,
+            },
+        )
+    };
     let mut built = match built {
         Ok(built) => built,
         Err(blocked) => {
@@ -2196,6 +2208,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
     // a wait nothing can satisfy loses the guest. So the wait is dropped and
     // named, here rather than in the bridge — which slot numbers exist is a
     // property of this device's page and not of the packet.
+    let wait_filter = tranche_span(TrancheCost::AdmitWaitFilter);
     let page_size = state.page_size();
     built.stamp_waits.retain(|wait| {
         if stamp_slot_offset(wait.slot.0, page_size).is_some() {
@@ -2214,7 +2227,11 @@ fn admit_and_park<H: HostMemory + HostOps>(
         }
         false
     });
-    note_access_modes(state, &built);
+    drop(wait_filter);
+    {
+        let _span = tranche_span(TrancheCost::AdmitAccessModes);
+        note_access_modes(state, &built);
+    }
     // The pipelines the records bind, told to the model before it is asked
     // whether the packet may run: `PipelineTable::waits_for` refuses a lease it
     // has no entry for, and the entry is this device's to make. The list is the
@@ -2241,15 +2258,19 @@ fn admit_and_park<H: HostMemory + HostOps>(
     // then ready) unreachable on the packet that first builds the kernel. The
     // step is the guest's fact and the walk's own list; taking it earlier
     // states the same thing at the first moment it is known.
-    for &lease in leases {
-        note_store_route(if state.declare_pipeline(lease) {
-            "pipeline_declared"
-        } else {
-            "pipeline_declared_already"
-        });
+    {
+        let _span = tranche_span(TrancheCost::AdmitPipelineDeclare);
+        for &lease in leases {
+            note_store_route(if state.declare_pipeline(lease) {
+                "pipeline_declared"
+            } else {
+                "pipeline_declared_already"
+            });
+        }
     }
     let translating = match (arrived.submission.as_ref(), built.payload.exec()) {
         (Some(submission), Some(resolved)) => {
+            let _span = tranche_span(TrancheCost::AdmitPreflight);
             let mut measured_ns = 0u64;
             crate::runtime::exec::preflight_submission(
                 state,
@@ -2261,16 +2282,26 @@ fn admit_and_park<H: HostMemory + HostOps>(
         }
         _ => Vec::new(),
     };
-    for &lease in leases {
-        if translating.contains(&lease.slot.0) {
-            withdraw_lease(state, lease);
-        } else if translating.is_empty() {
-            ready_lease(state, lease, "pipeline_lease_ready_admission");
+    {
+        let _span = tranche_span(TrancheCost::AdmitPipelineState);
+        for &lease in leases {
+            if translating.contains(&lease.slot.0) {
+                withdraw_lease(state, lease);
+            } else if translating.is_empty() {
+                ready_lease(state, lease, "pipeline_lease_ready_admission");
+            }
         }
     }
 
-    let admission = match state.admit_packet(&built) {
-        Ok(admission) => admission,
+    let admitted = {
+        let _span = tranche_span(TrancheCost::AdmitModel);
+        state.admit_packet(&built)
+    };
+    let admission = match admitted {
+        Ok(admission) => {
+            census::note_hazard_scan(admission.hazard_scan);
+            admission
+        }
         Err(refusal) => {
             note_unadmitted(
                 state,
@@ -2284,6 +2315,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
             return;
         }
     };
+    let build_parked = tranche_span(TrancheCost::AdmitBuildParked);
     let mut transaction = admission.admitted.transaction;
     let ingress = transaction.identity.ingress;
     // The resolved records move out of the transaction the model just handed
@@ -2311,6 +2343,8 @@ fn admit_and_park<H: HostMemory + HostOps>(
         ),
         _ => crate::runtime::parked::ParkedWork::new(fifo.domain().0, admission.epoch, packet),
     };
+    drop(build_parked);
+    let _span = tranche_span(TrancheCost::AdmitPark);
     state.parked.park(ingress, work);
 }
 
@@ -4096,8 +4130,11 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                 // tears down a task whose work has not been drained — which is
                 // exactly the ordering `admit` now holds, on a position rather
                 // than on this ring's consumer pointer.
+                // One admission record across both halves, so the stamp census
+                // and `admit_and_park`'s steps land on the same packet.
+                let admission = census::admission_scope(packet.opcode, None);
                 {
-                    let _admit = census::tranche_span(census::TrancheCost::Admit);
+                    let _admit = census::tranche_span(census::TrancheCost::AdmitStampWaits);
                     note_packet_stamp_waits(state, host, None, &packet);
                 }
 
@@ -4118,6 +4155,7 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                         packet,
                     );
                 }
+                drop(admission);
                 settle_model_work(state, host);
             }
         }
@@ -6847,8 +6885,12 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 // the reading and not for a verdict: a wait that is not yet met
                 // is an ordering position in `admit`, not a ring head this loop
                 // refuses to move.
+                // One admission record across both halves, so the stamp census
+                // and `admit_and_park`'s steps land on the same packet. The head
+                // write between them is `regs`, and is in neither.
+                let admission = census::admission_scope(packet.opcode, Some(channel_id));
                 {
-                    let _admit = census::tranche_span(census::TrancheCost::Admit);
+                    let _admit = census::tranche_span(census::TrancheCost::AdmitStampWaits);
                     note_packet_stamp_waits(state, host, Some(channel_id), &packet);
                 }
 
@@ -6887,6 +6929,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     let _admit = census::tranche_span(census::TrancheCost::Admit);
                     admit_and_park(state, host, fifo, stamp_index, packet);
                 }
+                drop(admission);
                 settle_model_work(state, host);
 
                 if state.pending.host_action_yield {

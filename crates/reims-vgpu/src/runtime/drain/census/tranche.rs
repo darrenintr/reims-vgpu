@@ -12,7 +12,7 @@
 //!
 //! A frame-pacing hitch *is* one tranche. So this ledger is reset when a
 //! tranche starts, charged by the same hooks that feed the window census, and
-//! snapshotted when the tranche ends. Four lines come out of it:
+//! snapshotted when the tranche ends. Six lines come out of it:
 //!
 //! - `drain_long`, at once, for every tranche at or above [`LONG_TRANCHE_US`]
 //!   (bounded per window by [`LONG_LINES_PER_WINDOW`], with the excess counted
@@ -24,6 +24,8 @@
 //! - `present_long` / `present_worst`, the same pair for one present packet
 //!   (`DisplaySwap`, x86 `PRESENT_X86` op 6/7): what `present_named_mapping`
 //!   spent its time on. See [`PresentPhase`].
+//! - `admit_long` / `admit_worst`, the same pair for one packet's admission:
+//!   which admission step it spent its time in. See [`AdmissionAnatomy`].
 //!
 //! # The tiling is exclusive, and why it has to be
 //!
@@ -47,9 +49,35 @@
 //! The tiling is `TrancheCost::TILING`:
 //!
 //! `setup + ring + decode + regs + proc + tail + boundary + root_proc +
-//! xlate_retry + main_fifo + sweep + resweep + child_fifo + admit + settle +
-//! settle_stamps + settle_pump + complete + iosfc + display_online +
+//! xlate_retry + main_fifo + sweep + resweep + child_fifo + admit + admit_* +
+//! settle + settle_stamps + settle_pump + complete + iosfc + display_online +
 //! retired_views + retire_linear + other == drain_us`
+//!
+//! # Admission is its own tiling, per step and per packet
+//!
+//! `admit` used to be one span opened twice per packet — once around the
+//! stamp-wait census and once around `admit_and_park` — and a live RX 7600
+//! tranche read `admit_us=805259 admit_n=660 packets=330`: 94 % of an 855 ms
+//! tranche in a cost that could not say what it was. So admission is now the
+//! `Admit*` run of the tiling, one exclusive span per step:
+//!
+//! `admit_stamp_waits`, `admit_arrival`, `admit_read_exec_submission`,
+//! `admit_build_packet`, `admit_wait_filter`, `admit_access_modes`,
+//! `admit_pipeline_declare`, `admit_preflight`, `admit_pipeline_state`,
+//! `admit_model`, `admit_build_parked_work`, `admit_park`
+//!
+//! and `admit` is only `admit_and_park`'s glue between them (and its refusal
+//! paths). The steps are exclusive like every other tiling span, so they sum
+//! to the admission path with nothing counted twice — `read_exec` is inside
+//! `arrival` and is not also charged to it.
+//!
+//! The same spans also feed one record per packet, [`AdmissionAnatomy`],
+//! which `admit_long` (at once, past [`LONG_ADMIT_US`]) and `admit_worst`
+//! (per window) print step by step, together with what the hazard compiler
+//! scanned to admit it (`crate::model::HazardScan`). `drain_long` and
+//! `drain_worst` carry the tranche's own worst admission as
+//! `admit_worst_op`/`admit_worst_us`/`admit_worst_phase`/`admit_worst_phase_us`,
+//! and the tranche's summed hazard scan as `graph_*`.
 //!
 //! `other` is now only what lies between the worker's own clock read and the
 //! first span — tens of nanoseconds. It is computed, not clamped: if the claimed
@@ -116,6 +144,15 @@ pub const LONG_TRANCHE_US: u64 = 50_000;
 /// unit of a visible stall.
 pub const LONG_PRESENT_US: u64 = 16_000;
 
+/// One packet's admission at or above this is reported as `admit_long`, at
+/// once.
+///
+/// One frame at 60 Hz, as for a present: admission runs before the packet has
+/// an ordering position, so the drain — and every channel behind it — waits
+/// the whole of it, and an admission that alone costs a frame is a visible
+/// stall whatever the packet then does.
+pub const LONG_ADMIT_US: u64 = 16_000;
+
 /// At most this many `drain_long` (and, separately, `present_long`) lines
 /// between two `drain_worst` lines.
 ///
@@ -133,6 +170,10 @@ const MAX_DEPTH: usize = 48;
 /// How many present packets can be open at once (a present whose rescue drain
 /// runs another present).
 const MAX_PRESENT_DEPTH: usize = 4;
+
+/// How many packet admissions can be open at once. Admission enters no drain
+/// today, so the realistic depth is one; the bound is for the fixed array.
+const MAX_ADMIT_DEPTH: usize = 4;
 
 /// One thing a tranche can spend time on. See the module doc for which of these
 /// tile `drain_us` and which cut across it.
@@ -165,8 +206,37 @@ pub enum TrancheCost {
     Resweep,
     /// `drain_child_fifo`'s own loop, exclusive of everything named here.
     ChildFifo,
-    /// Admission: stamp-wait census, arrival work, parking, preflight.
+    /// `admit_and_park`'s own glue, exclusive of the `Admit*` steps below: the
+    /// refusal paths (`note_unadmitted`) and everything between the steps.
     Admit,
+    /// `note_packet_stamp_waits`: the stamp-wait census, before the head moves.
+    AdmitStampWaits,
+    /// `arrival_work`, exclusive of [`Self::AdmitReadExec`]: the re-point's
+    /// incarnation move, and the class dispatch.
+    AdmitArrival,
+    /// `exec::read_exec_submission`: the exec header and the command buffers
+    /// read out of the task's address space.
+    AdmitReadExec,
+    /// `ingress::device_packet`: the ordering walk over the records, its
+    /// namespace and access resolution.
+    AdmitBuildPacket,
+    /// The `stamp_waits.retain` over slots the stamp page cannot hold.
+    AdmitWaitFilter,
+    /// `note_access_modes`: one route per access, and the usage census.
+    AdmitAccessModes,
+    /// `declare_pipeline` for every lease the walk named.
+    AdmitPipelineDeclare,
+    /// `exec::preflight_submission`: the rail starting cold translations.
+    AdmitPreflight,
+    /// The `withdraw_lease` / `ready_lease` loop over the leases.
+    AdmitPipelineState,
+    /// `DeviceState::admit_packet`: the session model's admission, hazard
+    /// compilation and the readiness service included.
+    AdmitModel,
+    /// Moving the resolved records out and building the `ParkedWork`.
+    AdmitBuildParked,
+    /// `ParkedStore::park`.
+    AdmitPark,
     /// `settle_model_work`'s own walk: take/mark ready, the ready list, the
     /// waiting walk that re-arms domains.
     Settle,
@@ -245,6 +315,18 @@ impl TrancheCost {
         TrancheCost::Resweep,
         TrancheCost::ChildFifo,
         TrancheCost::Admit,
+        TrancheCost::AdmitStampWaits,
+        TrancheCost::AdmitArrival,
+        TrancheCost::AdmitReadExec,
+        TrancheCost::AdmitBuildPacket,
+        TrancheCost::AdmitWaitFilter,
+        TrancheCost::AdmitAccessModes,
+        TrancheCost::AdmitPipelineDeclare,
+        TrancheCost::AdmitPreflight,
+        TrancheCost::AdmitPipelineState,
+        TrancheCost::AdmitModel,
+        TrancheCost::AdmitBuildParked,
+        TrancheCost::AdmitPark,
         TrancheCost::Settle,
         TrancheCost::SettleStamps,
         TrancheCost::SettlePump,
@@ -318,6 +400,50 @@ impl TrancheCost {
         matches!(self, TrancheCost::ChildFifo | TrancheCost::MainFifo)
     }
 
+    /// How many costs make up one packet's admission: `Admit` and the
+    /// contiguous `Admit*` steps after it.
+    pub const ADMISSION_COUNT: usize =
+        TrancheCost::AdmitPark as usize - TrancheCost::Admit as usize + 1;
+
+    /// Where this cost sits in an [`AdmissionAnatomy`], if it is an admission
+    /// step at all. The steps are one contiguous run of the tiling, so the
+    /// answer is a subtraction and a new step cannot be left out of it.
+    const fn admission_index(self) -> Option<usize> {
+        let first = TrancheCost::Admit as usize;
+        let i = self.index();
+        if i >= first && i < first + Self::ADMISSION_COUNT {
+            Some(i - first)
+        } else {
+            None
+        }
+    }
+
+    /// The admission step at `i`, the inverse of [`Self::admission_index`].
+    const fn admission_step(i: usize) -> TrancheCost {
+        Self::ALL[TrancheCost::Admit as usize + i]
+    }
+
+    /// An admission step's name on an `admit_*` line, where every field is
+    /// already about admission and the prefix would only repeat it. `Admit`
+    /// itself is the residue.
+    const fn admission_label(self) -> &'static str {
+        match self {
+            TrancheCost::AdmitStampWaits => "stamp_waits",
+            TrancheCost::AdmitArrival => "arrival",
+            TrancheCost::AdmitReadExec => "read_exec",
+            TrancheCost::AdmitBuildPacket => "build_packet",
+            TrancheCost::AdmitWaitFilter => "wait_filter",
+            TrancheCost::AdmitAccessModes => "access_modes",
+            TrancheCost::AdmitPipelineDeclare => "pipeline_declare",
+            TrancheCost::AdmitPreflight => "preflight",
+            TrancheCost::AdmitPipelineState => "pipeline_state",
+            TrancheCost::AdmitModel => "model",
+            TrancheCost::AdmitBuildParked => "build_parked",
+            TrancheCost::AdmitPark => "park",
+            _ => "residue",
+        }
+    }
+
     pub const fn label(self) -> &'static str {
         match self {
             TrancheCost::Setup => "setup",
@@ -334,6 +460,18 @@ impl TrancheCost {
             TrancheCost::Resweep => "resweep",
             TrancheCost::ChildFifo => "child_fifo",
             TrancheCost::Admit => "admit",
+            TrancheCost::AdmitStampWaits => "admit_stamp_waits",
+            TrancheCost::AdmitArrival => "admit_arrival",
+            TrancheCost::AdmitReadExec => "admit_read_exec_submission",
+            TrancheCost::AdmitBuildPacket => "admit_build_packet",
+            TrancheCost::AdmitWaitFilter => "admit_wait_filter",
+            TrancheCost::AdmitAccessModes => "admit_access_modes",
+            TrancheCost::AdmitPipelineDeclare => "admit_pipeline_declare",
+            TrancheCost::AdmitPreflight => "admit_preflight",
+            TrancheCost::AdmitPipelineState => "admit_pipeline_state",
+            TrancheCost::AdmitModel => "admit_model",
+            TrancheCost::AdmitBuildParked => "admit_build_parked_work",
+            TrancheCost::AdmitPark => "admit_park",
             TrancheCost::Settle => "settle",
             TrancheCost::SettleStamps => "settle_stamps",
             TrancheCost::SettlePump => "settle_pump",
@@ -548,6 +686,99 @@ impl PresentAnatomy {
     }
 }
 
+/// One packet's admission, as the ledger saw it: the exclusive time of each
+/// admission step, from the stamp-wait census to the park.
+///
+/// **The steps are exclusive and sum to the whole.** Each is the exclusive
+/// time of its own tiling span, so `read_exec` is not also inside `arrival`
+/// and nothing nested is counted twice. `total` is therefore their sum, not a
+/// clock of its own: the head write between the stamp census and the rest of
+/// admission is the drain's `regs`, not admission, and is left out of both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionAnatomy {
+    /// When the admission finished, in [`crate::observe::elapsed_ms`].
+    pub at_ms: u64,
+    /// The child channel, or `None` for the root FIFO.
+    pub channel: Option<u32>,
+    pub opcode: u16,
+    /// Indexed by [`TrancheCost::admission_index`].
+    pub ns: [u64; TrancheCost::ADMISSION_COUNT],
+    /// What the hazard compiler did, when the packet reached the model.
+    pub scan: Option<crate::model::HazardScan>,
+}
+
+impl AdmissionAnatomy {
+    const EMPTY: Self = Self {
+        at_ms: 0,
+        channel: None,
+        opcode: 0,
+        ns: [0; TrancheCost::ADMISSION_COUNT],
+        scan: None,
+    };
+
+    pub fn total_ns(&self) -> u64 {
+        self.ns.iter().sum()
+    }
+
+    pub fn total_us(&self) -> u64 {
+        self.total_ns() / 1000
+    }
+
+    /// The step that cost the most, and what it cost.
+    pub fn worst_step(&self) -> (TrancheCost, u64) {
+        let mut worst = (TrancheCost::Admit, 0);
+        for (i, &ns) in self.ns.iter().enumerate() {
+            if ns > worst.1 {
+                worst = (TrancheCost::admission_step(i), ns);
+            }
+        }
+        worst
+    }
+
+    #[cfg(test)]
+    pub fn ns_of(&self, step: TrancheCost) -> u64 {
+        step.admission_index().map_or(0, |i| self.ns[i])
+    }
+
+    /// Every step is printed, zero or not, in the order a packet passes them
+    /// and the residue last, so the line has one shape to grep and to parse.
+    pub fn render(&self, kind: &str) -> String {
+        let (worst, worst_ns) = self.worst_step();
+        let mut line = format!("{kind} t={}", self.at_ms);
+        match self.channel {
+            Some(ch) => line.push_str(&format!(" ch={ch}")),
+            None => line.push_str(" ch=root"),
+        }
+        line.push_str(&format!(
+            " opcode={:#04x} total_us={} phase={} phase_us={}",
+            self.opcode,
+            self.total_us(),
+            worst.admission_label(),
+            worst_ns / 1000,
+        ));
+        for i in (1..TrancheCost::ADMISSION_COUNT).chain([0]) {
+            line.push_str(&format!(
+                " {}_us={}",
+                TrancheCost::admission_step(i).admission_label(),
+                self.ns[i] / 1000
+            ));
+        }
+        if let Some(scan) = &self.scan {
+            line.push_str(&format!(
+                " accesses={} scanned={} retired_scanned={} own_scanned={} \
+                 graph_retained={} graph_live={}",
+                scan.accesses,
+                scan.scanned,
+                scan.retired_scanned,
+                scan.own_scanned,
+                scan.retained,
+                scan.live,
+            ));
+        }
+        line
+    }
+}
+
 /// One finished tranche, as the ledger saw it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrancheAnatomy {
@@ -573,6 +804,12 @@ pub struct TrancheAnatomy {
     pub depth_overflow: u64,
     /// The tranche's most expensive present packet.
     pub worst_present: Option<PresentAnatomy>,
+    /// The tranche's most expensive packet admission.
+    pub worst_admission: Option<AdmissionAnatomy>,
+    /// The hazard compiler's work over every admission in the tranche:
+    /// `accesses`, `scanned` and its subsets summed; `retained` and `live` the
+    /// largest the graph was seen to hold.
+    pub hazard_scan: crate::model::HazardScan,
 }
 
 impl TrancheAnatomy {
@@ -675,6 +912,30 @@ impl TrancheAnatomy {
                 present.mapping,
             ));
         }
+        if let Some(admission) = &self.worst_admission {
+            let (step, step_ns) = admission.worst_step();
+            line.push_str(&format!(
+                " admit_worst_op={:#04x} admit_worst_us={} admit_worst_phase={} \
+                 admit_worst_phase_us={}",
+                admission.opcode,
+                admission.total_us(),
+                step.admission_label(),
+                step_ns / 1000,
+            ));
+        }
+        let scan = &self.hazard_scan;
+        if scan.accesses != 0 || scan.scanned != 0 {
+            line.push_str(&format!(
+                " graph_accesses={} graph_scanned={} graph_retired_scanned={} \
+                 graph_own_scanned={} graph_retained={} graph_live={}",
+                scan.accesses,
+                scan.scanned,
+                scan.retired_scanned,
+                scan.own_scanned,
+                scan.retained,
+                scan.live,
+            ));
+        }
         line
     }
 }
@@ -743,6 +1004,13 @@ pub struct SpanSlot {
     serial: u32,
 }
 
+/// An open admission record's identity, for the same reason as [`SpanSlot`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmitSlot {
+    index: usize,
+    serial: u32,
+}
+
 /// What closing a span produced that the ledger itself does not keep.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Closed {
@@ -773,6 +1041,11 @@ pub struct TrancheLedger {
     presents: [PresentAnatomy; MAX_PRESENT_DEPTH],
     present_depth: usize,
     worst_present: Option<PresentAnatomy>,
+    admissions: [AdmissionAnatomy; MAX_ADMIT_DEPTH],
+    admission_serials: [u32; MAX_ADMIT_DEPTH],
+    admission_depth: usize,
+    worst_admission: Option<AdmissionAnatomy>,
+    hazard_scan: crate::model::HazardScan,
 }
 
 impl Default for TrancheLedger {
@@ -800,6 +1073,18 @@ impl TrancheLedger {
             presents: [PresentAnatomy::EMPTY; MAX_PRESENT_DEPTH],
             present_depth: 0,
             worst_present: None,
+            admissions: [AdmissionAnatomy::EMPTY; MAX_ADMIT_DEPTH],
+            admission_serials: [0; MAX_ADMIT_DEPTH],
+            admission_depth: 0,
+            worst_admission: None,
+            hazard_scan: crate::model::HazardScan {
+                accesses: 0,
+                scanned: 0,
+                retired_scanned: 0,
+                own_scanned: 0,
+                retained: 0,
+                live: 0,
+            },
         }
     }
 
@@ -918,6 +1203,69 @@ impl TrancheLedger {
         Some(slot)
     }
 
+    /// Open one packet's admission record. Every admission step's span that
+    /// closes while it is the innermost open record is charged to it.
+    pub fn open_admission(&mut self, opcode: u16, channel: Option<u32>) -> Option<AdmitSlot> {
+        if !self.active {
+            return None;
+        }
+        if self.admission_depth == MAX_ADMIT_DEPTH {
+            self.overflow += 1;
+            return None;
+        }
+        self.serial = self.serial.wrapping_add(1);
+        let index = self.admission_depth;
+        self.admissions[index] = AdmissionAnatomy {
+            channel,
+            opcode,
+            ..AdmissionAnatomy::EMPTY
+        };
+        self.admission_serials[index] = self.serial;
+        self.admission_depth += 1;
+        Some(AdmitSlot {
+            index,
+            serial: self.serial,
+        })
+    }
+
+    /// Close the admission record `slot` names and return it. Records opened
+    /// after it and still open are discarded; a slot already closed is a no-op.
+    pub fn close_admission(&mut self, slot: AdmitSlot) -> Option<AdmissionAnatomy> {
+        if !self.active
+            || slot.index >= self.admission_depth
+            || self.admission_serials[slot.index] != slot.serial
+        {
+            return None;
+        }
+        self.admission_depth = slot.index;
+        let record = self.admissions[slot.index];
+        if self
+            .worst_admission
+            .as_ref()
+            .is_none_or(|w| record.total_ns() > w.total_ns())
+        {
+            self.worst_admission = Some(record);
+        }
+        Some(record)
+    }
+
+    /// What the hazard compiler did for the packet being admitted.
+    pub fn note_hazard_scan(&mut self, scan: crate::model::HazardScan) {
+        if !self.active {
+            return;
+        }
+        if self.admission_depth != 0 {
+            self.admissions[self.admission_depth - 1].scan = Some(scan);
+        }
+        let total = &mut self.hazard_scan;
+        total.accesses = total.accesses.saturating_add(scan.accesses);
+        total.scanned = total.scanned.saturating_add(scan.scanned);
+        total.retired_scanned = total.retired_scanned.saturating_add(scan.retired_scanned);
+        total.own_scanned = total.own_scanned.saturating_add(scan.own_scanned);
+        total.retained = total.retained.max(scan.retained);
+        total.live = total.live.max(scan.live);
+    }
+
     /// Close the span `slot` names. Spans opened after it and still open are
     /// closed first, at the same instant; a slot already closed is a no-op.
     pub fn close(&mut self, slot: SpanSlot, now_ns: u64) -> Option<Closed> {
@@ -951,6 +1299,12 @@ impl TrancheLedger {
         match frame.kind {
             FrameKind::Tile(cost) => {
                 self.add(cost, excl, 1);
+                if let (Some(i), Some(top)) =
+                    (cost.admission_index(), self.admission_depth.checked_sub(1))
+                {
+                    let record = &mut self.admissions[top];
+                    record.ns[i] = record.ns[i].saturating_add(excl);
+                }
                 self.credit_parent(incl);
                 if cost.is_drain() {
                     self.credit_nested(incl);
@@ -1016,10 +1370,13 @@ impl TrancheLedger {
             unclosed: self.depth as u64,
             depth_overflow: self.overflow,
             worst_present: self.worst_present,
+            worst_admission: self.worst_admission,
+            hazard_scan: self.hazard_scan,
         };
         self.active = false;
         self.depth = 0;
         self.present_depth = 0;
+        self.admission_depth = 0;
         anatomy
     }
 }
@@ -1034,6 +1391,10 @@ struct Window {
     present_emitted: u64,
     present_suppressed: u64,
     present_total: u64,
+    admit_worst: Option<AdmissionAnatomy>,
+    admit_emitted: u64,
+    admit_suppressed: u64,
+    admit_total: u64,
 }
 
 impl Window {
@@ -1047,6 +1408,10 @@ impl Window {
             present_emitted: 0,
             present_suppressed: 0,
             present_total: 0,
+            admit_worst: None,
+            admit_emitted: 0,
+            admit_suppressed: 0,
+            admit_total: 0,
         }
     }
 
@@ -1099,8 +1464,33 @@ impl Window {
         line
     }
 
-    /// The window's `drain_worst` and `present_worst` lines, and reset it.
-    fn take(&mut self, win_ms: u64) -> (Option<String>, Option<String>) {
+    /// The same for one finished packet admission.
+    fn admission(&mut self, admission: AdmissionAnatomy) -> Option<String> {
+        let line = if admission.total_us() >= LONG_ADMIT_US {
+            self.admit_total += 1;
+            self.admit_emitted += 1;
+            if self.admit_emitted <= LONG_LINES_PER_WINDOW {
+                Some(admission.render("admit_long"))
+            } else {
+                self.admit_suppressed += 1;
+                None
+            }
+        } else {
+            None
+        };
+        if self
+            .admit_worst
+            .as_ref()
+            .is_none_or(|w| admission.total_ns() > w.total_ns())
+        {
+            self.admit_worst = Some(admission);
+        }
+        line
+    }
+
+    /// The window's `drain_worst`, `present_worst` and `admit_worst` lines,
+    /// and reset it.
+    fn take(&mut self, win_ms: u64) -> [Option<String>; 3] {
         let worst = self.worst.take().map(|worst| {
             format!(
                 "{} win_ms={win_ms} long={} long_suppressed={} long_us={LONG_TRANCHE_US}",
@@ -1123,7 +1513,18 @@ impl Window {
         self.present_emitted = 0;
         self.present_total = 0;
         self.present_suppressed = 0;
-        (worst, present)
+        let admission = self.admit_worst.take().map(|admission| {
+            format!(
+                "{} win_ms={win_ms} long={} long_suppressed={} long_us={LONG_ADMIT_US}",
+                admission.render("admit_worst"),
+                self.admit_total,
+                self.admit_suppressed,
+            )
+        });
+        self.admit_emitted = 0;
+        self.admit_total = 0;
+        self.admit_suppressed = 0;
+        [worst, present, admission]
     }
 }
 
@@ -1182,9 +1583,9 @@ pub(super) fn tranche_end(drain_ns: u64, publish_us: u64) {
     }
 }
 
-/// The window's worst tranche and worst present, for the per-second census
-/// block.
-pub(super) fn take_worst_tranche(win_ms: u64) -> (Option<String>, Option<String>) {
+/// The window's worst tranche, worst present and worst admission, for the
+/// per-second census block.
+pub(super) fn take_worst_tranche(win_ms: u64) -> [Option<String>; 3] {
     WINDOW.lock().take(win_ms)
 }
 
@@ -1248,6 +1649,47 @@ pub fn tranche_span(cost: TrancheCost) -> TrancheSpan {
 pub fn present_phase(phase: PresentPhase) -> TrancheSpan {
     let now = now_ns();
     TrancheSpan::new(with_active(|ledger| ledger.open_phase(phase, now)).flatten())
+}
+
+/// One packet's admission record, closed when dropped. Inert outside a tranche.
+///
+/// Opened by the drain around the whole of one packet's admission — the
+/// stamp-wait census before the head moves and `admit_and_park` after it — so
+/// the steps both halves time land on one record. See [`AdmissionAnatomy`].
+#[must_use = "an admission record measures until it is dropped"]
+pub struct AdmissionScope {
+    slot: Option<AdmitSlot>,
+    _local: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for AdmissionScope {
+    fn drop(&mut self) {
+        let Some(slot) = self.slot.take() else {
+            return;
+        };
+        let Some(mut admission) = with_active(|ledger| ledger.close_admission(slot)).flatten()
+        else {
+            return;
+        };
+        admission.at_ms = crate::observe::elapsed_ms() as u64;
+        let line = WINDOW.lock().admission(admission);
+        if let Some(line) = line {
+            crate::observe::off(line);
+        }
+    }
+}
+
+/// Open one packet's admission record. Emits `admit_long` on close when long.
+pub fn admission_scope(opcode: u16, channel: Option<u32>) -> AdmissionScope {
+    AdmissionScope {
+        slot: with_active(|ledger| ledger.open_admission(opcode, channel)).flatten(),
+        _local: std::marker::PhantomData,
+    }
+}
+
+/// What the hazard compiler did for the packet being admitted.
+pub fn note_hazard_scan(scan: crate::model::HazardScan) {
+    with_active(|ledger| ledger.note_hazard_scan(scan));
 }
 
 /// Open one present packet's record. Emits `present_long` on close when long.
@@ -1666,14 +2108,15 @@ mod tests {
         for (drain, pay_ns) in [(8_000, 1_000), (97_000, 80_000_000), (12_000, 2_000)] {
             let _ = w.tranche(finished(drain, pay_ns));
         }
-        let (line, present) = w.take(1000);
+        let [line, present, admission] = w.take(1000);
         let line = line.expect("three tranches finished");
         assert!(present.is_none(), "no present ran");
+        assert!(admission.is_none(), "no packet was admitted");
         assert!(line.starts_with("drain_worst "), "{line}");
         assert!(line.contains(" total_us=97000 "), "{line}");
         assert!(line.contains(" debt_pay_us=80000 debt_pay_n=1"), "{line}");
         assert!(line.contains(" long=1 long_suppressed=0 "), "{line}");
-        assert!(w.take(1000).0.is_none(), "the window was reset");
+        assert!(w.take(1000)[0].is_none(), "the window was reset");
     }
 
     #[test]
@@ -1691,7 +2134,8 @@ mod tests {
             "below the threshold"
         );
         assert_eq!(printed, LONG_LINES_PER_WINDOW);
-        let line = w.take(1000).0.expect("finished");
+        let [line, ..] = w.take(1000);
+        let line = line.expect("finished");
         assert!(
             line.contains(&format!(
                 " long={} long_suppressed=3 ",
@@ -1719,11 +2163,164 @@ mod tests {
             line.starts_with("present_long t=0 ch=0 mid=4 total_us=628000 "),
             "{line}"
         );
-        let (_, worst) = w.take(1000);
+        let [_, worst, _] = w.take(1000);
         let worst = worst.expect("two presents finished");
         assert!(worst.starts_with("present_worst "), "{worst}");
         assert!(worst.contains(" total_us=628000 "), "{worst}");
         assert!(worst.contains(" long=1 long_suppressed=0 "), "{worst}");
+    }
+
+    /// One exec packet's admission, the shape the drain produces. Times in
+    /// nanoseconds.
+    ///
+    /// ```text
+    /// 0      child_fifo ......................................... 1_000_000
+    /// 10_000   [admission record opens]
+    /// 10_000   admit_stamp_waits ... 20_000
+    /// 20_000   (head write: regs leaf 5_000)
+    /// 30_000   admit ............................................. 900_000
+    /// 30_000     admit_arrival ............ 200_000
+    /// 40_000       admit_read_exec ... 190_000
+    /// 200_000    admit_build_packet ....... 300_000
+    /// 300_000    admit_model .............. 880_000   (hazard scan noted)
+    /// 900_000  [admission record closes]
+    /// ```
+    fn admitted_exec(l: &mut TrancheLedger) -> AdmissionAnatomy {
+        let fifo = span(l, TrancheCost::ChildFifo, 0);
+        let record = l.open_admission(0x37, Some(3)).expect("inside a tranche");
+        let stamps = span(l, TrancheCost::AdmitStampWaits, 10_000);
+        close(l, stamps, 20_000);
+        l.charge(TrancheCost::Regs, 5_000);
+        let admit = span(l, TrancheCost::Admit, 30_000);
+        let arrival = span(l, TrancheCost::AdmitArrival, 30_000);
+        let read = span(l, TrancheCost::AdmitReadExec, 40_000);
+        close(l, read, 190_000);
+        close(l, arrival, 200_000);
+        let build = span(l, TrancheCost::AdmitBuildPacket, 200_000);
+        close(l, build, 300_000);
+        let model = span(l, TrancheCost::AdmitModel, 300_000);
+        l.note_hazard_scan(crate::model::HazardScan {
+            accesses: 40,
+            scanned: 90_000,
+            retired_scanned: 89_000,
+            own_scanned: 600,
+            retained: 2_000_000,
+            live: 300,
+        });
+        close(l, model, 880_000);
+        close(l, admit, 900_000);
+        let finished = l.close_admission(record).expect("open");
+        close(l, fifo, 1_000_000);
+        finished
+    }
+
+    #[test]
+    fn admission_steps_are_exclusive_and_sum_to_the_admission() {
+        let mut l = active();
+        let record = admitted_exec(&mut l);
+        assert_eq!(record.ns_of(TrancheCost::AdmitStampWaits), 10_000);
+        // `read_exec` is inside `arrival` and is not also charged to it.
+        assert_eq!(record.ns_of(TrancheCost::AdmitReadExec), 150_000);
+        assert_eq!(record.ns_of(TrancheCost::AdmitArrival), 20_000);
+        assert_eq!(record.ns_of(TrancheCost::AdmitBuildPacket), 100_000);
+        assert_eq!(record.ns_of(TrancheCost::AdmitModel), 580_000);
+        // The glue between the steps, and only that.
+        assert_eq!(record.ns_of(TrancheCost::Admit), 20_000);
+        // The head write between the halves is the drain's, not admission's.
+        assert_eq!(record.total_ns(), 10_000 + 870_000);
+        assert_eq!(record.worst_step(), (TrancheCost::AdmitModel, 580_000));
+        assert_eq!(record.scan.map(|s| s.retired_scanned), Some(89_000));
+
+        let a = l.finish(1, 1_000_000, 0);
+        assert_tiles(&a);
+        assert_eq!(a.claimed_ns(), 1_000_000);
+        // The tranche's own admission columns are the same exclusive figures.
+        let admission: u64 = (0..TrancheCost::ADMISSION_COUNT)
+            .map(|i| a.ns_of(TrancheCost::admission_step(i)))
+            .sum();
+        assert_eq!(admission, record.total_ns());
+        assert_eq!(a.worst_admission, Some(record));
+        assert_eq!(a.hazard_scan.scanned, 90_000);
+
+        let line = a.render("drain_long");
+        assert!(line.contains(" admit_us=20 admit_n=1"), "{line}");
+        assert!(line.contains(" admit_stamp_waits_us=10 "), "{line}");
+        assert!(
+            line.contains(" admit_read_exec_submission_us=150 "),
+            "{line}"
+        );
+        assert!(
+            line.contains(" admit_model_us=580 admit_model_n=1"),
+            "{line}"
+        );
+        assert!(
+            line.contains(
+                " admit_worst_op=0x37 admit_worst_us=880 admit_worst_phase=model \
+                 admit_worst_phase_us=580"
+            ),
+            "{line}"
+        );
+        assert!(
+            line.contains(" graph_scanned=90000 graph_retired_scanned=89000 "),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn an_admission_line_prints_every_step_and_names_the_worst() {
+        let mut l = active();
+        let record = admitted_exec(&mut l);
+        let line = record.render("admit_worst");
+        assert!(
+            line.starts_with(
+                "admit_worst t=0 ch=3 opcode=0x37 total_us=880 phase=model phase_us=580 \
+                 stamp_waits_us=10 arrival_us=20 read_exec_us=150 build_packet_us=100 \
+                 wait_filter_us=0 access_modes_us=0 pipeline_declare_us=0 preflight_us=0 \
+                 pipeline_state_us=0 model_us=580 build_parked_us=0 park_us=0 residue_us=20 \
+                 accesses=40 scanned=90000 retired_scanned=89000 own_scanned=600 \
+                 graph_retained=2000000 graph_live=300"
+            ),
+            "{line}"
+        );
+        let root = AdmissionAnatomy {
+            channel: None,
+            ..record
+        };
+        assert!(root.render("admit_long").contains(" ch=root "));
+    }
+
+    #[test]
+    fn long_admissions_print_at_once_and_the_worst_rides_the_window() {
+        let mut w = Window::new();
+        let admission = |model_ns| {
+            let mut a = AdmissionAnatomy {
+                opcode: 0x37,
+                ..AdmissionAnatomy::EMPTY
+            };
+            a.ns[TrancheCost::AdmitModel.admission_index().unwrap()] = model_ns;
+            a
+        };
+        assert!(w.admission(admission(LONG_ADMIT_US * 1000 - 1)).is_none());
+        let line = w.admission(admission(550_000_000)).expect("long");
+        assert!(line.starts_with("admit_long t=0 ch=root opcode=0x37 total_us=550000 "));
+        let [_, _, worst] = w.take(1000);
+        let worst = worst.expect("two admissions finished");
+        assert!(worst.starts_with("admit_worst "), "{worst}");
+        assert!(worst.contains(" total_us=550000 phase=model "), "{worst}");
+        assert!(worst.contains(" long=1 long_suppressed=0 "), "{worst}");
+        assert!(w.take(1000)[2].is_none(), "the window was reset");
+    }
+
+    #[test]
+    fn admission_steps_are_one_contiguous_run_of_the_tiling() {
+        for i in 0..TrancheCost::ADMISSION_COUNT {
+            let step = TrancheCost::admission_step(i);
+            assert!(step.is_tiling(), "{}", step.label());
+            assert_eq!(step.admission_index(), Some(i));
+            assert!(step.label().starts_with("admit"), "{}", step.label());
+        }
+        assert_eq!(TrancheCost::Settle.admission_index(), None);
+        assert_eq!(TrancheCost::ChildFifo.admission_index(), None);
     }
 
     #[test]
