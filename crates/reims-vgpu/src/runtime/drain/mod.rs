@@ -2409,6 +2409,7 @@ pub(crate) fn note_access_modes(state: &DeviceState, built: &reims_vgpu_core::se
 /// into the model and this takes work out of it, and neither is a function of
 /// where a ring's head happens to be.
 fn settle_model_work<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    let _span = census::tranche_span(census::TrancheCost::Settle);
     // **Until nothing more runs, not once.** Running a position publishes its
     // channel's completion words, and a published word discharges the stamp
     // waits other positions were admitted with — so one pass over what was
@@ -2506,6 +2507,7 @@ fn declined_by_the_device(
 /// forever. So the slots parked work is watching are read every pass, which is
 /// the same observation at the moment it has become the only one.
 fn observe_awaited_stamps<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    let _span = census::tranche_span(census::TrancheCost::SettleStamps);
     if state.gfx.fifo_base_page == 0 {
         return;
     }
@@ -2513,6 +2515,7 @@ fn observe_awaited_stamps<H: HostMemory + HostOps>(state: &mut DeviceState, host
     if waiting.is_empty() {
         return;
     }
+    census::note_tranche_count(census::TrancheCost::SettleWalk, 0, waiting.len() as u64);
     let mut seen: Vec<u32> = Vec::new();
     for ingress in waiting {
         for index in state.parked.awaited_slots(ingress) {
@@ -2551,7 +2554,10 @@ fn observe_awaited_stamps<H: HostMemory + HostOps>(state: &mut DeviceState, host
 /// Nothing here runs anything. It moves pipelines to `Ready`, and readying a
 /// pipeline is what the model turns into released work.
 fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
-    for ingress in state.parked.waiting_in_order() {
+    let _span = census::tranche_span(census::TrancheCost::SettlePump);
+    let waiting = state.parked.waiting_in_order();
+    census::note_tranche_count(census::TrancheCost::SettleWalk, 0, waiting.len() as u64);
+    for ingress in waiting {
         let Some((submission, resolved)) = state.parked.planning(ingress) else {
             continue;
         };
@@ -2572,6 +2578,7 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             continue;
         }
         let mut measured_ns = 0u64;
+        let preflight_started = std::time::Instant::now();
         let pending = crate::runtime::exec::preflight_submission(
             state,
             &*host,
@@ -2579,6 +2586,7 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             resolved,
             &mut measured_ns,
         );
+        census::note_tranche_since(census::TrancheCost::PumpPreflight, preflight_started);
         if !pending.is_empty() {
             // The pump's own withdrawal arm. A position can be parked on one
             // pipeline while another it binds is `Ready` from an earlier
@@ -2615,6 +2623,7 @@ fn run_parked<H: HostMemory + HostOps>(
 ) {
     let domain = work.domain();
     if domain == crate::runtime::ingress::Fifo::ROOT.domain().0 {
+        let _span = census::tranche_span(census::TrancheCost::RootProc);
         process_root_packet(state, host, work.packet());
     } else {
         // The re-entry guard this packet used to be run under. A child packet's
@@ -2628,14 +2637,17 @@ fn run_parked<H: HostMemory + HostOps>(
         let prev_channel = state.draining_channel;
         state.draining_channel = domain;
         state.draining_mask |= bit;
-        let started = std::time::Instant::now();
+        // Exclusive `proc`: a drain this packet enters (a present's rescue) is
+        // charged under its own names, not a second time as this packet's.
+        let packet_span = census::packet_span(work.packet().opcode);
         let _ = process_child_packet(state, host, domain, work.packet(), work.retained());
-        census::note_drain_proc(work.packet().opcode, started.elapsed().as_nanos() as u64);
+        drop(packet_span);
         if was_draining == 0 {
             state.draining_mask &= !bit;
         }
         state.draining_channel = prev_channel;
     }
+    let _complete = census::tranche_span(census::TrancheCost::Complete);
     match state.complete_transaction(work.epoch(), ingress) {
         Ok(released) => {
             for release in released {
@@ -4050,6 +4062,7 @@ fn process_root_packet<H: HostMemory + HostOps>(
 
 /// Drain the main (root) FIFO while producer != consumer.
 pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    let _span = census::tranche_span(census::TrancheCost::MainFifo);
     let ring_size = main_ring_data_size(state.gfx.fifo_length, state.gfx.fifo_start);
     if ring_size == 0 || state.gfx.fifo_base_page == 0 {
         state.pending.main_drain = false;
@@ -4083,7 +4096,10 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                 // tears down a task whose work has not been drained — which is
                 // exactly the ordering `admit` now holds, on a position rather
                 // than on this ring's consumer pointer.
-                note_packet_stamp_waits(state, host, None, &packet);
+                {
+                    let _admit = census::tranche_span(census::TrancheCost::Admit);
+                    note_packet_stamp_waits(state, host, None, &packet);
+                }
 
                 // The head advances first and unconditionally; see the child
                 // drain's copy for why that is the whole of the switch.
@@ -4092,13 +4108,16 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                     .fifo_read
                     .store(packet.next_head, std::sync::atomic::Ordering::Release);
 
-                admit_and_park(
-                    state,
-                    host,
-                    crate::runtime::ingress::Fifo::ROOT,
-                    ROOT_STAMP_SLOT,
-                    packet,
-                );
+                {
+                    let _admit = census::tranche_span(census::TrancheCost::Admit);
+                    admit_and_park(
+                        state,
+                        host,
+                        crate::runtime::ingress::Fifo::ROOT,
+                        ROOT_STAMP_SLOT,
+                        packet,
+                    );
+                }
                 settle_model_work(state, host);
             }
         }
@@ -4681,6 +4700,11 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     if mapping == 0 {
         return ChildPacketDisposition::Complete;
     }
+    // The present's own record for the tranche ledger: every step below is
+    // timed inclusive, nested drains beside it, so a long present names the
+    // step that owned it (`present_long`). Inert outside a drain tranche.
+    let _present = census::present_scope(channel_id, mapping);
+    use census::{present_phase, PresentPhase};
     // Archive apple_pv_gpu_display_swap:
     //   render_wait_surface(s, false, swap->mapping_id);
     //   scanout_present_boundary(...);
@@ -4698,8 +4722,14 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     } else {
         channel_id
     };
-    drain_other_child_fifos(state, host, skip);
-    drain_other_child_fifos(state, host, skip);
+    {
+        let _phase = present_phase(PresentPhase::RescueChildFirst);
+        drain_other_child_fifos(state, host, skip);
+    }
+    {
+        let _phase = present_phase(PresentPhase::RescueChildSecond);
+        drain_other_child_fifos(state, host, skip);
+    }
     // Main-ring Dekker only (not full drain_stranded): guest may
     // publish root control work while child drains ran. Full
     // drain_stranded re-enters this child channel and wedged iBoot
@@ -4711,8 +4741,12 @@ fn present_named_mapping<H: HostMemory + HostOps>(
             .load(std::sync::atomic::Ordering::Acquire)
             != state.gfx.fifo_written
     {
-        drain_main_fifo(state, host);
+        {
+            let _phase = present_phase(PresentPhase::RescueMain);
+            drain_main_fifo(state, host);
+        }
         // Body-layer child work may be doorbell'd from main packets.
+        let _phase = present_phase(PresentPhase::RescueChildAfterMain);
         drain_other_child_fifos(state, host, skip);
     }
 
@@ -4754,17 +4788,24 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     // A presented framebuffer is what WindowServer copies from with the CPU,
     // unannounced, to fill the next back buffer. Its frame has to be in its
     // pages before anything after this swap can reach the guest.
-    crate::runtime::writeback_debt::pay_cpu_shared_mapping(state, host, mapping);
+    {
+        let _phase = present_phase(PresentPhase::PayCpuShared);
+        crate::runtime::writeback_debt::pay_cpu_shared_mapping(state, host, mapping);
+    }
     // x86: present surface_id → backing object-list slot (heap index =
     // IOSurface getSurfaceID). Arm: MappingInternal page-table resolve.
     // Always attempt backing when pages empty; then iosfc/mapper path.
-    let _ = crate::runtime::objects::ensure_surface_for_present(state, host, mapping);
+    {
+        let _phase = present_phase(PresentPhase::EnsureSurface);
+        let _ = crate::runtime::objects::ensure_surface_for_present(state, host, mapping);
+    }
     let force = state
         .mappings
         .get(&mapping)
         .map(|m| m.mapping_internal != 0)
         .unwrap_or(false);
     if force {
+        let _phase = present_phase(PresentPhase::ResolveBacking);
         let _ = crate::runtime::mapper::resolve_mapping_backing(state, host, mapping);
     }
     // Paint only from the presented surface's own geom — never the
@@ -4784,7 +4825,10 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         log_present_page_identity(state, mapping, w, h);
         // Independent of everything below: the guest's own copy of the plane
         // this present names, sampled where the desktop background belongs.
-        crate::runtime::scanout::note_present_field_witness(state, &*host, mapping, w, h);
+        {
+            let _phase = present_phase(PresentPhase::FieldWitness);
+            crate::runtime::scanout::note_present_field_witness(state, &*host, mapping, w, h);
+        }
         // Every present takes one route: capture the surface the transaction
         // named. A ClearOnly present — one whose named mid's most recent write
         // was a `display_clear`/CLEAR Store rather than a draw — used to take a
@@ -4844,7 +4888,10 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // the arm, so only on a present the structural gate has already refused —
         // four times in that boot, not 60 times a second.
         if let Some(backing) = state.note_present_backing(mapping) {
-            let carried = crate::backend::selected().present_resident_carries(state, mapping, w, h);
+            let carried = {
+                let _phase = present_phase(PresentPhase::ResidentCarries);
+                crate::backend::selected().present_resident_carries(state, mapping, w, h)
+            };
             let emit = crate::observe::Emit::decline("present_unbacked", &backing)
                 .field("mid", mapping)
                 .field("geom", format!("{w}x{h}"))
@@ -4863,7 +4910,10 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // rotation step behind the one the guest asked for — residue when a
         // window closed in between, a stale region when one moved, thrash as
         // the choice oscillates.
-        let encoded = crate::runtime::scanout::capture_present_frame(state, mapping, w, h, gen);
+        let encoded = {
+            let _phase = present_phase(PresentPhase::Capture);
+            crate::runtime::scanout::capture_present_frame(state, mapping, w, h, gen)
+        };
         if !encoded {
             // Retry encode at first host paint. Do **not** clear
             // frame_valid: PGDisplay keeps the prior presentFrame
@@ -4886,6 +4936,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
             // `px[0].max(px[1]).max(px[2])` per pixel, so a separate scan for
             // `max_rgb` was a second full 8 MiB walk of the frame, under the
             // device lock, for a value this call already returns.
+            let _phase = present_phase(PresentPhase::ContentStats);
             let (rgb_nz, max_rgb, px0) = crate::observe::bgra_rgb_stats(&state.present.frame_bgra);
             let verdict = present_content_verdict(&state.present.frame_bgra, max_rgb);
             if verdict == PresentContentVerdict::Unsampled {
@@ -4943,7 +4994,10 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // `copy_to_bgra8`'s Unchanged/expected_generation checks on the QEMU
         // paint; with no paint action produced, the window resolves the frame
         // from `state.present` directly and the distinction has no consumer.
-        enqueue_present_scanout(state, host, w, h);
+        {
+            let _phase = present_phase(PresentPhase::EnqueueScanout);
+            enqueue_present_scanout(state, host, w, h);
+        }
         // Entry-side waitForPendingFrames / apple-gfx pending_frames:
         // count accepted presents until host paint. Stamp still
         // fires with this packet (below) — PGDisplay completion
@@ -4959,7 +5013,10 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     // PGDisplay completion block runs for every present after the
     // +0x188 retain (also when geometry held the paint): display
     // shared-page present bit + conditional display IRQ.
-    signal_display_present_complete(state, host);
+    {
+        let _phase = present_phase(PresentPhase::SignalComplete);
+        signal_display_present_complete(state, host);
+    }
     ChildPacketDisposition::Complete
 }
 
@@ -6681,6 +6738,9 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     host: &mut H,
     channel_id: u32,
 ) {
+    // A drain, for the tranche ledger: entered from inside a packet it is a
+    // nested drain, and what it runs is charged under its own names once.
+    let _span = census::tranche_span(census::TrancheCost::ChildFifo);
     if state.gfx.root_page == 0 {
         return;
     }
@@ -6787,7 +6847,10 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 // the reading and not for a verdict: a wait that is not yet met
                 // is an ordering position in `admit`, not a ring head this loop
                 // refuses to move.
-                note_packet_stamp_waits(state, host, Some(channel_id), &packet);
+                {
+                    let _admit = census::tranche_span(census::TrancheCost::Admit);
+                    note_packet_stamp_waits(state, host, Some(channel_id), &packet);
+                }
 
                 // **The head advances first, and unconditionally.** Everything
                 // this packet needs has been taken out of the ring — the
@@ -6820,7 +6883,10 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     });
                 }
 
-                admit_and_park(state, host, fifo, stamp_index, packet);
+                {
+                    let _admit = census::tranche_span(census::TrancheCost::Admit);
+                    admit_and_park(state, host, fifo, stamp_index, packet);
+                }
                 settle_model_work(state, host);
 
                 if state.pending.host_action_yield {
@@ -6851,6 +6917,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
 /// with `cpu_memory_rw_debug(first_cpu)` deadlocks against MMIO holding
 /// `DEVICES` (see reims-vgpu-mmio.c `read_kva`).
 pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    let _span = census::tranche_span(census::TrancheCost::Iosfc);
     let producer = state.iosfc.producer;
     let mut consumer = state.iosfc.consumer;
     if producer == consumer {
@@ -7488,6 +7555,7 @@ fn signal_display_vbl_at<H: HostMemory + HostOps>(
 /// `enable()` sets `+0x104` bit 2 — earlier IRQs wedge an unregistered display.
 /// createDisplayAttributes then consumes TimingElements (incl. 1440 mode).
 pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    let _span = census::tranche_span(census::TrancheCost::DisplayOnline);
     if state.display.shared_gpa == 0 || state.display.online_acked {
         return;
     }
@@ -7674,6 +7742,7 @@ pub fn drain_other_child_fifos<H: HostMemory + HostOps>(
     host: &mut H,
     skip_channel: u32,
 ) {
+    let _span = census::tranche_span(census::TrancheCost::Resweep);
     let mask = state.drainable_child_mask();
     let nested = state.draining_mask;
 
@@ -7900,12 +7969,17 @@ pub(crate) fn fold_rung_child_doorbells(state: &mut DeviceState) {
 }
 
 pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    // The tranche's outermost exclusive span: what is left of it once every
+    // phase below has claimed its own time is this function's control flow —
+    // the child sweep and its refills.
+    let _sweep = census::tranche_span(census::TrancheCost::Sweep);
     // A queued present action is part of the ordered device timeline. QEMU
     // cannot paint it while this worker owns the device lock, so later worker
     // wakeups must leave guest work queued until scanout consumes the action.
     if state.pending.host_action_yield {
         return;
     }
+    let xlate = census::tranche_span(census::TrancheCost::XlateRetry);
     release_translation_order_holds(state);
     // Retry an already translation-held EXEC before allowing either the root
     // FIFO or a sibling child FIFO to overtake it. The guest is free to queue
@@ -7933,6 +8007,7 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
         }
         release_translation_order_holds(state);
     }
+    drop(xlate);
     if state.pending.main_drain {
         drain_main_fifo(state, host);
     }

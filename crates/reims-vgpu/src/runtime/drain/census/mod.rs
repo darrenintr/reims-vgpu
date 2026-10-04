@@ -24,7 +24,12 @@ use super::DISPLAY_VBL_MIN_INTERVAL_US;
 use crate::backend::{Backend as _, CensusSite};
 
 mod tranche;
-pub use tranche::{note_tranche_cost, note_tranche_since, TrancheCost};
+pub use tranche::{
+    note_tranche_cost, note_tranche_count, note_tranche_since, packet_span, present_phase,
+    present_scope, tranche_span, PacketSpan, PresentPhase, TrancheCost, TrancheSpan,
+};
+#[cfg(test)]
+pub(crate) use tranche::{test_tranche_begin, test_tranche_finish};
 /// Delivered-VBL rate, reported from the branch that decides it.
 ///
 /// VBL is what paces the guest's compositor: WindowServer produces a frame off
@@ -2005,6 +2010,13 @@ impl DrainDutyCensus {
     /// One `process_child_packet` dispatch, in nanoseconds, into the total and
     /// into the slot for its opcode. Contains the draw and compute phases, which
     /// name themselves on the same line.
+    ///
+    /// **Exclusive of any drain the packet enters.** A present's rescue drain
+    /// runs other channels' packets from inside the present, and those packets
+    /// are dispatched — and charged here — themselves; charging them again as
+    /// part of the present made `proc_us` exceed `drain_us` on a live line.
+    /// The caller is `tranche::PacketSpan`, which passes the exclusive figure
+    /// whenever a tranche is running.
     pub(crate) fn note_proc(&self, opcode: u16, ns: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         self.proc_ns.fetch_add(ns, Relaxed);
@@ -2747,11 +2759,13 @@ fn list_lookup_age_route(hit: bool, us: u64) -> &'static str {
 }
 
 /// Attribute the tranche tail: the deferred-batch submit and the present
-/// boundary, both inside `drain_us` and inside no [`DrainPhase`].
-pub fn note_drain_tail(tail_us: u64, boundary_us: u64) {
-    DRAIN_DUTY.note_tail(tail_us, boundary_us);
-    note_tranche_cost(TrancheCost::Tail, tail_us.saturating_mul(1000));
-    note_tranche_cost(TrancheCost::Boundary, boundary_us.saturating_mul(1000));
+/// boundary, both inside `drain_us` and inside no [`DrainPhase`]. Nanoseconds,
+/// so the tranche's exclusive tiling is charged what was measured rather than
+/// a truncation of it.
+pub fn note_drain_tail(tail_ns: u64, boundary_ns: u64) {
+    DRAIN_DUTY.note_tail(tail_ns / 1000, boundary_ns / 1000);
+    note_tranche_cost(TrancheCost::Tail, tail_ns);
+    note_tranche_cost(TrancheCost::Boundary, boundary_ns);
 }
 
 /// Attribute one ring snapshot read, in nanoseconds.
@@ -2764,12 +2778,6 @@ pub fn note_drain_ring(ns: u64) {
 pub fn note_drain_decode(ns: u64) {
     DRAIN_DUTY.note_decode(ns);
     note_tranche_cost(TrancheCost::Decode, ns);
-}
-
-/// Attribute one `process_child_packet` dispatch, in nanoseconds, by opcode.
-pub fn note_drain_proc(opcode: u16, ns: u64) {
-    DRAIN_DUTY.note_proc(opcode, ns);
-    tranche::note_tranche_packet(opcode, ns);
 }
 
 /// Attribute one span inside `process_exec_indirect2`, in nanoseconds.
@@ -2812,18 +2820,22 @@ pub fn note_drain_setup(ns: u64) {
 pub fn note_drain_tranche(
     state: &crate::model::DeviceState,
     host: &dyn crate::runtime::host::HostOps,
-    drain_us: u64,
+    drain_ns: u64,
     publish_us: u64,
 ) {
+    let drain_us = drain_ns / 1000;
     // Before the window can report, so the tranche that closes a window is
     // among the ones that window's `drain_worst` chooses from.
-    tranche::tranche_end(drain_us, publish_us);
+    tranche::tranche_end(drain_ns, publish_us);
     if let Some(line) = DRAIN_DUTY.note(drain_us, publish_us, crate::observe::elapsed_ms() as u64) {
         crate::observe::off(line);
         // Immediately after `drain_duty`, whose `max_tranche_us` it explains:
         // its `total_us` is that figure, broken into what the tranche did.
-        if let Some(worst) = tranche::take_worst_tranche(DRAIN_DUTY.last_window_ms()) {
-            crate::observe::off(worst);
+        // `present_worst` right after it: the window's most expensive present
+        // packet, broken into the steps `present_named_mapping` took.
+        let (worst, present) = tranche::take_worst_tranche(DRAIN_DUTY.last_window_ms());
+        for line in [worst, present].into_iter().flatten() {
+            crate::observe::off(line);
         }
         // The rail this device is running on, asked four times below at the
         // points its lines have to be read from. Taken once so the four asks

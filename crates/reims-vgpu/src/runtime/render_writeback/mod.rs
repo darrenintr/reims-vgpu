@@ -810,6 +810,8 @@ pub fn settle_guest_writes_unless_disjoint(
 /// Task teardown means the GPU VA maps are gone, so nothing here writes guest
 /// pages — the deleted object's bytes are not guest work any more.
 pub fn retire_linear_residents(state: &mut DeviceState) {
+    let _span =
+        crate::runtime::drain::tranche_span(crate::runtime::drain::TrancheCost::RetireLinear);
     if state.retired_linear_residents.is_empty() {
         return;
     }
