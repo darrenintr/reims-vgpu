@@ -5556,6 +5556,42 @@ mod recycle_tests {
         );
     }
 
+    /// A gather the witness proved unnameable carries no identity, and the cache
+    /// declines it: the slot returns to the live list for recycling, no byte is
+    /// charged, and nothing is evicted to make room for it.
+    ///
+    /// This is the engine half of `GatherVouch::Unreachable`. The witness half is
+    /// that no later bind can name the generation; this half is that offering
+    /// `None` costs the cache nothing it was holding.
+    #[test]
+    fn an_unnameable_gather_is_recycled_instead_of_displacing_a_findable_image() {
+        let mut pools = ResourcePools::new();
+        let named = crate::backend::vulkan::engine::SampledContentIdentity {
+            key: 1,
+            generation: 1,
+        };
+        let content = SampledRetainContent::Gathered {
+            len: SAMPLED_CACHE_BYTE_CAP,
+        };
+        assert!(pools
+            .admit_sampled_entry(null_slot(8, 8), &content, Some(named))
+            .is_empty());
+        let held = pools.sampled_cache_bytes;
+        assert_eq!(held, SAMPLED_CACHE_BYTE_CAP);
+
+        // Another full-size gather with no identity: with an identity it would
+        // push the byte cap and evict the named image; without, nothing moves.
+        let evicted = pools.admit_sampled_entry(null_slot(8, 8), &content, None);
+        assert!(evicted.is_empty(), "nothing the cache held was displaced");
+        assert_eq!(pools.sampled_cache_bytes, held, "no byte was charged");
+        assert_eq!(pools.sampled_cache.len(), 1);
+        assert_eq!(
+            pools.sampled_live.len(),
+            1,
+            "the declined slot is back on the list that recycles"
+        );
+    }
+
     /// Two different textures filed under one digest stay two textures.
     ///
     /// A natural 128-bit collision is not something a test can produce, so this

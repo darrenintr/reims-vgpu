@@ -289,16 +289,21 @@
 //!
 //! **What the cache did with them.** `sampled_gather_unretained` was 3: the
 //! cache lost almost nothing it could have served, so eviction was not what made
-//! 628 gathers. Each unarmed gather did retain a 2.5 MB image under a fresh
-//! generation, though — 728 byte-cap evictions in the second, and
-//! `sampled_free_allocs` 675 against 628 gathers, so the free pool fed none of
-//! them. By the code, a bind that read no generation records 0 as its baseline,
-//! the next bind meets `entry.gen == 0` and spends a generation of its own, and a
-//! generation only survives a bind through [`GatherVerdict::Vouched`]: an image
-//! retained under the identity of a bind that read no generation is never looked
-//! up. `unreadable` on `gather_storm` counts exactly those binds, and
-//! `gather_storm_evict` says whether the cache was evicting them or something it
-//! could still have served. Nothing in this module acts on either.
+//! 628 gathers. It was, however, filling itself with their images — each unarmed
+//! gather retained a 2.5 MB image under a fresh generation, 728 byte-cap
+//! evictions in the second, and `sampled_free_allocs` 675 against 628 gathers —
+//! so the free pool fed none of them. Those images could never be found: a bind that read no
+//! generation records 0 as its baseline, the next bind meets `entry.gen == 0`
+//! and spends a generation of its own, and a generation only survives a bind
+//! through [`GatherVerdict::Vouched`]. [`GatherVouch::Unreachable`] names that,
+//! and [`GatherOutcome::identity`] is `None` for it, so the engine declines to
+//! admit the image (`sampled_admit_no_identity`) and recycles it. This is not a
+//! relaxation of the witness: no vouch changes and no gather is skipped. It stops
+//! the cache holding what cannot be asked for. **How many allocations that
+//! returns is not yet measured** — a recycled slot waits on its submission's fence
+//! like any other, so inside one long tranche it may return few. Read
+//! `sampled_free_allocs` and `alloc_us` against `gw_unnameable` on the next
+//! boot before quoting a gain.
 //!
 //! **What it does not do, and why the rest was left alone.**
 //!
@@ -963,7 +968,8 @@ pub enum UnarmedCause {
     /// harvests pass.
     Untracked,
     /// The token is live and its generation still reads 0: the shim pins a set at
-    /// 0 until a harvest has run over it. Every bind in this state gathers.
+    /// 0 until a harvest has run over it. Every bind in this state gathers, and
+    /// the identity it spends cannot be named by any later bind.
     Arming,
     /// The generation is readable now and was not at the previous bind. This
     /// bind's gather is the one the baseline describes, so it is not wasted: the
@@ -1251,7 +1257,18 @@ impl crate::observe::decline::Decline for GatherWitnessFault {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GatherOutcome {
     /// What the engine looks the retained image up under, and retains under.
-    pub identity: GatheredIdentity,
+    ///
+    /// `None` exactly when [`Self::vouch`] is [`GatherVouch::Unreachable`]: the
+    /// witness has proved no later bind can name this generation, so offering it
+    /// would only fill the sampled cache with an image nothing can find. The
+    /// engine already declines to admit an identity-less gather
+    /// (`sampled_admit_no_identity`) and recycles the image instead.
+    ///
+    /// This is not the `Option` the earlier doc on [`note_gather`] retired. That
+    /// one was `Some` on every path and meant "was the witness asked"; this one
+    /// is decided beside the assignment that spends the generation and means
+    /// "can the generation be named again".
+    pub identity: Option<GatheredIdentity>,
     /// Whether that identity can name an image the cache already holds.
     pub vouch: GatherVouch,
 }
@@ -1263,6 +1280,9 @@ pub struct GatherOutcome {
 /// page-set compare and one content fold and changes no behaviour.
 ///
 /// # Why this does not return an `Option`
+///
+/// (The identity inside [`GatherOutcome`] is one now, with a different meaning: see
+/// [`GatherVouch::Unreachable`]. What follows is about the retired one.)
 ///
 /// It used to, and the `Option` was `Some` on every path: the identity was read
 /// back with `vouched_identity`, which answered "is this window tracked", and
@@ -1437,12 +1457,16 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
             .fail_once(key.content_key());
         }
     }
+    if !seen.vouch.nameable() {
+        note_store_route("gw_unnameable");
+        note_store_route_n("gw_unnameable_kb", span / 1024);
+    }
     crate::runtime::gather_storm::note_bind(key, rail, span, &seen);
     GatherOutcome {
-        identity: GatheredIdentity {
+        identity: seen.vouch.nameable().then_some(GatheredIdentity {
             key: key.content_key(),
             generation: seen.generation,
-        },
+        }),
         vouch: seen.vouch,
     }
 }
@@ -1465,10 +1489,23 @@ pub enum GatherVouch {
     /// Both halves said the bytes cannot have moved since the gather that filled
     /// the retained image, so the identity is one the cache may already hold.
     Vouched,
-    /// Either half saw a write, the window was re-pointed, or no token could
-    /// answer — the generation was spent this bind and names bytes no retained
-    /// image was ever built from.
+    /// Either half saw a write, the window was re-pointed, or the previous bind's
+    /// generation was unreadable — the generation was spent this bind and names
+    /// bytes no retained image was ever built from. The image this bind gathers
+    /// *can* be named by the next one, because this bind read a generation for it
+    /// to be compared against.
     Fresh,
+    /// The generation was spent **and no later bind can ever name it.**
+    ///
+    /// This bind read no generation (no token, or one still inside its arming
+    /// window), so the entry records 0 as its baseline, and the next bind meets
+    /// `entry.gen == 0` and spends a generation of its own whatever the host says
+    /// then. The only way a generation outlives a bind is [`GatherVouch::Vouched`],
+    /// which needs a non-zero baseline; so the image this bind gathers can be
+    /// retained under an identity that nothing will ever look up. It costs a cache
+    /// slot, evicts an image something *could* look up, and pins an image the
+    /// recycle pool would have handed to the very next gather.
+    Unreachable,
 }
 
 impl GatherVouch {
@@ -1476,6 +1513,12 @@ impl GatherVouch {
     /// question as "is there an identity" — there always is.
     pub fn is_vouched(self) -> bool {
         matches!(self, Self::Vouched)
+    }
+
+    /// Whether a retained image under this bind's identity can ever be found
+    /// again. False only for [`GatherVouch::Unreachable`].
+    pub fn nameable(self) -> bool {
+        !matches!(self, Self::Unreachable)
     }
 }
 
@@ -1619,8 +1662,14 @@ fn observe<M: crate::runtime::host::HostOps>(
             generation: fresh_generation,
             // The other place a generation is assigned, and the only one that
             // assigns unconditionally: a re-pointed window has no previous bind
-            // of these pages to have vouched for them.
-            vouch: GatherVouch::Fresh,
+            // of these pages to have vouched for them. Whether the next bind can
+            // name it depends on the one thing the entry records as its baseline:
+            // a generation read here, or 0.
+            vouch: if gen != 0 {
+                GatherVouch::Fresh
+            } else {
+                GatherVouch::Unreachable
+            },
             detail: BindDetail {
                 unarmed: None,
                 rearm: Some(rearm),
@@ -1826,10 +1875,16 @@ fn observe<M: crate::runtime::host::HostOps>(
         verdict,
         audit,
         generation: entry.generation,
+        // Decided beside the assignment above, for the same reason `kept` is. A
+        // generation survives a bind only through `kept`, which needs a
+        // non-zero baseline; so a bind that read none spent a generation that
+        // the next bind will spend past, whatever the host says by then.
         vouch: if kept {
             GatherVouch::Vouched
-        } else {
+        } else if readable {
             GatherVouch::Fresh
+        } else {
+            GatherVouch::Unreachable
         },
         stated,
         detail: BindDetail {
@@ -2887,6 +2942,164 @@ mod tests {
             let seen = bind_in(&mut w, &mut host, &runs, 1);
             assert_eq!(seen.detail.unarmed, Some(UnarmedCause::Untracked));
             assert!(!seen.detail.life.readable);
+        }
+    }
+
+    /// The identity a bind that read no generation spends can never be named by a
+    /// later bind, and the one bind whose gather the baseline describes can.
+    ///
+    /// Walks one window through the shim's arming window the way a driven boot
+    /// does: tracked, still reading 0 for several binds, then armed. Every bind
+    /// before the arm gathers — the witness has nothing to compare against — and
+    /// the engine must not retain those gathers under an identity nothing will
+    /// ask for. The first bind that reads a generation is the one that *does*
+    /// seed the cache, and the bind after it is the one that vouches.
+    #[test]
+    fn a_bind_that_read_no_generation_names_nothing_a_later_bind_can_find() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        host.guest_write_startup_window = true;
+        let mut w = GatherWitness::default();
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+
+        let born = bind_in(&mut w, &mut host, &runs, 1);
+        assert_eq!(born.verdict, GatherVerdict::Rearmed);
+        assert_eq!(born.vouch, GatherVouch::Unreachable, "tracked but unarmed");
+        assert_eq!(
+            born.detail.rearm,
+            Some(Rearm {
+                why: RearmWhy::New,
+                interrupted_arming: false
+            })
+        );
+        assert!(!born.detail.life.readable);
+
+        for n in 0..3 {
+            let arming = bind_in(&mut w, &mut host, &runs, 1);
+            assert_eq!(arming.verdict, GatherVerdict::Unarmed, "repeat {n}");
+            assert_eq!(arming.detail.unarmed, Some(UnarmedCause::Arming));
+            assert_eq!(arming.vouch, GatherVouch::Unreachable);
+            assert!(arming.detail.life.same_tranche_as_previous);
+            assert_eq!(arming.detail.life.unarmed_run_before, n);
+        }
+
+        host.close_guest_write_arming_window();
+        let baseline = bind_in(&mut w, &mut host, &runs, 2);
+        assert_eq!(baseline.verdict, GatherVerdict::Unarmed);
+        assert_eq!(baseline.detail.unarmed, Some(UnarmedCause::NoBaseline));
+        assert_eq!(
+            baseline.vouch,
+            GatherVouch::Fresh,
+            "this bind's gather is the one the baseline describes"
+        );
+        assert!(baseline.detail.life.first_readable);
+        assert_eq!(baseline.detail.life.binds, 5);
+        assert_eq!(baseline.detail.life.tranches, 1);
+        assert_eq!(baseline.detail.life.us, 1000);
+        assert!(!baseline.detail.life.same_tranche_as_previous);
+
+        let vouched = bind_in(&mut w, &mut host, &runs, 2);
+        assert_eq!(vouched.verdict, GatherVerdict::Vouched);
+        assert_eq!(
+            vouched.generation, baseline.generation,
+            "the image retained under the baseline bind's identity is the one found"
+        );
+        assert!(!vouched.detail.life.first_readable);
+    }
+
+    /// A host that refuses to track leaves every bind of the window unnameable,
+    /// however many arrive.
+    #[test]
+    fn a_window_the_host_refuses_to_track_is_unnameable_on_every_bind() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        host.guest_writes_unobservable = true;
+        let mut w = GatherWitness::default();
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+
+        assert_eq!(
+            bind_in(&mut w, &mut host, &runs, 1).vouch,
+            GatherVouch::Unreachable
+        );
+        for _ in 0..4 {
+            let seen = bind_in(&mut w, &mut host, &runs, 1);
+            assert_eq!(seen.detail.unarmed, Some(UnarmedCause::Untracked));
+            assert_eq!(seen.vouch, GatherVouch::Unreachable);
+            assert!(!seen.vouch.nameable());
+        }
+    }
+
+    /// The soundness the engine's decision rests on, stated as a property over
+    /// sequences: a generation the witness called [`GatherVouch::Unreachable`] is
+    /// never the generation of any later observation, whatever the host, the
+    /// guest and this device did in between.
+    ///
+    /// A deterministic generator rather than a hand-picked sequence, because the
+    /// claim is about every interleaving of three things the witness cannot
+    /// order — the arming window closing, a guest store, and a device write —
+    /// and a sequence someone chose is a sequence that already passes.
+    #[test]
+    fn an_unreachable_generation_is_never_seen_again() {
+        use crate::runtime::host_writes::HostWriteVerdict;
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut roll = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        for round in 0..64 {
+            let mut host = crate::runtime::host::FakeHost::new();
+            host.guest_write_startup_window = roll(4) != 0;
+            host.guest_writes_unobservable = roll(16) == 0;
+            let mut w = GatherWitness::default();
+            let mut unreachable = std::collections::HashSet::new();
+            for step in 0..96u64 {
+                match roll(8) {
+                    0 => host.close_guest_write_arming_window(),
+                    1 => host.guest_wrote_page(GPAS[0]),
+                    _ => {}
+                }
+                let readings = WitnessReadings {
+                    pages_wrote: Some(if roll(5) == 0 {
+                        HostWriteVerdict::Overlap
+                    } else {
+                        HostWriteVerdict::Quiet
+                    }),
+                    clock: BindClock {
+                        tranche: step / 3,
+                        us: step * 10,
+                    },
+                    ..QUIET
+                };
+                let seen = observe(
+                    &mut w,
+                    &mut host,
+                    KEY,
+                    one_page(&GPAS, &runs),
+                    readings,
+                    next_gen(),
+                );
+                assert!(
+                    !unreachable.contains(&seen.generation),
+                    "round {round} step {step}: a generation proved unnameable came back as {:?}",
+                    seen.verdict
+                );
+                if seen.vouch == GatherVouch::Unreachable {
+                    unreachable.insert(seen.generation);
+                }
+                // The other half of the claim, and the identity the census
+                // relies on: a bind is unnameable exactly when it read no
+                // generation, so `unreadable` on `gather_storm` is the number of
+                // images this rule declines to retain.
+                assert_eq!(
+                    seen.vouch == GatherVouch::Unreachable,
+                    !seen.detail.life.readable,
+                    "round {round} step {step}"
+                );
+            }
         }
     }
 

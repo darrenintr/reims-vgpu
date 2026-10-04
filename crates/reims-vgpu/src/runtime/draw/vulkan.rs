@@ -4753,7 +4753,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                     native,
                     sampled_vk_format,
                     planes,
-                    Some(LinearSampleIdentity::from(seen.identity)),
+                    seen.identity.map(LinearSampleIdentity::from),
                     seen.vouch,
                     native_components,
                 ),
@@ -4810,7 +4810,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             native,
             sampled_vk_format,
             planes,
-            Some(LinearSampleIdentity::from(seen.identity)),
+            seen.identity.map(LinearSampleIdentity::from),
             seen.vouch,
             native_components,
         ),
@@ -4944,7 +4944,7 @@ pub(super) fn try_mapper_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
         native,
         sampled_vk_format,
         1,
-        Some(LinearSampleIdentity::from(seen.identity)),
+        seen.identity.map(LinearSampleIdentity::from),
         seen.vouch,
         // Identity: this rail admitted the format only after checking its plan
         // was identity, so there is nothing to fold in.
@@ -5071,7 +5071,7 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
         native,
         sampled_vk_format,
         1,
-        Some(LinearSampleIdentity::from(seen.identity)),
+        seen.identity.map(LinearSampleIdentity::from),
         seen.vouch,
         // Identity: this rail admitted the format only after checking its plan
         // was identity, so there is nothing to fold in.
