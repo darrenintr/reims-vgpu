@@ -4551,10 +4551,21 @@ impl DeviceState {
         packet: &reims_vgpu_core::session::Packet,
     ) -> Result<Admission, reims_vgpu_core::session::Refusal> {
         let mut session = self.session.lock().expect("session");
+        let before = session.graph().census();
         let admitted = session.admit(packet)?;
+        let graph = session.graph();
+        let after = graph.census();
         Ok(Admission {
             epoch: session.epoch(),
             admitted,
+            hazard_scan: HazardScan {
+                accesses: packet.payload.accesses().len(),
+                scanned: after.candidates_scanned - before.candidates_scanned,
+                retired_scanned: after.retired_scanned - before.retired_scanned,
+                own_scanned: after.own_scanned - before.own_scanned,
+                retained: graph.retained_entries(),
+                live: graph.live_accesses(),
+            },
         })
     }
 
@@ -5898,6 +5909,32 @@ impl DeviceState {
 pub struct Admission {
     pub admitted: reims_vgpu_core::session::Admitted,
     pub epoch: reims_vgpu_core::identity::DeviceEpoch,
+    /// What the hazard compiler did to admit it. Census only.
+    pub hazard_scan: HazardScan,
+}
+
+/// What one admission cost the dependency graph, read under the admitting
+/// lock so the four counts and the two sizes describe the same moment.
+///
+/// **Census, deciding nothing.** It exists so a slow `admit_model` phase can
+/// say whether it was the graph's own scan and, if so, which part of it: the
+/// comparisons that could order (`scanned - retired_scanned - own_scanned`),
+/// the ones against retired transactions the indexes still hold, and the ones
+/// against the packet's own earlier accesses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HazardScan {
+    /// Accesses the packet carried into the graph.
+    pub accesses: usize,
+    /// Index entries those accesses were compared against.
+    pub scanned: usize,
+    /// Of `scanned`, entries whose transaction had retired.
+    pub retired_scanned: usize,
+    /// Of `scanned`, entries this packet itself had just inserted.
+    pub own_scanned: usize,
+    /// Index entries the graph holds after the admission, live and retired.
+    pub retained: usize,
+    /// Of `retained`, the live ones.
+    pub live: usize,
 }
 
 /// One task's records, in one submission domain, as an

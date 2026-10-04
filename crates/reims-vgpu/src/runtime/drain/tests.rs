@@ -2237,7 +2237,43 @@ fn a_present_rescue_drain_is_charged_once_in_the_tranche_tiling() {
     assert!(a.count(TrancheCost::ChildFifo) >= 2, "{line}");
     assert!(a.count(TrancheCost::Resweep) >= 2, "{line}");
     assert!(a.count(TrancheCost::Settle) >= 3, "{line}");
-    assert!(a.count(TrancheCost::Admit) >= 3, "{line}");
+    // Admission: one `admit` residue and one stamp census per packet — the
+    // census no longer opens a second `admit` span — and every packet reached
+    // the ordering walk, the model and the park, each under its own step.
+    assert_eq!(a.count(TrancheCost::Admit), 3, "{line}");
+    for step in [
+        TrancheCost::AdmitStampWaits,
+        TrancheCost::AdmitArrival,
+        TrancheCost::AdmitBuildPacket,
+        TrancheCost::AdmitModel,
+        TrancheCost::AdmitPark,
+    ] {
+        assert_eq!(a.count(step), 3, "{}: {line}", step.label());
+    }
+    // Every packet's admission was recorded, and the worst one's steps are
+    // the tranche's own exclusive figures for that packet: no more than the
+    // tranche's admission columns in total.
+    let worst = a.worst_admission.expect("three packets were admitted");
+    let admission: u64 = [
+        TrancheCost::Admit,
+        TrancheCost::AdmitStampWaits,
+        TrancheCost::AdmitArrival,
+        TrancheCost::AdmitBuildPacket,
+        TrancheCost::AdmitWaitFilter,
+        TrancheCost::AdmitAccessModes,
+        TrancheCost::AdmitPipelineDeclare,
+        TrancheCost::AdmitModel,
+        TrancheCost::AdmitBuildParked,
+        TrancheCost::AdmitPark,
+    ]
+    .iter()
+    .map(|&c| a.ns_of(c))
+    .sum();
+    assert!(worst.total_ns() <= admission, "{line}");
+    assert!(
+        worst.scan.is_some(),
+        "the worst packet reached the model: {line}"
+    );
 
     // And the present says which of its steps ran the nested drain.
     let p = a.worst_present.expect("the tranche held a present");

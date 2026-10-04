@@ -64,6 +64,19 @@ pub struct Census {
     /// two accesses of one transaction meeting one earlier ordinal counted
     /// twice against the one edge they made, and the fraction could exceed one.
     pub edges_from_unknown_mode: usize,
+    /// Index entries an admitted access was compared against, whatever came of
+    /// the comparison. The work [`DependencyGraph::admit`] actually does, as
+    /// opposed to what it found: the three counters below are subsets of it.
+    pub candidates_scanned: usize,
+    /// Of [`Self::candidates_scanned`], entries whose transaction had already
+    /// retired. They cannot create an edge, so every one is a comparison paid
+    /// for nothing — the cost of index entries [`DependencyGraph::retire`]
+    /// leaves behind until [`DependencyGraph::compact`] drops them.
+    pub retired_scanned: usize,
+    /// Of [`Self::candidates_scanned`], entries the admitting transaction had
+    /// itself inserted a moment earlier. Never an edge either; they grow with
+    /// the square of one transaction's accesses to one backing.
+    pub own_scanned: usize,
 }
 
 /// The live hazard state.
@@ -84,6 +97,10 @@ pub struct DependencyGraph {
     by_domain: HashMap<ChannelId, Vec<usize>>,
     domain_only: HashMap<ChannelId, Vec<usize>>,
     by_ordinal: HashMap<IngressOrdinal, Vec<usize>>,
+    /// How many of `entries` are live. Kept beside them rather than counted, so
+    /// a caller can ask how much of the graph is retired residue without a
+    /// walk of the whole of it.
+    live: usize,
     census: Census,
     /// Buffers `admit` refills instead of allocating.
     ///
@@ -97,6 +114,12 @@ pub struct DependencyGraph {
     /// signature owns.
     scratch: Vec<usize>,
     waits: Vec<IngressOrdinal>,
+    /// The ordinal of the newest entry ever inserted, which is what the
+    /// ingress-order assertion compares against. Not `entries.last()`:
+    /// compaction drops retired entries, and the newest may be one of them.
+    newest: Option<IngressOrdinal>,
+    /// Old entry index to new, refilled by [`Self::compact`].
+    remap: Vec<usize>,
 }
 
 impl DependencyGraph {
@@ -113,7 +136,15 @@ impl DependencyGraph {
     /// Live accesses, for a test or a report. Not a bound anything enforces.
     #[must_use]
     pub fn live_accesses(&self) -> usize {
-        self.entries.iter().filter(|e| e.live).count()
+        debug_assert_eq!(self.live, self.entries.iter().filter(|e| e.live).count());
+        self.live
+    }
+
+    /// Index entries held, live and retired. What an admission may have to
+    /// scan; [`Self::live_accesses`] is the part of it that can still order.
+    #[must_use]
+    pub fn retained_entries(&self) -> usize {
+        self.entries.len()
     }
 
     /// Admit one transaction's accesses and return the ordinals it must wait
@@ -136,11 +167,21 @@ impl DependencyGraph {
         accesses: &[AccessIntent],
     ) -> Vec<IngressOrdinal> {
         assert!(
-            self.entries
-                .last()
-                .is_none_or(|last| ordinal > last.ordinal),
+            self.newest.is_none_or(|newest| ordinal > newest),
             "transactions are admitted in ingress order; {ordinal:?} arrived after a later one"
         );
+        // Retired entries can never create an edge, but every one left in an
+        // index is compared against by every later access to its backing,
+        // heap or domain. Left alone they accumulate for the life of the
+        // session and admission costs grow with uptime rather than with the
+        // work in flight. So the graph drops them itself, here, on the path
+        // that pays for scanning them, whenever they outnumber the live
+        // entries: a compaction costs O(entries) and follows more retirements
+        // than there are live entries, so it is O(1) amortized per retirement,
+        // and the indexes never hold more than twice the live entries plus one.
+        if self.entries.len() - self.live > self.live {
+            self.compact();
+        }
         // Taken out so the gathering below can borrow the indexes; put back
         // before returning, so the next admission finds the capacity this one
         // grew. Both are cleared here rather than at the end, because a
@@ -151,9 +192,15 @@ impl DependencyGraph {
         for intent in accesses {
             scratch.clear();
             self.gather(intent, &mut scratch);
+            self.census.candidates_scanned += scratch.len();
             for &candidate in &scratch {
                 let entry = self.entries[candidate];
-                if !entry.live || entry.ordinal == ordinal {
+                if !entry.live {
+                    self.census.retired_scanned += 1;
+                    continue;
+                }
+                if entry.ordinal == ordinal {
+                    self.census.own_scanned += 1;
                     continue;
                 }
                 if !requires_edge(&entry.intent, intent) {
@@ -179,6 +226,7 @@ impl DependencyGraph {
                 }
             }
             self.insert(ordinal, *intent);
+            self.newest = Some(ordinal);
         }
         self.scratch = scratch;
         let out = waits.clone();
@@ -235,6 +283,7 @@ impl DependencyGraph {
             intent,
             live: true,
         });
+        self.live += 1;
         self.census.accesses += 1;
         self.census.by_rung[usize::from(intent.key.rung()) - 1] += 1;
         self.by_domain.entry(intent.domain).or_default().push(idx);
@@ -261,7 +310,9 @@ impl DependencyGraph {
     /// that retires early publishes a hazard it still owes.
     pub fn retire(&mut self, ordinal: IngressOrdinal) {
         for &idx in self.by_ordinal.get(&ordinal).into_iter().flatten() {
-            self.entries[idx].live = false;
+            if std::mem::replace(&mut self.entries[idx].live, false) {
+                self.live -= 1;
+            }
         }
         self.by_ordinal.remove(&ordinal);
     }
@@ -271,21 +322,42 @@ impl DependencyGraph {
     /// Separate from [`Self::retire`] because retirement is on the completion
     /// path and this is not: an index rebuild in a completion handler is work
     /// charged to the thing that finished rather than to the thing that grew.
+    /// [`Self::admit`] runs it once retired entries outnumber live ones, so a
+    /// caller never has to; calling it is still allowed and changes no answer.
+    ///
+    /// In place, and allocation-free once warm: every index list keeps its own
+    /// order and capacity and has its entries renumbered through one reused
+    /// map, so running this on the admission path does not undo the
+    /// structural zero [`Self::scratch`] exists for. The census is a running
+    /// total across the graph's life and is not touched: compaction is
+    /// bookkeeping, and it did not admit anything.
     pub fn compact(&mut self) {
-        let live: Vec<_> = self.entries.iter().copied().filter(|e| e.live).collect();
-        self.entries.clear();
-        self.by_backing.clear();
-        self.by_heap.clear();
-        self.by_domain.clear();
-        self.domain_only.clear();
-        self.by_ordinal.clear();
-        // The census is a running total across the graph's life and is not
-        // rebuilt: compaction is bookkeeping, and it did not admit anything.
-        let saved = self.census;
-        for e in live {
-            self.insert(e.ordinal, e.intent);
+        let mut remap = std::mem::take(&mut self.remap);
+        remap.clear();
+        let mut next = 0usize;
+        for entry in &self.entries {
+            if entry.live {
+                remap.push(next);
+                next += 1;
+            } else {
+                remap.push(usize::MAX);
+            }
         }
-        self.census = saved;
+        self.entries.retain(|e| e.live);
+        debug_assert_eq!(self.entries.len(), self.live);
+        let renumber = |list: &mut Vec<usize>| {
+            list.retain_mut(|idx| {
+                *idx = remap[*idx];
+                *idx != usize::MAX
+            });
+            !list.is_empty()
+        };
+        self.by_backing.retain(|_, list| renumber(list));
+        self.by_heap.retain(|_, list| renumber(list));
+        self.by_domain.retain(|_, list| renumber(list));
+        self.domain_only.retain(|_, list| renumber(list));
+        self.by_ordinal.retain(|_, list| renumber(list));
+        self.remap = remap;
     }
 }
 
@@ -505,6 +577,67 @@ mod tests {
         assert_eq!(g.live_accesses(), 1);
         g.compact();
         assert_eq!(g.live_accesses(), 1, "only the live access survives");
+    }
+
+    /// What an admission scanned is counted apart from what it found, and the
+    /// two kinds of comparison that can never be an edge are named: an entry
+    /// whose transaction retired, and an entry the admitting transaction put
+    /// there itself.
+    #[test]
+    fn scanned_candidates_name_the_ones_that_cannot_order() {
+        let mut g = DependencyGraph::new();
+        let k = AccessKey::Whole(res(1));
+        g.admit(ord(1), &[intent(k, AccessMode::Write)]);
+        g.admit(ord(2), &[intent(k, AccessMode::Read)]);
+        g.retire(ord(1));
+        let before = g.census();
+        // Two accesses to one backing: the second meets the first.
+        let waits = g.admit(
+            ord(3),
+            &[intent(k, AccessMode::Write), intent(k, AccessMode::Write)],
+        );
+        assert_eq!(waits, vec![ord(2)]);
+        let after = g.census();
+        // First access: ord 1 (retired) and ord 2. Second: those and its twin.
+        assert_eq!(after.candidates_scanned - before.candidates_scanned, 5);
+        assert_eq!(after.retired_scanned - before.retired_scanned, 2);
+        assert_eq!(after.own_scanned - before.own_scanned, 1);
+        assert_eq!(g.live_accesses(), 3);
+    }
+
+    /// Retired entries cannot accumulate. A session that admits and retires a
+    /// write to one backing over and over used to keep every one of them in
+    /// that backing's index, so the n-th admission compared against n-1 dead
+    /// entries and the session paid n²/2 comparisons for n transactions.
+    #[test]
+    fn retired_entries_do_not_accumulate_across_admissions() {
+        let mut g = DependencyGraph::new();
+        let k = AccessKey::Whole(res(1));
+        let n = 10_000u64;
+        // One long-lived reader, so the graph is never simply empty.
+        g.admit(ord(1), &[intent(k, AccessMode::Read)]);
+        for i in 2..n {
+            g.admit(ord(i), &[intent(k, AccessMode::Read)]);
+            g.retire(ord(i));
+            assert!(
+                g.retained_entries() <= 2 * g.live_accesses() + 1,
+                "{} retained for {} live",
+                g.retained_entries(),
+                g.live_accesses()
+            );
+        }
+        let census = g.census();
+        assert!(
+            census.retired_scanned < 2 * n as usize,
+            "{} comparisons against retired entries for {n} admissions",
+            census.retired_scanned
+        );
+        // And the order contract still holds after the newest entry was
+        // compacted away.
+        let late = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            g.admit(ord(n - 2), &[intent(k, AccessMode::Read)])
+        }));
+        assert!(late.is_err(), "an ordinal older than one already admitted");
     }
 
     /// Compaction is bookkeeping. It must not change an answer, and it must not

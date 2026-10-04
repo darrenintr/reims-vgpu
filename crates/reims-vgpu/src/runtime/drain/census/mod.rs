@@ -25,8 +25,9 @@ use crate::backend::{Backend as _, CensusSite};
 
 mod tranche;
 pub use tranche::{
-    note_tranche_cost, note_tranche_count, note_tranche_since, packet_span, present_phase,
-    present_scope, tranche_span, PacketSpan, PresentPhase, TrancheCost, TrancheSpan,
+    admission_scope, note_hazard_scan, note_tranche_cost, note_tranche_count, note_tranche_since,
+    packet_span, present_phase, present_scope, tranche_span, AdmissionScope, PacketSpan,
+    PresentPhase, TrancheCost, TrancheSpan,
 };
 #[cfg(test)]
 pub(crate) use tranche::{test_tranche_begin, test_tranche_finish};
@@ -2833,8 +2834,12 @@ pub fn note_drain_tranche(
         // its `total_us` is that figure, broken into what the tranche did.
         // `present_worst` right after it: the window's most expensive present
         // packet, broken into the steps `present_named_mapping` took.
-        let (worst, present) = tranche::take_worst_tranche(DRAIN_DUTY.last_window_ms());
-        for line in [worst, present].into_iter().flatten() {
+        // `admit_worst` after both: the window's most expensive packet admission,
+        // broken into its exclusive steps.
+        for line in tranche::take_worst_tranche(DRAIN_DUTY.last_window_ms())
+            .into_iter()
+            .flatten()
+        {
             crate::observe::off(line);
         }
         // The rail this device is running on, asked four times below at the
