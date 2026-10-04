@@ -2137,6 +2137,133 @@ fn child_drain_yields_after_present_for_display_consumer() {
     assert_eq!(host.get_u32(stamp_gpa + 4), 22);
 }
 
+/// A present's rescue drain runs a sibling channel's packets from inside the
+/// present packet. The tranche ledger must charge each of them once: the live
+/// RX 7600 line that motivated the exclusive tiling read `drain_us=61285
+/// proc_us=62884`, because the present's inclusive `proc` already held the
+/// nested packets' `proc`.
+///
+/// Driven through `drain_pending` with the real hooks, not a synthetic clock:
+/// channel 5 holds one `PRESENT_X86` (op 6), channel 3 holds two NOPs that only
+/// the present's `drain_other_child_fifos` reaches.
+#[test]
+fn a_present_rescue_drain_is_charged_once_in_the_tranche_tiling() {
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::drain::{PresentPhase, TrancheCost};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page_size = state.page_size() as usize;
+    let root_pfn = 0x10u32;
+    let stamp_pfn = 0x40u32;
+    let root_gpa = state.pfn_gpa(root_pfn);
+    let stamp_gpa = state.pfn_gpa(stamp_pfn);
+    for gpa in [root_gpa, stamp_gpa] {
+        host.map_range(gpa, page_size, 0);
+    }
+    // One ring per channel: (channel, page-list pfn, ring pfn, stamp index, bytes).
+    let form = PresentForm::Transaction2;
+    let mut payload = vec![0u8; form.trailer_len()];
+    payload[form.target_offset()..form.target_offset() + 4].copy_from_slice(&4u32.to_le_bytes());
+    let present = packet_bytes(CHILD_OP_DISPLAY_TRANSACTION2, 21, &payload);
+    let mut nops = packet_bytes(CHILD_OP_NOP, 31, &[]);
+    nops.extend_from_slice(&packet_bytes(CHILD_OP_NOP, 32, &[]));
+    let mut heads = Vec::new();
+    for (channel, list_pfn, ring_pfn, stamp_index, ring) in [
+        (5u32, 0x20u32, 0x30u32, 1u32, present.clone()),
+        (3, 0x21, 0x31, 2, nops.clone()),
+    ] {
+        let list_gpa = state.pfn_gpa(list_pfn);
+        let ring_gpa = state.pfn_gpa(ring_pfn);
+        host.map_range(list_gpa, page_size, 0);
+        host.map_range(ring_gpa, page_size, 0);
+        host.write_gpa(ring_gpa, &ring).unwrap();
+        host.put_u32(list_gpa, ring_pfn);
+        let regs_gpa = root_gpa + child_reg_block_offset(channel).unwrap();
+        host.put_u32(regs_gpa + CHILD_REG_TAIL, ring.len() as u32);
+        host.put_u32(regs_gpa + CHILD_REG_HEAD, 0);
+        host.put_u32(regs_gpa + CHILD_REG_STAMP_INDEX, stamp_index);
+        host.put_u32(regs_gpa + CHILD_REG_BASE_PFN, list_pfn);
+        heads.push((regs_gpa + CHILD_REG_HEAD, ring.len() as u32));
+    }
+    assert!(state.map_surface(4));
+    assert!(state.set_mapping_geom(4, 2, 2, MTL_FORMAT_BGRA8_UNORM));
+    state.gfx.root_page = root_pfn;
+    state.gfx.fifo_base_page = stamp_pfn;
+    state.open_child_domains_for_test((1u32 << 5) | (1u32 << 3));
+    // Only the present's channel is rung: channel 3 is reached by the rescue.
+    state.pending.child_mask = 1u32 << 5;
+
+    crate::runtime::drain::test_tranche_begin();
+    let started = std::time::Instant::now();
+    drain_pending(&mut state, &mut host);
+    let drain_ns = started.elapsed().as_nanos() as u64;
+    let a = crate::runtime::drain::test_tranche_finish(drain_ns);
+    let line = a.render("drain_long");
+
+    // The drive did what the accounting claims it did.
+    for (head_gpa, end) in heads {
+        assert_eq!(host.get_u32(head_gpa), end, "both rings consumed: {line}");
+    }
+    assert_eq!(host.get_u32(stamp_gpa + 4), 21, "the present completed");
+    assert_eq!(host.get_u32(stamp_gpa + 8), 32, "the nested NOPs completed");
+
+    // The exclusive tiling fits inside the interval it was measured in.
+    assert!(a.claimed_ns() <= drain_ns, "{line}");
+    assert!(a.residue_ns().is_ok(), "{line}");
+    assert_eq!(
+        (a.skew_n, a.unclosed, a.depth_overflow),
+        (0, 0, 0),
+        "{line}"
+    );
+
+    // Three packets, each charged once.
+    assert_eq!(a.packets, 3, "{line}");
+    assert_eq!(a.count(TrancheCost::Proc), 3, "{line}");
+    assert_eq!(a.top_op, CHILD_OP_DISPLAY_TRANSACTION2, "{line}");
+    // The present entered one nested drain region, and its own `proc` is what
+    // is left once that region is taken out — not its inclusive time.
+    assert_eq!(a.count(TrancheCost::NestedDrain), 1, "{line}");
+    let nested = a.ns_of(TrancheCost::NestedDrain);
+    assert!(nested > 0, "{line}");
+    assert!(a.top_self_ns + nested <= a.top_ns, "{line}");
+    // The old inclusive accounting would have charged at least the present's
+    // inclusive time plus the nested packets' own; the exclusive one charges
+    // strictly less than the present's inclusive time plus the nested NOPs'.
+    assert!(a.ns_of(TrancheCost::Proc) < a.top_ns + nested, "{line}");
+
+    // The drain phases the old `other` hid are each claimed by name.
+    assert!(a.count(TrancheCost::Sweep) == 1, "{line}");
+    assert!(a.count(TrancheCost::ChildFifo) >= 2, "{line}");
+    assert!(a.count(TrancheCost::Resweep) >= 2, "{line}");
+    assert!(a.count(TrancheCost::Settle) >= 3, "{line}");
+    assert!(a.count(TrancheCost::Admit) >= 3, "{line}");
+
+    // And the present says which of its steps ran the nested drain.
+    let p = a.worst_present.expect("the tranche held a present");
+    assert_eq!((p.channel, p.mapping), (5, 4));
+    let first = p.ns_of(PresentPhase::RescueChildFirst);
+    let first_nested = p.nested_of(PresentPhase::RescueChildFirst);
+    assert!(
+        first_nested > 0 && first_nested <= first,
+        "{}",
+        p.render("present_long")
+    );
+    assert_eq!(
+        p.nested_of(PresentPhase::Capture),
+        0,
+        "{}",
+        p.render("present_long")
+    );
+    assert!(
+        p.render("present_long").contains(" signal_complete_n=1"),
+        "{}",
+        p.render("present_long")
+    );
+    assert!(p.residue_ns().is_ok(), "{}", p.render("present_long"));
+    assert!(p.nested_ns <= p.total_ns);
+}
+
 /// Mode switch (1920→1440) is a new surface identity: reset
 /// content_generation (Load/scanout semantics restart).
 #[test]

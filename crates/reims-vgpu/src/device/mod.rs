@@ -566,11 +566,14 @@ pub fn device_drain(id: u64) -> bool {
     // inside the tranche flush on their own (engine begin_entry), this bounds
     // only the idle-tail latency of the last same-target run.
     crate::backend::selected().flush_deferred_submissions(&device.state);
-    let tail_us = tail_started.elapsed().as_micros() as u64;
+    let tail_ns = tail_started.elapsed().as_nanos() as u64;
     let boundary_started = std::time::Instant::now();
     publish_present_boundary(&slot, device.state.present.frame_flush_seen);
-    crate::runtime::drain::note_drain_tail(tail_us, boundary_started.elapsed().as_micros() as u64);
-    let drain_us = tranche_started.elapsed().as_micros() as u64;
+    crate::runtime::drain::note_drain_tail(tail_ns, boundary_started.elapsed().as_nanos() as u64);
+    // Nanoseconds, because the tranche ledger's exclusive tiling is checked
+    // against it: every span inside `Device::drain` nests in this interval, so
+    // their sum can only fall short of it, and by what nothing claimed.
+    let drain_ns = tranche_started.elapsed().as_nanos() as u64;
     let publish_started = std::time::Instant::now();
     // Push the finished present frame to the host-owned window (if running).
     // Off the QEMU main loop; a small dedicated mutex, never the render lock.
@@ -579,7 +582,7 @@ pub fn device_drain(id: u64) -> bool {
     crate::runtime::drain::note_drain_tranche(
         &device.state,
         &host,
-        drain_us,
+        drain_ns,
         publish_started.elapsed().as_micros() as u64,
     );
     // Everything from here to the return is `gap_post_us`: the per-tranche
