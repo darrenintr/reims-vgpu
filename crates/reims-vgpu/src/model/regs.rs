@@ -831,20 +831,7 @@ pub const DISPLAY_DESC_HEIGHT_MM_F32: u64 = 0x28;
 /// what stands in the way is whether this crate executes the gamma-carrying
 /// present form, not whether the value is known.
 ///
-/// # Two neighbouring fields this device also leaves unwritten
-///
-/// Named in prose rather than as constants, because a constant nothing writes is
-/// dead code and the useful part is the contract, not the offset.
-///
-/// **`+0x200`, a `u32` — a configuration generation counter the host
-/// *increments*.** The reference host does exactly that at the end of every
-/// descriptor refill, after writing the timing count at `+0x208` and the timing
-/// array from `+0x210`. The guest's online handler reads it and echoes it back as
-/// the second word of the online acknowledgement, beside the pipe index, which is
-/// how the host learns which generation the guest acked. This device never writes
-/// it, so the guest acknowledges zero and every publish looks like the same
-/// generation. Writing a *constant* here would be wrong for the same reason;
-/// what the contract asks for is an increment per publish.
+/// # One neighbouring field this device still leaves unwritten
 ///
 /// **`+0x2c … +0x48`, eight `f32`.** The panel's CIE xy chromaticities — red, green,
 /// blue, white — which newer guests pass straight into the EDID they synthesise, and
@@ -857,6 +844,19 @@ pub const DISPLAY_DESC_HEIGHT_MM_F32: u64 = 0x28;
 /// the instrument that settles it is the guest's own EDID, decoded on a boot of a
 /// guest new enough to read the block.
 pub const DISPLAY_DESC_FEATURES: u64 = 0x1c;
+
+/// Display descriptor configuration generation.
+///
+/// Apple's reference host increments this word once per descriptor refill, after
+/// writing the timing array. The guest's ONLINE handler reads it and echoes the
+/// value back in the second word of the acknowledgement, so keeping it at zero
+/// makes every descriptor publication look like the same generation.
+///
+/// This is a counter, not a capability flag. The current value is owned by
+/// `DisplayHandshake::descriptor_generation` and is written by
+/// `fill_display_descriptor` only after all timing entries have been published.
+pub const DISPLAY_DESC_GENERATION: u64 = 0x200;
+
 /// Timing-element **count** (not a pixel width — large values hang the guest).
 ///
 /// Each element is width `u16`, height `u16`, refresh as 16.16 fixed `u32`, and then
