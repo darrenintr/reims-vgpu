@@ -1284,16 +1284,25 @@ pub(crate) unsafe fn execute_compute_inner(
         );
     }
 
-    // Storage images → readback buffers
-    for prepared in &simg_slots {
-        let img = &prepared.slot;
-        let barrier = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-            .old_layout(vk::ImageLayout::GENERAL)
-            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .image(img.image)
-            .subresource_range(super::color_subresource_range())];
+    // Storage images → readback buffers / guest-page copies.
+    //
+    // Every storage image leaves compute in the same access/layout state and
+    // enters the same transfer-read state. Emit one dependency carrying all of
+    // them instead of one vkCmdPipelineBarrier per binding; the copies remain
+    // per destination below.
+    if !simg_slots.is_empty() {
+        let barriers: Vec<_> = simg_slots
+            .iter()
+            .map(|prepared| {
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .image(prepared.slot.image)
+                    .subresource_range(super::color_subresource_range())
+            })
+            .collect();
         ctx.device.cmd_pipeline_barrier(
             cb,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1301,8 +1310,11 @@ pub(crate) unsafe fn execute_compute_inner(
             vk::DependencyFlags::empty(),
             &[],
             &[],
-            &barrier,
+            &barriers,
         );
+    }
+    for prepared in &simg_slots {
+        let img = &prepared.slot;
         match &prepared.dst {
             ComputeImageDst::Readback(slot) => {
                 // The pooled readback is always tightly packed from texel zero.
