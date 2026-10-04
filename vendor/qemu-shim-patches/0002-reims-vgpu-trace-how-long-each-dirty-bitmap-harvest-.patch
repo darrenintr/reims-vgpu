@@ -1,0 +1,132 @@
+From 7b6eea7b4592bad7a9bd0ea7c382304a2a72fb5f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 4 Oct 2026 13:07:51 +0000
+Subject: [PATCH] reims-vgpu: trace how long each dirty-bitmap harvest holds
+ the BQL
+
+Measurement only. reims_vgpu_dirty_run is now timed when the trace event is
+enabled (the clock is not read otherwise) and reports whether it was the
+main-loop arming harvest or a doorbell harvest, how long it ran, how many sets
+were tracked, and whether a set is still waiting. The arming harvest runs on the
+main loop, which also services QEMU's audio and USB isochronous timers, so this
+is the number that says whether the adapter can starve them. Enable with
+-trace reims_vgpu_dirty_run (or 'trace-event reims_vgpu_dirty_run on' in the
+monitor). No behaviour change; the model check is unchanged.
+---
+ .../reims-vgpu-dirty-test/fake/fake_qemu.c    |  1 +
+ .../fake/trace/trace-hw_display.h             | 25 +++++++++++++++
+ hw/display/reims-vgpu-dirty.c                 | 32 +++++++++++++++++++
+ hw/display/trace-events                       |  5 +++
+ 4 files changed, 63 insertions(+)
+ create mode 100644 hw/display/reims-vgpu-dirty-test/fake/trace/trace-hw_display.h
+
+diff --git a/hw/display/reims-vgpu-dirty-test/fake/fake_qemu.c b/hw/display/reims-vgpu-dirty-test/fake/fake_qemu.c
+index 48587af..7b448ab 100644
+--- a/hw/display/reims-vgpu-dirty-test/fake/fake_qemu.c
++++ b/hw/display/reims-vgpu-dirty-test/fake/fake_qemu.c
+@@ -6,6 +6,7 @@ FakeRange fake_ranges[8];
+ int fake_nranges;
+ size_t fake_target_page = 4096;
+ uint64_t fake_syncs;
++uint64_t fake_trace_runs;
+ 
+ static MemoryRegion *world_mr(void)
+ {
+diff --git a/hw/display/reims-vgpu-dirty-test/fake/trace/trace-hw_display.h b/hw/display/reims-vgpu-dirty-test/fake/trace/trace-hw_display.h
+new file mode 100644
+index 0000000..93903df
+--- /dev/null
++++ b/hw/display/reims-vgpu-dirty-test/fake/trace/trace-hw_display.h
+@@ -0,0 +1,25 @@
++/* Stand-in for the generated hw/display trace.h. Enabled, so the timed path runs. */
++#ifndef FAKE_TRACE_H
++#define FAKE_TRACE_H
++#include "../fake_qemu.h"
++#include <time.h>
++#define TRACE_REIMS_VGPU_DIRTY_RUN 0
++#define QEMU_CLOCK_REALTIME 0
++static inline int trace_event_get_state_backends(int e) { (void)e; return 1; }
++static inline int64_t qemu_clock_get_us(int clk)
++{
++    struct timespec ts;
++
++    (void)clk;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000 + 1;
++}
++extern uint64_t fake_trace_runs;
++static inline void trace_reims_vgpu_dirty_run(uint64_t forced, uint64_t us,
++                                              uint64_t sets, uint64_t pending,
++                                              uint64_t harvests)
++{
++    (void)forced; (void)us; (void)sets; (void)pending; (void)harvests;
++    fake_trace_runs++;
++}
++#endif
+diff --git a/hw/display/reims-vgpu-dirty.c b/hw/display/reims-vgpu-dirty.c
+index e0e0ae0..e6902cb 100644
+--- a/hw/display/reims-vgpu-dirty.c
++++ b/hw/display/reims-vgpu-dirty.c
+@@ -15,6 +15,7 @@
+ #include "system/ram_addr.h"
+ 
+ #include "reims-vgpu-dirty.h"
++#include "trace.h"
+ 
+ /*
+  * One guest-RAM range of the system address space. A tracked page is resolved
+@@ -518,7 +519,38 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
+  * last harvest" shortcut, which is a statement about generation readers and
+  * does not apply to a harvest a waiting set asked for.
+  */
++static bool reims_vgpu_dirty_run_body(ReimsVgpuDirty *d, bool force);
++
++/*
++ * A harvest, timed. The sync inside it runs with the BQL held, and the main loop
++ * that now also runs the arming harvest is the thread QEMU's audio and USB
++ * isochronous timers are serviced from, so how long one takes is the number that
++ * says whether this adapter can starve them. Measured only when the trace event
++ * is on: the clock is not read otherwise.
++ */
+ static bool reims_vgpu_dirty_run(ReimsVgpuDirty *d, bool force)
++{
++    int64_t t0 = 0;
++    bool pending;
++
++    if (trace_event_get_state_backends(TRACE_REIMS_VGPU_DIRTY_RUN)) {
++        t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
++    }
++    pending = reims_vgpu_dirty_run_body(d, force);
++    if (t0) {
++        uint64_t sets;
++
++        qemu_mutex_lock(&d->lock);
++        sets = g_hash_table_size(d->sets);
++        qemu_mutex_unlock(&d->lock);
++        trace_reims_vgpu_dirty_run(force,
++                                   qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0,
++                                   sets, pending, d->harvests);
++    }
++    return pending;
++}
++
++static bool reims_vgpu_dirty_run_body(ReimsVgpuDirty *d, bool force)
+ {
+     bool pending = false;
+     ReimsVgpuDirtySlice *slices;
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index e7a99b4..05797dc 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -262,3 +262,8 @@ reims_vgpu_pci_mode_change(uint64_t width, uint64_t height) "mode=%"PRIu64"x%"PR
+ # on boundary samples (width/height omitted — use t11_register / scanout_frame).
+ # Probe-only — remove after the isolation boot.
+ 
++# reims-vgpu-dirty.c: one dirty-bitmap harvest. `forced` is 1 for the main-loop
++# bottom half that arms a waiting set and 0 for a guest-doorbell harvest; `us` is
++# how long it ran, which is how long it held the BQL; `pending` is whether a set
++# is still unarmed afterwards (the bottom half reschedules itself on it).
++reims_vgpu_dirty_run(uint64_t forced, uint64_t us, uint64_t sets, uint64_t pending, uint64_t harvests) "forced=%"PRIu64" us=%"PRIu64" sets=%"PRIu64" pending=%"PRIu64" harvests=%"PRIu64
+-- 
+2.43.0
+
