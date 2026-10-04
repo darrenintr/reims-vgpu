@@ -4038,6 +4038,42 @@ pub(super) unsafe fn read_back_slot(
 /// when the invalidate is owed lives in one place. A leased read owes it just
 /// as much as a copied one does; the only thing the lease changes is what
 /// happens *after* the bytes become visible.
+/// Borrow the first `len` bytes of a retired readback slot in place.
+///
+/// This is the compute-storage counterpart of `read_target_leased`: the
+/// submission has already been fenced, so the slot is now in the free pool.
+/// When cached persistent readback memory is available, remove that exact slot
+/// from the pool, invalidate it if needed, and hand its mapping to the caller.
+/// Otherwise return `None` and let the caller use `read_back_slot`.
+pub(super) unsafe fn lease_read_back_slot(
+    ctx: &DeviceContext,
+    pools: &mut ResourcePools,
+    slot: &BufferSlot,
+    len: u64,
+    invalidate_op: VkOp,
+) -> Result<Option<ReadbackLease>, DrawError> {
+    if !slot_span_fits(len, slot.size) {
+        return Err(DrawError::DrawExecution(
+            super::draw_execution::DrawExecutionDecline::ReadBackBeyondSlot {
+                len,
+                slot_size: slot.size,
+            },
+        ));
+    }
+    if slot.mapped == 0 || !slot.cached {
+        return Ok(None);
+    }
+    let Some(lease) = pools.lease_retired_readback(slot.buffer) else {
+        return Ok(None);
+    };
+    if let Err(error) = invalidate_slot_for_read(ctx, slot, invalidate_op) {
+        return_readback_lease(lease.token);
+        return Err(error);
+    }
+    debug_assert!(slot_span_fits(len, lease.slot_size));
+    Ok(Some(lease))
+}
+
 pub(super) unsafe fn invalidate_slot_for_read(
     ctx: &DeviceContext,
     slot: &BufferSlot,
