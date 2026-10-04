@@ -546,6 +546,23 @@ impl ResourcePools {
     fn evict_sampled_entry(&mut self, index: usize, route: SampledVictimRoute) -> SampledSlot {
         let evicted = self.sampled_cache.remove(index);
         self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_sub(evicted.content_len);
+        if let (Some(identity), SampledFingerprint::Gathered) =
+            (evicted.identity, evicted.fingerprint)
+        {
+            // What the departure cost, for the `gather_storm_evict` line: an
+            // entry a newer generation of its window had replaced, or one that
+            // never answered a lookup, was dead weight and its eviction freed a
+            // slot for free. Only an entry that was current and had been useful
+            // is a gather the cap caused.
+            crate::runtime::gather_storm::note_image_evicted(
+                crate::runtime::gather_storm::EvictedImage {
+                    content_key: identity.key,
+                    bytes: evicted.content_len as u64,
+                    hits: evicted.hits,
+                    superseded: evicted.superseded,
+                },
+            );
+        }
         if let Some(identity) = evicted.identity {
             self.sampled_victims.push_front(SampledVictim {
                 key: evicted.slot.key(),
@@ -4384,6 +4401,7 @@ impl ResourcePools {
             .position(|entry| entry.slot.key() == key && entry.identity == Some(id))?;
         let mut entry = self.sampled_cache.remove(index);
         entry.last_touch_ms = self.idle_clock_ms;
+        entry.hits = entry.hits.saturating_add(1);
         let handles = entry.slot.handles();
         self.sampled_cache.push(entry);
         Some(handles)
@@ -4613,6 +4631,21 @@ impl ResourcePools {
             return Vec::new();
         }
         crate::runtime::drain::note_store_route("sampled_admit_kept");
+        // An older generation of the same window can never be named again: the
+        // witness issues each window's generations from one monotonic counter and
+        // only ever offers its newest. Marked rather than evicted — this is the
+        // measurement of how much of the cache that describes, not a policy.
+        if let (SampledFingerprint::Gathered, Some(new)) = (fingerprint, identity) {
+            for older in self.sampled_cache.iter_mut() {
+                if older.fingerprint == SampledFingerprint::Gathered
+                    && older
+                        .identity
+                        .is_some_and(|old| old.key == new.key && old.generation < new.generation)
+                {
+                    older.superseded = true;
+                }
+            }
+        }
         self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_add(content_len);
         let touch = self.idle_clock_ms;
         self.sampled_cache.push(ResidentSampledSlot {
@@ -4622,6 +4655,8 @@ impl ResourcePools {
             content_len,
             identity,
             last_touch_ms: touch,
+            hits: 0,
+            superseded: false,
         });
         // Which of the two caps is doing the evicting decides whether a later
         // miss is a capacity eviction or content the cache has never held.
@@ -5282,6 +5317,8 @@ mod recycle_tests {
                 content_len: 4096,
                 identity: Some(named(i as u64)),
                 last_touch_ms: 0,
+                hits: 0,
+                superseded: false,
             });
             pools.sampled_cache_bytes += 4096;
         }
@@ -5464,6 +5501,97 @@ mod recycle_tests {
         );
     }
 
+    /// An older generation of a window stops being nameable the moment a newer one
+    /// is admitted, and only that: a different window, and a content-digest
+    /// entry that merely shares the identity's key, are still reachable.
+    ///
+    /// The mark is what `gather_storm_evict` reads to say whether an eviction cost
+    /// a gather, so a mark on an entry something can still find would report a
+    /// loss as housekeeping.
+    #[test]
+    fn a_newer_generation_supersedes_only_older_gathers_of_its_own_window() {
+        let mut pools = ResourcePools::new();
+        let id = |key: u64, generation: u64| {
+            crate::backend::vulkan::engine::SampledContentIdentity { key, generation }
+        };
+        let admit = |pools: &mut ResourcePools, identity| {
+            let slot = null_slot(8, 8);
+            let content = SampledRetainContent::Gathered { len: 256 };
+            assert!(pools
+                .admit_sampled_entry(slot, &content, Some(identity))
+                .is_empty());
+        };
+        let superseded = |pools: &ResourcePools, identity| {
+            pools
+                .sampled_cache
+                .iter()
+                .find(|entry| entry.identity == Some(identity))
+                .map(|entry| entry.superseded)
+        };
+
+        admit(&mut pools, id(7, 1));
+        admit(&mut pools, id(9, 2));
+        // A digest entry sharing key 7 with a lower generation: found by its
+        // bytes, not by its identity, so a gather does not replace it.
+        pools.sampled_cache.push(ResidentSampledSlot {
+            slot: null_slot(8, 8),
+            fingerprint: SampledFingerprint::Content(0),
+            content: Some(std::sync::Arc::new(vec![0u8; 4])),
+            content_len: 4,
+            identity: Some(id(7, 0)),
+            last_touch_ms: 0,
+            hits: 0,
+            superseded: false,
+        });
+        assert_eq!(superseded(&pools, id(7, 1)), Some(false), "newest so far");
+
+        admit(&mut pools, id(7, 3));
+        assert_eq!(superseded(&pools, id(7, 1)), Some(true));
+        assert_eq!(superseded(&pools, id(7, 3)), Some(false), "the newest");
+        assert_eq!(superseded(&pools, id(9, 2)), Some(false), "another window");
+        assert_eq!(
+            superseded(&pools, id(7, 0)),
+            Some(false),
+            "findable by its bytes"
+        );
+    }
+
+    /// A gather the witness proved unnameable carries no identity, and the cache
+    /// declines it: the slot returns to the live list for recycling, no byte is
+    /// charged, and nothing is evicted to make room for it.
+    ///
+    /// This is the engine half of `GatherVouch::Unreachable`. The witness half is
+    /// that no later bind can name the generation; this half is that offering
+    /// `None` costs the cache nothing it was holding.
+    #[test]
+    fn an_unnameable_gather_is_recycled_instead_of_displacing_a_findable_image() {
+        let mut pools = ResourcePools::new();
+        let named = crate::backend::vulkan::engine::SampledContentIdentity {
+            key: 1,
+            generation: 1,
+        };
+        let content = SampledRetainContent::Gathered {
+            len: SAMPLED_CACHE_BYTE_CAP,
+        };
+        assert!(pools
+            .admit_sampled_entry(null_slot(8, 8), &content, Some(named))
+            .is_empty());
+        let held = pools.sampled_cache_bytes;
+        assert_eq!(held, SAMPLED_CACHE_BYTE_CAP);
+
+        // Another full-size gather with no identity: with an identity it would
+        // push the byte cap and evict the named image; without, nothing moves.
+        let evicted = pools.admit_sampled_entry(null_slot(8, 8), &content, None);
+        assert!(evicted.is_empty(), "nothing the cache held was displaced");
+        assert_eq!(pools.sampled_cache_bytes, held, "no byte was charged");
+        assert_eq!(pools.sampled_cache.len(), 1);
+        assert_eq!(
+            pools.sampled_live.len(),
+            1,
+            "the declined slot is back on the list that recycles"
+        );
+    }
+
     /// Two different textures filed under one digest stay two textures.
     ///
     /// A natural 128-bit collision is not something a test can produce, so this
@@ -5491,6 +5619,8 @@ mod recycle_tests {
             content_len: retained.len(),
             identity: None,
             last_touch_ms: 0,
+            hits: 0,
+            superseded: false,
         });
 
         assert!(
@@ -5526,6 +5656,8 @@ mod recycle_tests {
             content_len: content.len(),
             identity: None,
             last_touch_ms: 0,
+            hits: 0,
+            superseded: false,
         });
 
         let copy = content.clone();
@@ -5785,6 +5917,8 @@ mod recycle_tests {
                 content_len: len,
                 identity: None,
                 last_touch_ms: touch,
+                hits: 0,
+                superseded: false,
             });
         };
         push(&mut pools, 1920, 1080, 1_000, 8_000_000);

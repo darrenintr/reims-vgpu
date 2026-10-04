@@ -2709,10 +2709,24 @@ pub fn note_resident_window_flushed() {
 /// per device.
 static TRANCHE_START_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Ordinal of the drain tranche now running; 0 before the first.
+///
+/// What lets a reader say two events happened inside one tranche without
+/// comparing clocks: the dirty tracker answers at harvest points, and a
+/// harvest is driven by a doorbell the tranche then drains, so "same tranche"
+/// is the nearest thing the Rust side can name to "no harvest in between".
+static TRANCHE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Mark the start of a drain tranche, for [`tranche_elapsed_us`].
 pub fn note_tranche_started(now_us: u64) {
     TRANCHE_START_US.store(now_us, std::sync::atomic::Ordering::Relaxed);
+    TRANCHE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     tranche::tranche_begin();
+}
+
+/// The ordinal [`note_tranche_started`] last issued.
+pub fn tranche_seq() -> u64 {
+    TRANCHE_SEQ.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// How long the tranche now running has been running.
@@ -2900,6 +2914,12 @@ pub fn note_drain_tranche(
         );
         if let Some(routes) = take_store_routes() {
             crate::observe::off(routes);
+        }
+        // Beside `store_routes` because it divides two of its lines: `gw_unarmed`
+        // into why the hypervisor half had no answer, and `gw_rail_*` into which
+        // windows moved the bytes.
+        for line in crate::runtime::gather_storm::take_lines(DRAIN_DUTY.last_window_ms()) {
+            crate::observe::off(line);
         }
         // Beside `store_routes` deliberately: the two are read against each
         // other. `backing_fail` lines equal `backing_recovered +

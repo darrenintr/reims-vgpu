@@ -1686,6 +1686,11 @@ struct ResidentSampledSlot {
     /// for cache diagnostics. Removal is governed by the cache's count/byte
     /// capacity, not by this timestamp.
     last_touch_ms: u64,
+    /// Lookups this entry has answered. Diagnostic, read at eviction only.
+    hits: u32,
+    /// A newer generation of this entry's window was admitted after it, so no
+    /// later bind can name it. Diagnostic: nothing evicts on it.
+    superseded: bool,
 }
 
 /// Geometry+format key for storage-image pool free lists. Compute images are single-layer 2D by

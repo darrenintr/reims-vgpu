@@ -265,6 +265,71 @@
 //! separated on this counter with no overlap — 155-186 clean against
 //! 20 122-34 772 degraded — which makes it the gate for that class as well.
 //!
+//! # An unarmed window gathers on every bind, and the cache was keeping each copy
+//!
+//! One RX 7600 second with the diagnostic witness off, same-load, 3 608 draws:
+//!
+//! ```text
+//! gw_rail_linear   630  (1 596 037 KB)     gw_hw_quiet     624
+//! gw_unarmed       610                     gw_hw_overlap    13
+//! gw_rearm          15                     gw_vouched       18
+//! gw_refused_*       0                     ~57 distinct windows
+//! ```
+//!
+//! **What that reading establishes by itself.** No bind in it was refused: the
+//! 628 gathers are 15 re-pointed windows, 610 binds of a window whose pages had
+//! *not* moved since the previous bind, and 3 the cache lost. [`observe`] returns
+//! [`GatherVerdict::Unarmed`] only for a window it has already seen with the same
+//! pages and span, so those 610 were repeats of identical windows by
+//! construction. Neither half of the witness had an objection to them — the
+//! hypervisor half had no *answer*, because `guest_write_gen` reads 0 until the
+//! shim's harvests have run over a new token, and a gather read nothing it could
+//! compare. Which of three things that was is [`UnarmedCause`], and nothing before
+//! `gather_storm` could split it.
+//!
+//! **What the cache did with them.** `sampled_gather_unretained` was 3: the
+//! cache lost almost nothing it could have served, so eviction was not what made
+//! 628 gathers. It was, however, filling itself with their images — each unarmed
+//! gather retained a 2.5 MB image under a fresh generation, 728 byte-cap
+//! evictions in the second, and `sampled_free_allocs` 675 against 628 gathers —
+//! so the free pool fed none of them. Those images could never be found: a bind that read no
+//! generation records 0 as its baseline, the next bind meets `entry.gen == 0`
+//! and spends a generation of its own, and a generation only survives a bind
+//! through [`GatherVerdict::Vouched`]. [`GatherVouch::Unreachable`] names that,
+//! and [`GatherOutcome::identity`] is `None` for it, so the engine declines to
+//! admit the image (`sampled_admit_no_identity`) and recycles it. This is not a
+//! relaxation of the witness: no vouch changes and no gather is skipped. It stops
+//! the cache holding what cannot be asked for. **How many allocations that
+//! returns is not yet measured** — a recycled slot waits on its submission's fence
+//! like any other, so inside one long tranche it may return few. Read
+//! `sampled_free_allocs` and `alloc_us` against `gw_unnameable` on the next
+//! boot before quoting a gain.
+//!
+//! **What it does not do, and why the rest was left alone.**
+//!
+//! - *A synchronous baseline.* Reading a generation immediately after
+//!   `track_guest_writes` cannot cover the writes made before logging was on,
+//!   and `HostOps::track_guest_writes` states that enabling logging is deferred
+//!   to a bottom half under the BQL. The shim's arming rule lives in the QEMU
+//!   submodule, which this checkout does not carry, so a change there was not
+//!   audited and none is made. The Rust-side conclusion stands on its own: until
+//!   the shim can say *at which harvest* logging became active, the first
+//!   gather after arming is the earliest the baseline can describe.
+//! - *Reusing one gathered image inside the arming window.* No half of the
+//!   witness can vouch there, and "unarmed means unchanged" is exactly the
+//!   inference this module exists to refuse. A content compare is the one other
+//!   sound witness in the tree, and it is a CPU read of every byte the gather
+//!   would move; `fold_same` on `gather_storm` (under
+//!   [`crate::config::GATHER_STORM_FOLD`]) is the ceiling on what it could save,
+//!   and until a boot reads it there is no case to argue.
+//! - *More cache.* `sampled_gather_unretained` bounds what capacity could buy at
+//!   3 gathers of 628.
+//!
+//! The `gather_storm` lines (see [`crate::runtime::gather_storm`]) are the instrument for
+//! what remains: whether the repeats sit inside one drain tranche, how many binds
+//! a window takes to read its first generation, whether any host is refusing
+//! tokens, and which windows carry the volume.
+//!
 //! # The content fold is now an audit, not the decision
 //!
 //! A full fold over the window is what *established* the rule above: crossed
@@ -313,6 +378,15 @@ pub enum GatherRail {
 }
 
 impl GatherRail {
+    /// Short name for a census line.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Linear => "linear",
+            Self::MapperRefTexture => "t11",
+            Self::RefTexture => "t5",
+        }
+    }
+
     /// Census names for the rail's gather count and its gathered kilobytes.
     fn names(self) -> (&'static str, &'static str) {
         match self {
@@ -370,7 +444,7 @@ impl GatherKey {
 
     /// Whitespace-free rendering for the always-on log, which is parsed by
     /// splitting on spaces.
-    fn log_token(self) -> String {
+    pub(super) fn log_token(self) -> String {
         match self {
             Self::TaskGva { task_id, gva } => format!("gva:{task_id}:{gva:#x}"),
             Self::Mapping { mid, base_off } => format!("map:{mid}:{base_off:#x}"),
@@ -448,6 +522,18 @@ struct Entry {
     /// no compare at all, so a generation that outlives its content by one bind
     /// is a wrong picture that then persists.
     generation: u64,
+    /// When this entry — and so its token — was created.
+    born: BindClock,
+    /// Binds of this entry, this one included once recorded.
+    binds_alive: u32,
+    /// Tranche of the previous bind.
+    last_tranche: u64,
+    /// Consecutive [`GatherVerdict::Unarmed`] binds ending at the previous one.
+    unarmed_run: u32,
+    /// Whether any bind of this entry has read a generation.
+    ever_readable: bool,
+    /// The shadow fold of the previous unvouched bind; see [`ShadowFold`].
+    shadow_fold: Option<u128>,
 }
 
 /// Per-device witness state: one entry per sampled window seen.
@@ -463,6 +549,10 @@ pub struct GatherWitness {
     /// what makes every construction site — the one in `DeviceState` and the
     /// ones in this module's tests — pick the switch up without naming it.
     audit: AuditDensity,
+    /// Whether unvouched binds are folded for the `gather_storm` census; see
+    /// [`ShadowFold`]. Read from [`crate::config::GATHER_STORM_FOLD`] once, here,
+    /// for the reason `audit` is.
+    shadow_fold: bool,
 }
 
 impl Default for GatherWitness {
@@ -471,6 +561,10 @@ impl Default for GatherWitness {
             entries: HashMap::new(),
             binds: 0,
             audit: AuditDensity::from_env(),
+            shadow_fold: matches!(
+                crate::config::switch(crate::config::GATHER_STORM_FOLD),
+                crate::config::Switch::On
+            ),
         }
     }
 }
@@ -610,6 +704,12 @@ impl GatherWitness {
                 stated_gen: None,
                 last_seen: 0,
                 generation: 0,
+                born: BindClock::default(),
+                binds_alive: 0,
+                last_tranche: 0,
+                unarmed_run: 0,
+                ever_readable: false,
+                shadow_fold: None,
             },
         );
     }
@@ -747,6 +847,8 @@ struct WitnessReadings {
     /// that, so its remaining alarms are about the cache rather than about
     /// itself.
     pending: PendingWrites,
+    /// Where in the device's timeline this bind landed.
+    clock: BindClock,
 }
 
 /// Whether a guest-page write this device has submitted but the GPU has not yet
@@ -850,6 +952,121 @@ pub enum GatherVerdict {
         /// This device wrote at least one of these pages.
         host_wrote_pages: bool,
     },
+}
+
+/// Why the hypervisor half had no answer for a bind that came back
+/// [`GatherVerdict::Unarmed`].
+///
+/// One verdict, three causes, and they want three different repairs — which is
+/// why `gw_unarmed` alone could not say whether a storm of them was a host that
+/// never tracks, a token still inside its arming window, or the single bind
+/// after it that has to take the baseline.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UnarmedCause {
+    /// The host refused to track the window, so the entry holds no token. No
+    /// bind of this window can vouch for as long as that holds, however many
+    /// harvests pass.
+    Untracked,
+    /// The token is live and its generation still reads 0: the shim pins a set at
+    /// 0 until a harvest has run over it. Every bind in this state gathers, and
+    /// the identity it spends cannot be named by any later bind.
+    Arming,
+    /// The generation is readable now and was not at the previous bind. This
+    /// bind's gather is the one the baseline describes, so it is not wasted: the
+    /// next quiet bind vouches for it.
+    NoBaseline,
+}
+
+/// Why a bind came back [`GatherVerdict::Rearmed`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RearmWhy {
+    /// No entry: first sight of this key, or the first since its entry was
+    /// evicted.
+    New,
+    /// Same key and length, different pages.
+    PagesMoved,
+    /// The window's length changed.
+    SpanMoved,
+}
+
+/// A re-point or first sight, with whether it cut an arming window short.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Rearm {
+    pub why: RearmWhy,
+    /// The entry this replaced had never read a generation. Each of these
+    /// restarts the arming clock, which is what would keep a churning window
+    /// from ever warming up.
+    pub interrupted_arming: bool,
+}
+
+/// Where a bind sits in the device's own timeline: which drain tranche and when.
+///
+/// The dirty tracker only answers at harvest points, and harvests are driven by
+/// the doorbells the drain consumes, so two binds in one tranche had no harvest
+/// *the drain thread could see* between them. Carried as a value into
+/// [`observe`] rather than read there so a test can state it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct BindClock {
+    /// [`crate::runtime::drain::tranche_seq`].
+    pub tranche: u64,
+    /// [`crate::observe::elapsed_us`].
+    pub us: u64,
+}
+
+/// One bind placed in the life of its window's entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct EntryLife {
+    /// The tranche this bind ran in, as [`BindClock::tranche`].
+    pub tranche: u64,
+    /// Binds of this entry so far, this one included: 1 on the bind that created
+    /// it.
+    pub binds: u32,
+    /// Drain tranches since the entry was created; 0 when this is still the
+    /// tranche that created it.
+    pub tranches: u64,
+    /// Microseconds since the entry was created.
+    pub us: u64,
+    /// Consecutive [`GatherVerdict::Unarmed`] binds immediately before this one.
+    pub unarmed_run_before: u32,
+    /// The previous bind of this window was in this same tranche.
+    pub same_tranche_as_previous: bool,
+    /// The host answered with a readable generation at this bind.
+    pub readable: bool,
+    /// This is the first bind of the entry that read one.
+    pub first_readable: bool,
+}
+
+/// What the opt-in shadow fold ([`crate::config::GATHER_STORM_FOLD`]) found, on
+/// a bind the witness did not vouch for.
+///
+/// Observed only: nothing branches on it. It answers the one question an
+/// arming-window reuse would need answered first — whether the bytes a
+/// re-gather moved were the bytes the previous gather moved.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ShadowFold {
+    /// The switch is off, or the bind was vouched and no gather was owed.
+    #[default]
+    Off,
+    /// Folded, with no previous fold of this window to compare against.
+    Seeded,
+    /// The previous fold of this window is this fold.
+    Same,
+    /// The window's bytes differ from the previous fold of it.
+    Moved,
+    /// Not folded: a copy this device submitted is in flight over the window, so
+    /// a CPU read of it is not a reading of either side of that copy.
+    Indebted,
+}
+
+/// What the witness can say about one bind that [`GatherVerdict`] does not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct BindDetail {
+    /// Why the bind was [`GatherVerdict::Unarmed`], when it was.
+    pub unarmed: Option<UnarmedCause>,
+    /// Why the bind was [`GatherVerdict::Rearmed`], when it was.
+    pub rearm: Option<Rearm>,
+    pub life: EntryLife,
+    pub shadow: ShadowFold,
 }
 
 /// What the guest's **stated** invalidation channel says about one window, read
@@ -972,6 +1189,9 @@ pub struct GatherObservation {
     /// hypervisor half of [`Self::verdict`] answers. Observed only; no arm of
     /// this module branches on it.
     pub stated: StatedGuestWrite,
+    /// The bind in context: why it was unarmed or re-pointed, and where it sits
+    /// in its window's life. Read by the census alone.
+    pub detail: BindDetail,
 }
 
 /// What this witness reports on the fail channel: one way it can be wrong, and
@@ -1037,7 +1257,18 @@ impl crate::observe::decline::Decline for GatherWitnessFault {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GatherOutcome {
     /// What the engine looks the retained image up under, and retains under.
-    pub identity: GatheredIdentity,
+    ///
+    /// `None` exactly when [`Self::vouch`] is [`GatherVouch::Unreachable`]: the
+    /// witness has proved no later bind can name this generation, so offering it
+    /// would only fill the sampled cache with an image nothing can find. The
+    /// engine already declines to admit an identity-less gather
+    /// (`sampled_admit_no_identity`) and recycles the image instead.
+    ///
+    /// This is not the `Option` the earlier doc on [`note_gather`] retired. That
+    /// one was `Some` on every path and meant "was the witness asked"; this one
+    /// is decided beside the assignment that spends the generation and means
+    /// "can the generation be named again".
+    pub identity: Option<GatheredIdentity>,
     /// Whether that identity can name an image the cache already holds.
     pub vouch: GatherVouch,
 }
@@ -1049,6 +1280,9 @@ pub struct GatherOutcome {
 /// page-set compare and one content fold and changes no behaviour.
 ///
 /// # Why this does not return an `Option`
+///
+/// (The identity inside [`GatherOutcome`] is one now, with a different meaning: see
+/// [`GatherVouch::Unreachable`]. What follows is about the retired one.)
 ///
 /// It used to, and the `Option` was `Some` on every path: the identity was read
 /// back with `vouched_identity`, which answered "is this window tracked", and
@@ -1095,6 +1329,10 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
             GatherKey::TaskGva { .. } => None,
         },
         pending: PendingWrites::over(window.gpas),
+        clock: BindClock {
+            tranche: crate::runtime::drain::tranche_seq(),
+            us: crate::observe::elapsed_us(),
+        },
     };
     // Every bind, vouched or not, so the route is a denominator rather than a
     // tally of refusals — the reading wanted is what fraction of binds this
@@ -1157,7 +1395,15 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
 
     match seen.verdict {
         GatherVerdict::Rearmed => note_store_route("gw_rearm"),
-        GatherVerdict::Unarmed => note_store_route("gw_unarmed"),
+        GatherVerdict::Unarmed => {
+            note_store_route("gw_unarmed");
+            // Why, in the same window, so the three causes divide the count above.
+            note_store_route(match seen.detail.unarmed {
+                Some(UnarmedCause::Untracked) => "gw_unarmed_untracked",
+                Some(UnarmedCause::Arming) => "gw_unarmed_arming",
+                Some(UnarmedCause::NoBaseline) | None => "gw_unarmed_no_baseline",
+            });
+        }
         GatherVerdict::Vouched => {
             note_store_route("gw_vouched");
             note_store_route_n("gw_vouched_kb", span / 1024);
@@ -1211,11 +1457,16 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
             .fail_once(key.content_key());
         }
     }
+    if !seen.vouch.nameable() {
+        note_store_route("gw_unnameable");
+        note_store_route_n("gw_unnameable_kb", span / 1024);
+    }
+    crate::runtime::gather_storm::note_bind(key, rail, span, &seen);
     GatherOutcome {
-        identity: GatheredIdentity {
+        identity: seen.vouch.nameable().then_some(GatheredIdentity {
             key: key.content_key(),
             generation: seen.generation,
-        },
+        }),
         vouch: seen.vouch,
     }
 }
@@ -1238,10 +1489,23 @@ pub enum GatherVouch {
     /// Both halves said the bytes cannot have moved since the gather that filled
     /// the retained image, so the identity is one the cache may already hold.
     Vouched,
-    /// Either half saw a write, the window was re-pointed, or no token could
-    /// answer — the generation was spent this bind and names bytes no retained
-    /// image was ever built from.
+    /// Either half saw a write, the window was re-pointed, or the previous bind's
+    /// generation was unreadable — the generation was spent this bind and names
+    /// bytes no retained image was ever built from. The image this bind gathers
+    /// *can* be named by the next one, because this bind read a generation for it
+    /// to be compared against.
     Fresh,
+    /// The generation was spent **and no later bind can ever name it.**
+    ///
+    /// This bind read no generation (no token, or one still inside its arming
+    /// window), so the entry records 0 as its baseline, and the next bind meets
+    /// `entry.gen == 0` and spends a generation of its own whatever the host says
+    /// then. The only way a generation outlives a bind is [`GatherVouch::Vouched`],
+    /// which needs a non-zero baseline; so the image this bind gathers can be
+    /// retained under an identity that nothing will ever look up. It costs a cache
+    /// slot, evicts an image something *could* look up, and pins an image the
+    /// recycle pool would have handed to the very next gather.
+    Unreachable,
 }
 
 impl GatherVouch {
@@ -1249,6 +1513,12 @@ impl GatherVouch {
     /// question as "is there an identity" — there always is.
     pub fn is_vouched(self) -> bool {
         matches!(self, Self::Vouched)
+    }
+
+    /// Whether a retained image under this bind's identity can ever be found
+    /// again. False only for [`GatherVouch::Unreachable`].
+    pub fn nameable(self) -> bool {
+        !matches!(self, Self::Unreachable)
     }
 }
 
@@ -1295,6 +1565,7 @@ fn observe<M: crate::runtime::host::HostOps>(
         pages_wrote,
         pending,
         stated_gen: stated_now,
+        clock,
     } = counts;
 
     witness.binds = witness.binds.wrapping_add(1);
@@ -1305,6 +1576,7 @@ fn observe<M: crate::runtime::host::HostOps>(
         // the table reports the same loss on every pass and the count above
         // already says how often.
         if let Some((victim, span)) = witness.evict_oldest(host) {
+            crate::runtime::gather_storm::note_window_evicted(victim);
             crate::observe::emit::Emit::decline(
                 "gather_witness",
                 &GatherWitnessFault::TrackedWindowEvicted {
@@ -1322,16 +1594,39 @@ fn observe<M: crate::runtime::host::HostOps>(
         None => true,
     };
     if stale {
-        if let Some(old) = witness.entries.remove(&key) {
-            if old.token != 0 {
-                host.untrack_guest_writes(old.token);
+        let rearm = match witness.entries.remove(&key) {
+            Some(old) => {
+                if old.token != 0 {
+                    host.untrack_guest_writes(old.token);
+                }
+                Rearm {
+                    why: if old.span != span {
+                        RearmWhy::SpanMoved
+                    } else {
+                        RearmWhy::PagesMoved
+                    },
+                    interrupted_arming: !old.ever_readable,
+                }
             }
-        }
+            None => Rearm {
+                why: RearmWhy::New,
+                interrupted_arming: false,
+            },
+        };
         let token = host.track_guest_writes(gpas, page_size).unwrap_or(0);
         let gen = if token == 0 {
             0
         } else {
             host.guest_write_gen(token).unwrap_or(0)
+        };
+        let mut shadow_fold = None;
+        let shadow = if witness.shadow_fold {
+            // Seeded on the re-point so the first unarmed bind after it has
+            // something to be compared with. `fold_runs` reads the pages the
+            // gather is about to read, under the same precondition.
+            shadow_step(&mut shadow_fold, runs, span, pending)
+        } else {
+            ShadowFold::Off
         };
         witness.entries.insert(
             key,
@@ -1353,6 +1648,12 @@ fn observe<M: crate::runtime::host::HostOps>(
                 stated_gen: stated_now,
                 last_seen: witness.binds,
                 generation: fresh_generation,
+                born: clock,
+                binds_alive: 1,
+                last_tranche: clock.tranche,
+                unarmed_run: 0,
+                ever_readable: gen != 0,
+                shadow_fold,
             },
         );
         return GatherObservation {
@@ -1361,8 +1662,26 @@ fn observe<M: crate::runtime::host::HostOps>(
             generation: fresh_generation,
             // The other place a generation is assigned, and the only one that
             // assigns unconditionally: a re-pointed window has no previous bind
-            // of these pages to have vouched for them.
-            vouch: GatherVouch::Fresh,
+            // of these pages to have vouched for them. Whether the next bind can
+            // name it depends on the one thing the entry records as its baseline:
+            // a generation read here, or 0.
+            vouch: if gen != 0 {
+                GatherVouch::Fresh
+            } else {
+                GatherVouch::Unreachable
+            },
+            detail: BindDetail {
+                unarmed: None,
+                rearm: Some(rearm),
+                life: EntryLife {
+                    tranche: clock.tranche,
+                    binds: 1,
+                    readable: gen != 0,
+                    first_readable: gen != 0,
+                    ..EntryLife::default()
+                },
+                shadow,
+            },
             // A re-point has no previous bind to compare a generation against,
             // which is the same "no answer" the channel gives an unaddressable
             // window. Reporting it as quiet would credit the stated channel with
@@ -1374,6 +1693,7 @@ fn observe<M: crate::runtime::host::HostOps>(
     // Copied out before the entry is borrowed mutably: the policy belongs to the
     // witness and the decisions that read it belong to one of its entries.
     let density = witness.audit;
+    let witness_shadow = witness.shadow_fold;
     let entry = witness
         .entries
         .get_mut(&key)
@@ -1392,7 +1712,18 @@ fn observe<M: crate::runtime::host::HostOps>(
     // of this, and two spellings of it is one edit away from a witness that
     // vouches and reports a host write in the same breath.
     let host_quiet = pages_wrote.is_some_and(|seen| !seen.wrote());
-    let verdict = if gen == 0 || entry.gen == 0 {
+    let unarmed = if gen == 0 || entry.gen == 0 {
+        Some(if entry.token == 0 {
+            UnarmedCause::Untracked
+        } else if gen == 0 {
+            UnarmedCause::Arming
+        } else {
+            UnarmedCause::NoBaseline
+        })
+    } else {
+        None
+    };
+    let verdict = if unarmed.is_some() {
         GatherVerdict::Unarmed
     } else if gen == entry.gen && host_quiet {
         GatherVerdict::Vouched
@@ -1403,6 +1734,33 @@ fn observe<M: crate::runtime::host::HostOps>(
         }
     };
     let vouched = matches!(verdict, GatherVerdict::Vouched);
+    let readable = gen != 0;
+    let life = EntryLife {
+        tranche: clock.tranche,
+        binds: entry.binds_alive.saturating_add(1),
+        tranches: clock.tranche.saturating_sub(entry.born.tranche),
+        us: clock.us.saturating_sub(entry.born.us),
+        unarmed_run_before: entry.unarmed_run,
+        same_tranche_as_previous: entry.last_tranche == clock.tranche,
+        readable,
+        first_readable: readable && !entry.ever_readable,
+    };
+    entry.binds_alive = life.binds;
+    entry.last_tranche = clock.tranche;
+    entry.ever_readable |= readable;
+    entry.unarmed_run = if unarmed.is_some() {
+        entry.unarmed_run.saturating_add(1)
+    } else {
+        0
+    };
+    // Only a bind that is about to gather has a reading to compare: a vouched
+    // one reads nothing, and the entry's last fold still describes the window
+    // as far as the vouch can say.
+    let shadow = if witness_shadow && !vouched {
+        shadow_step(&mut entry.shadow_fold, runs, span, pending)
+    } else {
+        ShadowFold::Off
+    };
 
     // The guest's own account of the same writes the `gen` comparison above
     // infers, taken here so both answers describe one bind of one window. Only
@@ -1517,12 +1875,52 @@ fn observe<M: crate::runtime::host::HostOps>(
         verdict,
         audit,
         generation: entry.generation,
+        // Decided beside the assignment above, for the same reason `kept` is. A
+        // generation survives a bind only through `kept`, which needs a
+        // non-zero baseline; so a bind that read none spent a generation that
+        // the next bind will spend past, whatever the host says by then.
         vouch: if kept {
             GatherVouch::Vouched
-        } else {
+        } else if readable {
             GatherVouch::Fresh
+        } else {
+            GatherVouch::Unreachable
         },
         stated,
+        detail: BindDetail {
+            unarmed,
+            rearm: None,
+            life,
+            shadow,
+        },
+    }
+}
+
+/// One step of the opt-in shadow fold: fold the window the gather is about to
+/// read, compare with the previous such fold, and keep this one.
+///
+/// Declines while a copy this device submitted is in flight over the window, for
+/// the reason the audit does — a CPU read of those pages is not a reading of
+/// either side of the copy — and drops the previous fold with it, since a fold
+/// taken across the copy would compare the device's own queue.
+fn shadow_step(
+    previous: &mut Option<u128>,
+    runs: &[crate::runtime::guest_ram::GuestRun],
+    span: u64,
+    pending: PendingWrites,
+) -> ShadowFold {
+    if !pending.settled() {
+        *previous = None;
+        return ShadowFold::Indebted;
+    }
+    // SAFETY: `runs` describe the window the draw is about to gather from, so
+    // their pointers are live for the reason the audit's folds are — see the
+    // comment above the audit in `observe`.
+    let fold = unsafe { fold_runs(runs, span) };
+    match previous.replace(fold) {
+        None => ShadowFold::Seeded,
+        Some(before) if before == fold => ShadowFold::Same,
+        Some(_) => ShadowFold::Moved,
     }
 }
 
@@ -1557,6 +1955,7 @@ mod tests {
         pages_wrote: Some(crate::runtime::host_writes::HostWriteVerdict::Quiet),
         pending: PendingWrites::Disjoint,
         stated_gen: None,
+        clock: BindClock { tranche: 1, us: 0 },
     };
 
     /// One bind, discarding the audit — for the tests that are about the verdict.
@@ -2452,6 +2851,373 @@ mod tests {
             victim,
             key_at(1),
             "the lower name outranked the older bind ordinal"
+        );
+    }
+
+    /// One bind of the window under test, on a host whose arming window the test
+    /// controls, in tranche `tranche`.
+    fn bind_in(
+        w: &mut GatherWitness,
+        host: &mut crate::runtime::host::FakeHost,
+        runs: &[GuestRun],
+        tranche: u64,
+    ) -> GatherObservation {
+        observe(
+            w,
+            host,
+            KEY,
+            one_page(&GPAS, runs),
+            WitnessReadings {
+                clock: BindClock {
+                    tranche,
+                    us: tranche * 1000,
+                },
+                ..QUIET
+            },
+            next_gen(),
+        )
+    }
+
+    /// One window walked through the shim's arming window the way a driven boot
+    /// meets it: tracked, still reading 0 for several binds, then armed. Each
+    /// bind says why it was unarmed, how far into its entry's life it is, and
+    /// whether it is the one that first read a generation — the bind whose gather
+    /// the baseline describes and after which the next quiet bind vouches.
+    #[test]
+    fn an_arming_window_reports_its_causes_and_its_first_readable_bind() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        host.guest_write_startup_window = true;
+        let mut w = GatherWitness::default();
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+
+        let born = bind_in(&mut w, &mut host, &runs, 1);
+        assert_eq!(born.verdict, GatherVerdict::Rearmed);
+        assert_eq!(
+            born.detail.rearm,
+            Some(Rearm {
+                why: RearmWhy::New,
+                interrupted_arming: false
+            })
+        );
+        assert!(!born.detail.life.readable);
+
+        for n in 0..3 {
+            let arming = bind_in(&mut w, &mut host, &runs, 1);
+            assert_eq!(arming.verdict, GatherVerdict::Unarmed, "repeat {n}");
+            assert_eq!(arming.detail.unarmed, Some(UnarmedCause::Arming));
+            assert!(arming.detail.life.same_tranche_as_previous);
+            assert_eq!(arming.detail.life.unarmed_run_before, n);
+            assert!(!arming.detail.life.first_readable);
+        }
+
+        host.close_guest_write_arming_window();
+        let baseline = bind_in(&mut w, &mut host, &runs, 2);
+        assert_eq!(baseline.verdict, GatherVerdict::Unarmed);
+        assert_eq!(baseline.detail.unarmed, Some(UnarmedCause::NoBaseline));
+        assert!(baseline.detail.life.first_readable);
+        assert_eq!(baseline.detail.life.binds, 5);
+        assert_eq!(baseline.detail.life.tranches, 1);
+        assert_eq!(baseline.detail.life.us, 1000);
+        assert!(!baseline.detail.life.same_tranche_as_previous);
+
+        let vouched = bind_in(&mut w, &mut host, &runs, 2);
+        assert_eq!(vouched.verdict, GatherVerdict::Vouched);
+        assert_eq!(vouched.generation, baseline.generation);
+        assert!(!vouched.detail.life.first_readable);
+    }
+
+    /// A host that refuses to track leaves every bind of the window untracked,
+    /// however many arrive, and says so rather than reading as an arming window.
+    #[test]
+    fn a_window_the_host_refuses_to_track_reports_untracked_on_every_bind() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        host.guest_writes_unobservable = true;
+        let mut w = GatherWitness::default();
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+
+        assert!(!bind_in(&mut w, &mut host, &runs, 1).detail.life.readable);
+        for _ in 0..4 {
+            let seen = bind_in(&mut w, &mut host, &runs, 1);
+            assert_eq!(seen.detail.unarmed, Some(UnarmedCause::Untracked));
+            assert!(!seen.detail.life.readable);
+        }
+    }
+
+    /// The identity a bind that read no generation spends can never be named by a
+    /// later bind, and the one bind whose gather the baseline describes can.
+    ///
+    /// Walks one window through the shim's arming window the way a driven boot
+    /// does: tracked, still reading 0 for several binds, then armed. Every bind
+    /// before the arm gathers — the witness has nothing to compare against — and
+    /// the engine must not retain those gathers under an identity nothing will
+    /// ask for. The first bind that reads a generation is the one that *does*
+    /// seed the cache, and the bind after it is the one that vouches.
+    #[test]
+    fn a_bind_that_read_no_generation_names_nothing_a_later_bind_can_find() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        host.guest_write_startup_window = true;
+        let mut w = GatherWitness::default();
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+
+        let born = bind_in(&mut w, &mut host, &runs, 1);
+        assert_eq!(born.verdict, GatherVerdict::Rearmed);
+        assert_eq!(born.vouch, GatherVouch::Unreachable, "tracked but unarmed");
+        assert_eq!(
+            born.detail.rearm,
+            Some(Rearm {
+                why: RearmWhy::New,
+                interrupted_arming: false
+            })
+        );
+        assert!(!born.detail.life.readable);
+
+        for n in 0..3 {
+            let arming = bind_in(&mut w, &mut host, &runs, 1);
+            assert_eq!(arming.verdict, GatherVerdict::Unarmed, "repeat {n}");
+            assert_eq!(arming.detail.unarmed, Some(UnarmedCause::Arming));
+            assert_eq!(arming.vouch, GatherVouch::Unreachable);
+            assert!(arming.detail.life.same_tranche_as_previous);
+            assert_eq!(arming.detail.life.unarmed_run_before, n);
+        }
+
+        host.close_guest_write_arming_window();
+        let baseline = bind_in(&mut w, &mut host, &runs, 2);
+        assert_eq!(baseline.verdict, GatherVerdict::Unarmed);
+        assert_eq!(baseline.detail.unarmed, Some(UnarmedCause::NoBaseline));
+        assert_eq!(
+            baseline.vouch,
+            GatherVouch::Fresh,
+            "this bind's gather is the one the baseline describes"
+        );
+        assert!(baseline.detail.life.first_readable);
+        assert_eq!(baseline.detail.life.binds, 5);
+        assert_eq!(baseline.detail.life.tranches, 1);
+        assert_eq!(baseline.detail.life.us, 1000);
+        assert!(!baseline.detail.life.same_tranche_as_previous);
+
+        let vouched = bind_in(&mut w, &mut host, &runs, 2);
+        assert_eq!(vouched.verdict, GatherVerdict::Vouched);
+        assert_eq!(
+            vouched.generation, baseline.generation,
+            "the image retained under the baseline bind's identity is the one found"
+        );
+        assert!(!vouched.detail.life.first_readable);
+    }
+
+    /// A host that refuses to track leaves every bind of the window unnameable,
+    /// however many arrive.
+    #[test]
+    fn a_window_the_host_refuses_to_track_is_unnameable_on_every_bind() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        host.guest_writes_unobservable = true;
+        let mut w = GatherWitness::default();
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+
+        assert_eq!(
+            bind_in(&mut w, &mut host, &runs, 1).vouch,
+            GatherVouch::Unreachable
+        );
+        for _ in 0..4 {
+            let seen = bind_in(&mut w, &mut host, &runs, 1);
+            assert_eq!(seen.detail.unarmed, Some(UnarmedCause::Untracked));
+            assert_eq!(seen.vouch, GatherVouch::Unreachable);
+            assert!(!seen.vouch.nameable());
+        }
+    }
+
+    /// The soundness the engine's decision rests on, stated as a property over
+    /// sequences: a generation the witness called [`GatherVouch::Unreachable`] is
+    /// never the generation of any later observation, whatever the host, the
+    /// guest and this device did in between.
+    ///
+    /// A deterministic generator rather than a hand-picked sequence, because the
+    /// claim is about every interleaving of three things the witness cannot
+    /// order — the arming window closing, a guest store, and a device write —
+    /// and a sequence someone chose is a sequence that already passes.
+    #[test]
+    fn an_unreachable_generation_is_never_seen_again() {
+        use crate::runtime::host_writes::HostWriteVerdict;
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut roll = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        for round in 0..64 {
+            let mut host = crate::runtime::host::FakeHost::new();
+            host.guest_write_startup_window = roll(4) != 0;
+            host.guest_writes_unobservable = roll(16) == 0;
+            let mut w = GatherWitness::default();
+            let mut unreachable = std::collections::HashSet::new();
+            for step in 0..96u64 {
+                match roll(8) {
+                    0 => host.close_guest_write_arming_window(),
+                    1 => host.guest_wrote_page(GPAS[0]),
+                    _ => {}
+                }
+                let readings = WitnessReadings {
+                    pages_wrote: Some(if roll(5) == 0 {
+                        HostWriteVerdict::Overlap
+                    } else {
+                        HostWriteVerdict::Quiet
+                    }),
+                    clock: BindClock {
+                        tranche: step / 3,
+                        us: step * 10,
+                    },
+                    ..QUIET
+                };
+                let seen = observe(
+                    &mut w,
+                    &mut host,
+                    KEY,
+                    one_page(&GPAS, &runs),
+                    readings,
+                    next_gen(),
+                );
+                assert!(
+                    !unreachable.contains(&seen.generation),
+                    "round {round} step {step}: a generation proved unnameable came back as {:?}",
+                    seen.verdict
+                );
+                if seen.vouch == GatherVouch::Unreachable {
+                    unreachable.insert(seen.generation);
+                }
+                // The other half of the claim, and the identity the census
+                // relies on: a bind is unnameable exactly when it read no
+                // generation, so `unreadable` on `gather_storm` is the number of
+                // images this rule declines to retain.
+                assert_eq!(
+                    seen.vouch == GatherVouch::Unreachable,
+                    !seen.detail.life.readable,
+                    "round {round} step {step}"
+                );
+            }
+        }
+    }
+
+    /// A re-point of a window that never read a generation is the churn that
+    /// would keep it from ever warming up, and is named as such.
+    #[test]
+    fn a_repoint_before_the_first_generation_is_read_says_it_cut_arming_short() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        host.guest_write_startup_window = true;
+        let mut w = GatherWitness::default();
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        let moved = [9 * PAGE as u64];
+
+        bind_in(&mut w, &mut host, &runs, 1);
+        let cut = observe(
+            &mut w,
+            &mut host,
+            KEY,
+            one_page(&moved, &runs),
+            QUIET,
+            next_gen(),
+        );
+        assert_eq!(
+            cut.detail.rearm,
+            Some(Rearm {
+                why: RearmWhy::PagesMoved,
+                interrupted_arming: true
+            })
+        );
+
+        let longer = GatherWindow {
+            span: 2 * PAGE as u64,
+            ..one_page(&moved, &runs)
+        };
+        let again = observe(&mut w, &mut host, KEY, longer, QUIET, next_gen());
+        assert_eq!(again.detail.rearm.map(|r| r.why), Some(RearmWhy::SpanMoved));
+
+        // Once a generation has been read, a re-point no longer cuts anything
+        // short: the next window starts its own clock but nothing was waiting.
+        host.close_guest_write_arming_window();
+        let mut ready = GatherWitness::default();
+        bind_in(&mut ready, &mut host, &runs, 1);
+        let repoint = observe(
+            &mut ready,
+            &mut host,
+            KEY,
+            one_page(&moved, &runs),
+            QUIET,
+            next_gen(),
+        );
+        assert_eq!(
+            repoint.detail.rearm.map(|r| r.interrupted_arming),
+            Some(false)
+        );
+    }
+
+    /// The opt-in fold says whether an unarmed re-gather moved the bytes the
+    /// previous one did, and declines rather than compares across a copy this
+    /// device has in flight.
+    #[test]
+    fn the_shadow_fold_says_whether_a_regather_moved_new_bytes() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        host.guest_write_startup_window = true;
+        let mut w = GatherWitness {
+            shadow_fold: true,
+            ..GatherWitness::default()
+        };
+        let mut buf = vec![0xa5u8; PAGE];
+
+        let seeded = bind_in(&mut w, &mut host, &[run_over(&buf)], 1);
+        assert_eq!(seeded.detail.shadow, ShadowFold::Seeded);
+        let same = bind_in(&mut w, &mut host, &[run_over(&buf)], 1);
+        assert_eq!(same.detail.shadow, ShadowFold::Same);
+        buf[100] ^= 1;
+        let moved = bind_in(&mut w, &mut host, &[run_over(&buf)], 1);
+        assert_eq!(moved.detail.shadow, ShadowFold::Moved);
+
+        // A copy in flight over the window: no fold, and no stale comparison
+        // afterwards either.
+        let indebted = observe(
+            &mut w,
+            &mut host,
+            KEY,
+            one_page(&GPAS, &[run_over(&buf)]),
+            WitnessReadings {
+                pending: PendingWrites::Overlap,
+                ..QUIET
+            },
+            next_gen(),
+        );
+        assert_eq!(indebted.detail.shadow, ShadowFold::Indebted);
+        let after = bind_in(&mut w, &mut host, &[run_over(&buf)], 1);
+        assert_eq!(after.detail.shadow, ShadowFold::Seeded);
+
+        // A vouched bind reads nothing even when the fold is on, and one with
+        // the fold off never reads.
+        let mut quiet_host = crate::runtime::host::FakeHost::new();
+        let mut on = GatherWitness {
+            shadow_fold: true,
+            ..GatherWitness::default()
+        };
+        bind_in(&mut on, &mut quiet_host, &[run_over(&buf)], 1);
+        let vouched = bind_in(&mut on, &mut quiet_host, &[run_over(&buf)], 1);
+        assert_eq!(vouched.verdict, GatherVerdict::Vouched);
+        assert_eq!(vouched.detail.shadow, ShadowFold::Off);
+
+        let mut off = GatherWitness {
+            shadow_fold: false,
+            ..GatherWitness::default()
+        };
+        let mut arming = crate::runtime::host::FakeHost::new();
+        arming.guest_write_startup_window = true;
+        assert_eq!(
+            bind_in(&mut off, &mut arming, &[run_over(&buf)], 1)
+                .detail
+                .shadow,
+            ShadowFold::Off
         );
     }
 }

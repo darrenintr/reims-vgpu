@@ -927,6 +927,22 @@ impl FakeHost {
         ));
     }
 
+    /// Close the arming window the shim holds every set in until a harvest has
+    /// run over it: every set still reading generation 0 becomes readable, and
+    /// sets tracked afterwards are readable at once.
+    ///
+    /// The fixture's stand-in for the harvest that arms a token, so a test can
+    /// state *when* the window closes rather than choosing between a host that
+    /// never arms and one that is armed from the first bind.
+    pub fn close_guest_write_arming_window(&mut self) {
+        for set in self.guest_write_sets.values_mut() {
+            if set.gen_ == 0 {
+                set.gen_ = 1;
+            }
+        }
+        self.guest_write_startup_window = false;
+    }
+
     /// State that an agent outside this device wrote the page holding `gpa`,
     /// and that the host observed it — the fixture's stand-in for a guest CPU
     /// store landing in the hypervisor's dirty bitmap.
