@@ -3773,6 +3773,61 @@ impl ResourcePools {
     /// otherwise move the slot into the submitted entry's cleanup.
     pub(crate) fn lease_readback(&mut self) -> Option<ReadbackLease> {
         let slot = self.readback_live.take()?;
+        match self.register_readback_lease(slot) {
+            Ok(lease) => Some(lease),
+            Err(slot) => {
+                self.readback_live = Some(slot);
+                None
+            }
+        }
+    }
+
+    /// Lease a readback slot after its submission has retired.
+    ///
+    /// Compute storage-image readbacks are acquired through
+    /// `acquire_readback_extra` and sealed into the submission. By the time
+    /// the dispatch's fence is retired those slots have moved into
+    /// `readback_free`; copying them into a `Vec` only to immediately scatter
+    /// the bytes into guest memory adds another full-frame host pass. This
+    /// removes the exact slot from the free pool and lends its persistent
+    /// mapping to that scatter instead.
+    ///
+    /// The engine lock is held while this search runs, so a free slot cannot be
+    /// acquired by another command between retirement and removal.
+    pub(crate) fn lease_retired_readback(&mut self, buffer: vk::Buffer) -> Option<ReadbackLease> {
+        let mut found = None;
+        for (bucket, list) in &self.readback_free {
+            if let Some(index) = list.iter().position(|slot| slot.buffer == buffer) {
+                found = Some((*bucket, index));
+                break;
+            }
+        }
+        let (bucket, index) = found?;
+        let slot = self.readback_free.get_mut(&bucket)?.swap_remove(index);
+        if self
+            .readback_free
+            .get(&bucket)
+            .is_some_and(|list| list.is_empty())
+        {
+            self.readback_free.remove(&bucket);
+        }
+        match self.register_readback_lease(slot) {
+            Ok(lease) => Some(lease),
+            Err(slot) => {
+                self.readback_free.entry(bucket).or_default().push(slot);
+                None
+            }
+        }
+    }
+
+    /// Turn a pool-owned slot into a mapping lease.
+    ///
+    /// Shared by the live render-target path and the retired compute-readback
+    /// path so the capability gate and teardown accounting cannot diverge.
+    fn register_readback_lease(
+        &mut self,
+        slot: BufferSlot,
+    ) -> Result<ReadbackLease, BufferSlot> {
         // Two refusals, and both send the caller to the copying path rather
         // than to a failure.
         //
@@ -3788,8 +3843,7 @@ impl ResourcePools {
         // of a scattered walk, so where the cached type was unavailable the
         // copy is genuinely the faster shape and the lease declines.
         if slot.mapped == 0 || !slot.cached {
-            self.readback_live = Some(slot);
-            return None;
+            return Err(slot);
         }
         let token = NEXT_READBACK_LEASE_TOKEN.fetch_add(1, Ordering::Relaxed);
         // Before the slot leaves the pool: the counter is what a teardown reads
@@ -3802,7 +3856,7 @@ impl ResourcePools {
             slot_size: slot.size,
         };
         self.readback_leased.push(LeasedReadback { token, slot });
-        Some(lease)
+        Ok(lease)
     }
 
     /// Take back every lease whose holder has finished and return its slot to
