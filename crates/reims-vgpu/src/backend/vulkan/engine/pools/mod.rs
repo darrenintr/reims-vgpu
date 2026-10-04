@@ -4063,7 +4063,7 @@ pub(super) unsafe fn lease_read_back_slot(
     if slot.mapped == 0 || !slot.cached {
         return Ok(None);
     }
-    let Some(lease) = pools.lease_retired_readback(slot.buffer) else {
+    let Some(lease) = pools.lease_retired_readback(slot.buffer, slot.size) else {
         return Ok(None);
     };
     if let Err(error) = invalidate_slot_for_read(ctx, slot, invalidate_op) {
