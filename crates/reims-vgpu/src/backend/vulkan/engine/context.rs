@@ -817,6 +817,10 @@ pub(crate) struct DeviceContext {
     /// in [`crate::observe::elapsed_ms`]; `0` when the blob on disk is current.
     /// See [`Self::note_pipeline_cache_grew`].
     pub pipeline_cache_grew_at_ms: AtomicU64,
+    /// `VK_EXT_pipeline_creation_feedback` was enabled, so a create can say
+    /// whether the driver served it from the pipeline cache. Measurement only:
+    /// see [`super::pipe_census`].
+    pub pipeline_creation_feedback: bool,
     /// `VK_KHR_swapchain` was enabled for the engine-owned host window.
     #[cfg(feature = "host-window")]
     pub swapchain: bool,
@@ -1156,6 +1160,8 @@ impl DeviceContext {
         crate::runtime::guest_ram_map::reset();
         let portability_subset = has_device_extension(vk::KHR_PORTABILITY_SUBSET_NAME);
         let vertex_attribute_divisor = has_device_extension(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME);
+        let pipeline_creation_feedback =
+            has_device_extension(vk::EXT_PIPELINE_CREATION_FEEDBACK_NAME);
         #[cfg(feature = "host-window")]
         let swapchain = has_device_extension(ash::khr::swapchain::NAME);
         // Combined depth-stencil format for the stencil-test path. The Vulkan
@@ -1205,6 +1211,11 @@ impl DeviceContext {
         }
         if vertex_attribute_divisor {
             enabled_device_extensions.push(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME.as_ptr());
+        }
+        // No feature bit and no behaviour change: the extension only lets a
+        // create report how it was served.
+        if pipeline_creation_feedback {
+            enabled_device_extensions.push(vk::EXT_PIPELINE_CREATION_FEEDBACK_NAME.as_ptr());
         }
         #[cfg(feature = "host-window")]
         if swapchain {
@@ -1499,6 +1510,7 @@ impl DeviceContext {
             pipeline_cache_path: Some(pipeline_cache_path),
             pipeline_cache_saved_len: AtomicUsize::new(initial_len),
             pipeline_cache_grew_at_ms: AtomicU64::new(0),
+            pipeline_creation_feedback,
             #[cfg(feature = "host-window")]
             swapchain,
         })

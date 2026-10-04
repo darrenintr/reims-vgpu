@@ -28,6 +28,7 @@ mod guest_scatter;
 mod host_ram;
 pub mod init_decline;
 mod linear_target_import;
+mod pipe_census;
 mod pools;
 mod queue_owner;
 /// This rail's half of a serialized resource's rail state: the resident-target
@@ -6139,6 +6140,7 @@ pub fn maintain_resources(now_ms: u64) {
     // On the heartbeat rather than after each compile, so a burst of new
     // pipelines serializes the cache once, after it, outside every tranche.
     ctx.persist_pipeline_cache_when_quiet(now_ms);
+    pipe_census::note_levels(now_ms, ctx.pipeline_creation_feedback);
 }
 
 /// Snapshot of create/alloc/hit-miss counters (for tests and thrash proxies).
