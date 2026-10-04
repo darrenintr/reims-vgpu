@@ -110,8 +110,12 @@ pub struct ReimsVgpuHostOps {
     pub map_pages_stable: c_int,
     /// Register `count` page-aligned GPAs as one guest-write-tracked set and
     /// return a non-zero opaque token, or 0 when the host has no dirty bitmap.
-    /// Mutates QEMU MemoryRegion logging state, so the shim may only do the
-    /// enabling part with the BQL held — see the C side for how it defers.
+    /// Called from the drain thread, which must not take the BQL, so the shim
+    /// only registers the set here. The harvest that turns logging on and arms
+    /// the set runs on the main loop, scheduled by this call and by every
+    /// `guest_write_gen` read that returns 0; the generation reads 0 until it
+    /// has run. It cannot be done inside this call without either the BQL or
+    /// reporting bits that predate the set as guest stores.
     pub track_guest_writes: Option<
         unsafe extern "C" fn(
             ctx: *mut c_void,
