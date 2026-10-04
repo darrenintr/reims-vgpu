@@ -71,8 +71,8 @@ pub use types::viewport_slot_count;
 pub use types::{
     BlendStateResource, BufferContent, ColorAttachmentState, ColorClearValue, ColorWriteMask,
     ComputeBufferResource, ComputeDispatch, ComputeDispatchPayload, ComputeDispatchRegion,
-    ComputeImageDestination, ComputeImageResult, ComputeOutput, ComputeRequest,
-    ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledSource,
+    ComputeImageDestination, ComputeImageResult, ComputeOutput, ComputeReadbackLease,
+    ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledSource,
     ComputeStorageImageResource, ComputeStorageResidency, DepthState, DrawError, DrawOutput,
     DrawRequest, GuestRun, GuestRunSource, GuestSampledBacking, GuestTargetBacking,
     GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource, PipelineObjectIdentity,
