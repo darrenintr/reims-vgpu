@@ -3829,10 +3829,7 @@ impl ResourcePools {
     ///
     /// Shared by the live render-target path and the retired compute-readback
     /// path so the capability gate and teardown accounting cannot diverge.
-    fn register_readback_lease(
-        &mut self,
-        slot: BufferSlot,
-    ) -> Result<ReadbackLease, BufferSlot> {
+    fn register_readback_lease(&mut self, slot: BufferSlot) -> Result<ReadbackLease, BufferSlot> {
         // Two refusals, and both send the caller to the copying path rather
         // than to a failure.
         //
