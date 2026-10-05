@@ -342,8 +342,16 @@ pub struct PipelineObjectIdentity {
     life: std::sync::Arc<PipelineObjectLife>,
 }
 
+/// What the identity's shared lifetime token remembers about the object.
+///
+/// The declaration instant and a first-use latch exist for one census question:
+/// how long before its first draw did the guest declare this pipeline? See
+/// [`super::pipe_census`]. Neither is read to decide a draw.
 #[derive(Debug)]
-pub(crate) struct PipelineObjectLife;
+pub(crate) struct PipelineObjectLife {
+    declared_at: std::time::Instant,
+    used: std::sync::atomic::AtomicBool,
+}
 
 impl PipelineObjectIdentity {
     pub(crate) fn new() -> Self {
@@ -358,8 +366,22 @@ impl PipelineObjectIdentity {
         Self {
             id: std::num::NonZeroU64::new(raw)
                 .expect("pipeline identity allocator never publishes zero"),
-            life: std::sync::Arc::new(PipelineObjectLife),
+            life: std::sync::Arc::new(PipelineObjectLife {
+                declared_at: std::time::Instant::now(),
+                used: std::sync::atomic::AtomicBool::new(false),
+            }),
         }
+    }
+
+    /// Microseconds from declaration to now, the first time this is asked, and
+    /// `None` on every later call. A load first, so the common draw costs a read
+    /// rather than a read-modify-write.
+    pub(crate) fn first_use_lead_us(&self) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        if self.life.used.load(Ordering::Relaxed) || self.life.used.swap(true, Ordering::Relaxed) {
+            return None;
+        }
+        Some(self.life.declared_at.elapsed().as_micros() as u64)
     }
 
     pub(crate) fn id(&self) -> std::num::NonZeroU64 {
@@ -2876,5 +2898,33 @@ mod tests {
             generation: 7,
             format: translate::pixel::SCANOUT_FORMAT,
         }));
+    }
+}
+
+#[cfg(test)]
+mod pipeline_object_lead_tests {
+    use super::PipelineObjectIdentity;
+
+    /// Only the first draw of a declared pipeline has a declaration-to-use lead.
+    /// Every later draw, and every clone of the identity the engine index keeps,
+    /// reads `None`: the latch lives in the shared lifetime token.
+    #[test]
+    fn the_first_use_has_a_lead_and_no_later_one_does() {
+        let identity = PipelineObjectIdentity::new();
+        let clone = identity.clone();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let lead = clone.first_use_lead_us().expect("first use");
+        assert!(lead >= 2_000, "lead {lead} us predates the declaration");
+        assert_eq!(identity.first_use_lead_us(), None);
+        assert_eq!(clone.first_use_lead_us(), None);
+    }
+
+    #[test]
+    fn two_declarations_latch_independently() {
+        let a = PipelineObjectIdentity::new();
+        let b = PipelineObjectIdentity::new();
+        assert!(a.first_use_lead_us().is_some());
+        assert!(b.first_use_lead_us().is_some());
+        assert!(a.first_use_lead_us().is_none());
     }
 }

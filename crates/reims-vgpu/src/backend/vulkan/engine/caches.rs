@@ -2434,6 +2434,10 @@ impl ObjectCaches {
         counters: &EngineCounters,
         pools: &mut ResourcePools,
     ) -> Result<vk::Pipeline, DrawError> {
+        // Taken before any early return so a hit also consumes the object's
+        // first-use latch: only the first draw of a declared pipeline has a
+        // declaration-to-use lead, and only a create reports it.
+        let first_use_lead_us = pipeline_object.and_then(|identity| identity.first_use_lead_us());
         if let Some(identity) = pipeline_object {
             if let Some(pipeline) = self.pipeline_objects.get(identity, key) {
                 counters.pipeline_hits.fetch_add(1, Ordering::Relaxed);
@@ -2871,9 +2875,21 @@ impl ObjectCaches {
                 return Err(err);
             }
         };
+        // How the driver served this create, for `pipe_census` only. Chained
+        // when the device enabled the extension; the struct outlives the call.
+        let mut feedback = vk::PipelineCreationFeedback::default();
+        let mut stage_feedback = [vk::PipelineCreationFeedback::default(); 2];
+        let mut feedback_info = vk::PipelineCreationFeedbackCreateInfo::default()
+            .pipeline_creation_feedback(&mut feedback)
+            .pipeline_stage_creation_feedbacks(&mut stage_feedback);
+        if ctx.pipeline_creation_feedback {
+            gpci = gpci.push_next(&mut feedback_info);
+        }
+        let call_started = std::time::Instant::now();
         let created = ctx
             .device
             .create_graphics_pipelines(ctx.pipeline_cache, &[gpci], None);
+        let call_us = call_started.elapsed().as_micros() as u64;
         breadcrumb.disarm();
         let pipe = created.map_err(|(_, e)| {
             let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateGraphicsPipelines, e));
@@ -2881,6 +2897,19 @@ impl ObjectCaches {
             err
         })?[0];
         counters.note_create(CreateSite::GraphicsPipeline);
+        super::pipe_census::census().note(
+            super::pipe_census::Served::from_feedback(
+                ctx.pipeline_creation_feedback
+                    && feedback
+                        .flags
+                        .contains(vk::PipelineCreationFeedbackFlags::VALID),
+                feedback
+                    .flags
+                    .contains(vk::PipelineCreationFeedbackFlags::APPLICATION_PIPELINE_CACHE_HIT),
+            ),
+            call_us,
+            first_use_lead_us,
+        );
         // A fresh pipeline compile grew the VkPipelineCache. Persisted from
         // the maintenance heartbeat once compiles go quiet, not here: see
         // `DeviceContext::note_pipeline_cache_grew`.
@@ -2960,7 +2989,7 @@ impl ObjectCaches {
         if key.local_size.is_some() {
             stage = stage.specialization_info(&spec_info);
         }
-        let cpci = vk::ComputePipelineCreateInfo::default()
+        let mut cpci = vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(pipeline_layout);
         // The other call that compiles the module, and the one an NVIDIA driver
@@ -2980,9 +3009,19 @@ impl ObjectCaches {
                 return Err(err);
             }
         };
+        let mut feedback = vk::PipelineCreationFeedback::default();
+        let mut stage_feedback = [vk::PipelineCreationFeedback::default(); 1];
+        let mut feedback_info = vk::PipelineCreationFeedbackCreateInfo::default()
+            .pipeline_creation_feedback(&mut feedback)
+            .pipeline_stage_creation_feedbacks(&mut stage_feedback);
+        if ctx.pipeline_creation_feedback {
+            cpci = cpci.push_next(&mut feedback_info);
+        }
+        let call_started = std::time::Instant::now();
         let created = ctx
             .device
             .create_compute_pipelines(ctx.pipeline_cache, &[cpci], None);
+        let call_us = call_started.elapsed().as_micros() as u64;
         breadcrumb.disarm();
         let pipe = created.map_err(|(_, e)| {
             let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateComputePipelines, e));
@@ -2991,6 +3030,19 @@ impl ObjectCaches {
             err
         })?[0];
         counters.note_create(CreateSite::ComputePipeline);
+        super::pipe_census::census().note(
+            super::pipe_census::Served::from_feedback(
+                ctx.pipeline_creation_feedback
+                    && feedback
+                        .flags
+                        .contains(vk::PipelineCreationFeedbackFlags::VALID),
+                feedback
+                    .flags
+                    .contains(vk::PipelineCreationFeedbackFlags::APPLICATION_PIPELINE_CACHE_HIT),
+            ),
+            call_us,
+            None,
+        );
         // Same warm-start persistence as the graphics path.
         ctx.note_pipeline_cache_grew();
         crate::runtime::drain::note_tranche_since(

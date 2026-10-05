@@ -1714,8 +1714,9 @@ pub(crate) fn mapping_guest_write_verdict<M: HostOps>(
     // It is the structural explanation for `t11_gw_ref_no_stamp` running far
     // ahead of `t11_gw_ref_moved` — the refusals are this device's own startup
     // cost, repeated, not guest writes. What it costs is measured: the window
-    // is counted in harvests, harvests are driven by guest doorbells, and a
-    // draw that lands in it pays a whole-frame seed read plus a whole-frame
+    // is counted in harvests, a harvest was driven only by guest doorbells
+    // (the shim now also schedules one on the main loop for an unarmed set),
+    // and a draw that lands in it pays a whole-frame seed read plus a whole-frame
     // staging upload. On a near-idle desktop `chain_phase` reads 12-65 ms per
     // draw with `seed_us` and the engine's `stage_us` holding it, against
     // 0.2 ms per draw driven, which is the hitch class goals 5 and 6 name.

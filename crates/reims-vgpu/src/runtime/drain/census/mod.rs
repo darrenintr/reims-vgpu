@@ -1612,6 +1612,11 @@ pub(crate) struct DrainDutyCensus {
     /// Kept as separate accumulators rather than derived from a residue: a
     /// residue absorbs every mistake in the other three and always tiles.
     gap_idle_us: std::sync::atomic::AtomicU64,
+    /// Every microsecond ever banked into [`Self::gap_idle_us`], never swapped.
+    /// The window presenter differences it between two presents to learn whether
+    /// the worker was waiting for the guest or working across the gap; see
+    /// [`crate::runtime::frame_interval`].
+    gap_idle_total_us: std::sync::atomic::AtomicU64,
     gap_lock_us: std::sync::atomic::AtomicU64,
     gap_skip_us: std::sync::atomic::AtomicU64,
     gap_post_us: std::sync::atomic::AtomicU64,
@@ -1820,8 +1825,9 @@ impl DrainDutyCensus {
         use std::sync::atomic::Ordering::Relaxed;
         let last = self.gap_last_exit_us.load(Relaxed);
         if last != 0 {
-            self.gap_idle_us
-                .fetch_add(entry_us.saturating_sub(last), Relaxed);
+            let idle = entry_us.saturating_sub(last);
+            self.gap_idle_us.fetch_add(idle, Relaxed);
+            self.gap_idle_total_us.fetch_add(idle, Relaxed);
         }
         entry_us
     }
@@ -3127,6 +3133,15 @@ pub fn note_irq_delivered() {
 /// ones that bail after taking the lock — an unclosed entry leaves
 /// `gap_last_exit_us` stale and folds this entry's whole duration into the next
 /// one's `gap_idle_us`, which reads as an idle worker rather than as a bug here.
+/// Total microseconds the drain worker has spent waiting for the guest's next
+/// doorbell, over the life of the process. Monotonic; read by the window
+/// presenter to say whose a long gap between presents was.
+pub fn drain_idle_total_us() -> u64 {
+    DRAIN_DUTY
+        .gap_idle_total_us
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn note_drain_exit(busy_end_us: u64, skipped: bool) {
     DRAIN_DUTY.note_gap_exit(crate::observe::elapsed_us(), busy_end_us, skipped);
 }

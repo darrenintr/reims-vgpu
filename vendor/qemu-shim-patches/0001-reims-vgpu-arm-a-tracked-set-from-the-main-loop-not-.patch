@@ -1,0 +1,1096 @@
+From adf5479604052eef8b87c1763ca63ac68bb71412 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 4 Oct 2026 07:08:40 +0000
+Subject: [PATCH] reims-vgpu: arm a tracked set from the main loop, not from
+ the next doorbell
+
+A set armed only inside reims_vgpu_dirty_harvest, which ran only from a guest
+doorbell write that followed a generation read. A set tracked while the guest was
+quiet, or inside one long drain tranche (which drains one doorbell's work), read
+generation 0 for as long as the guest stayed away: up to 8.24 s measured, the
+window re-gathered on every bind.
+
+track() and every generation read that comes back 0 now schedule a main-loop
+bottom half that runs the same harvest under the BQL, and reschedules itself
+while a set still owes a second harvest (the first region of a boot). The
+harvest itself is unchanged, so arming still happens at a harvest after logging
+was active and still absorbs the bits that predate the set.
+
+A baseline cannot be taken inside track(): it is called from the drain thread,
+which must not take the BQL the dirty-log sync needs, and a generation made
+readable without absorbing stale bits would report every pre-existing bit as a
+guest store to guest_written_pages, which the writeback rail answers by
+dropping the GPU's store for those pages.
+
+reims-vgpu-dirty-test/ drives the real adapter source against a model of the
+hypervisor bitmap: directed arming cases, and an exhaustive check of every
+interleaving of guest writes, harvests, reads, copies and vouches. Four mutants,
+including the synchronous baseline, must fail it.
+---
+ hw/display/reims-vgpu-dirty-test/README.md    |  38 ++
+ .../fake/exec/target_page.h                   |   1 +
+ .../reims-vgpu-dirty-test/fake/fake_qemu.c    | 195 ++++++++++
+ .../reims-vgpu-dirty-test/fake/fake_qemu.h    | 102 +++++
+ .../fake/qemu/main-loop.h                     |   1 +
+ .../reims-vgpu-dirty-test/fake/qemu/osdep.h   |   1 +
+ .../reims-vgpu-dirty-test/fake/qemu/rcu.h     |   1 +
+ .../reims-vgpu-dirty-test/fake/qemu/thread.h  |   1 +
+ .../fake/system/address-spaces.h              |   1 +
+ .../fake/system/memory.h                      |   1 +
+ .../fake/system/physmem.h                     |   1 +
+ .../fake/system/ram_addr.h                    |   1 +
+ hw/display/reims-vgpu-dirty-test/run.sh       |  37 ++
+ hw/display/reims-vgpu-dirty-test/test.c       | 362 ++++++++++++++++++
+ hw/display/reims-vgpu-dirty.c                 |  96 ++++-
+ hw/display/reims-vgpu-dirty.h                 |   9 +
+ 16 files changed, 845 insertions(+), 3 deletions(-)
+ create mode 100644 hw/display/reims-vgpu-dirty-test/README.md
+ create mode 100644 hw/display/reims-vgpu-dirty-test/fake/exec/target_page.h
+ create mode 100644 hw/display/reims-vgpu-dirty-test/fake/fake_qemu.c
+ create mode 100644 hw/display/reims-vgpu-dirty-test/fake/fake_qemu.h
+ create mode 100644 hw/display/reims-vgpu-dirty-test/fake/qemu/main-loop.h
+ create mode 100644 hw/display/reims-vgpu-dirty-test/fake/qemu/osdep.h
+ create mode 100644 hw/display/reims-vgpu-dirty-test/fake/qemu/rcu.h
+ create mode 100644 hw/display/reims-vgpu-dirty-test/fake/qemu/thread.h
+ create mode 100644 hw/display/reims-vgpu-dirty-test/fake/system/address-spaces.h
+ create mode 100644 hw/display/reims-vgpu-dirty-test/fake/system/memory.h
+ create mode 100644 hw/display/reims-vgpu-dirty-test/fake/system/physmem.h
+ create mode 100644 hw/display/reims-vgpu-dirty-test/fake/system/ram_addr.h
+ create mode 100755 hw/display/reims-vgpu-dirty-test/run.sh
+ create mode 100644 hw/display/reims-vgpu-dirty-test/test.c
+
+diff --git a/hw/display/reims-vgpu-dirty-test/README.md b/hw/display/reims-vgpu-dirty-test/README.md
+new file mode 100644
+index 0000000..5aa9d9b
+--- /dev/null
++++ b/hw/display/reims-vgpu-dirty-test/README.md
+@@ -0,0 +1,38 @@
++# reims-vgpu-dirty model check
++
++Drives the real `../reims-vgpu-dirty.c` against a model of the hypervisor dirty
++bitmap. No QEMU build is needed: `fake/` models exactly the QEMU surface the
++adapter touches (flat view, `DIRTY_MEMORY_VGA` bitmap, region logging, a
++main-loop bottom half) and nothing else.
++
++    ./run.sh [max-length]        # default 8; ~3.6 M interleavings in a few seconds
++    ./run.sh --mutant NAME 6     # a deliberately wrong shim; must FAIL
++
++## What it checks
++
++*Directed:* a tracked set arms with **no guest doorbell** — one main-loop harvest
++when logging is already on, two for the first region of a boot — and a burst of
++tracks costs one harvest.
++
++*Exhaustive:* every interleaving (to the length given) of guest writes `W0 W1`,
++doorbell harvest `H`, arming bottom half `B`, generation read `G`, host copy `C`
++and vouch check `V`, with the registration `T` at any point after up to two
++writes and harvests, in a world where logging is off and one where an earlier
++surface already turned it on. The reader follows the Rust protocol: read the
++generation, then copy, record the generation beside the copy.
++
++* **I** a vouched copy (generation unchanged) is never older than what the last
++  harvest had already seen — no guest write escapes;
++* **J** `written_since(armed_gen)` never names a page nobody wrote — a stale bit
++  must not read as a guest store, because the writeback rail drops the GPU's
++  store for pages it believes the guest wrote;
++* **K** every write a harvest saw after arming is named.
++
++## Mutants
++
++| name | what it breaks | caught by |
++|---|---|---|
++| `arm_at_track` | a "synchronous baseline": gen readable at track | J |
++| `no_unlogged` | arm in the harvest that enabled logging | J |
++| `no_hit_stamp` | do not stamp the pages the arming harvest absorbed | K |
++| `no_sync` | read the bitmap without folding hypervisor bits in | K |
+diff --git a/hw/display/reims-vgpu-dirty-test/fake/exec/target_page.h b/hw/display/reims-vgpu-dirty-test/fake/exec/target_page.h
+new file mode 100644
+index 0000000..a7a036a
+--- /dev/null
++++ b/hw/display/reims-vgpu-dirty-test/fake/exec/target_page.h
+@@ -0,0 +1 @@
++#include "../fake_qemu.h"
+diff --git a/hw/display/reims-vgpu-dirty-test/fake/fake_qemu.c b/hw/display/reims-vgpu-dirty-test/fake/fake_qemu.c
+new file mode 100644
+index 0000000..48587af
+--- /dev/null
++++ b/hw/display/reims-vgpu-dirty-test/fake/fake_qemu.c
+@@ -0,0 +1,195 @@
++/* See fake_qemu.h. SPDX-License-Identifier: GPL-2.0-or-later */
++#include "fake_qemu.h"
++
++AddressSpace address_space_memory;
++FakeRange fake_ranges[8];
++int fake_nranges;
++size_t fake_target_page = 4096;
++uint64_t fake_syncs;
++
++static MemoryRegion *world_mr(void)
++{
++    return fake_nranges ? fake_ranges[0].mr : NULL;
++}
++
++FlatView *address_space_to_flatview(AddressSpace *as)
++{
++    (void)as;
++    return (FlatView *)&fake_nranges;
++}
++
++void flatview_for_each_range(FlatView *fv, flatview_cb cb, void *opaque)
++{
++    int i;
++
++    (void)fv;
++    for (i = 0; i < fake_nranges; i++) {
++        FakeRange *r = &fake_ranges[i];
++
++        if (cb((Int128)r->gpa, (Int128)r->len, r->mr, r->offset, opaque)) {
++            return;
++        }
++    }
++}
++
++size_t qemu_target_page_size(void)
++{
++    return fake_target_page;
++}
++
++static uint64_t page_of(MemoryRegion *mr, ram_addr_t addr)
++{
++    return (addr - mr->ram_addr) / fake_target_page;
++}
++
++void memory_global_dirty_log_sync(bool last_stage)
++{
++    int i;
++
++    (void)last_stage;
++    fake_syncs++;
++    for (i = 0; i < fake_nranges; i++) {
++        MemoryRegion *mr = fake_ranges[i].mr;
++        uint64_t p;
++
++        if (!mr->logging) {
++            continue;
++        }
++        for (p = 0; p < mr->pages; p++) {
++            if (mr->kernel_dirty[p]) {
++                mr->ram_bit[p] = true;
++                mr->kernel_dirty[p] = false;
++            }
++        }
++    }
++}
++
++bool physical_memory_get_dirty_flag(ram_addr_t addr, unsigned client)
++{
++    MemoryRegion *mr = world_mr();
++
++    (void)client;
++    return mr->ram_bit[page_of(mr, addr)];
++}
++
++void memory_region_reset_dirty(MemoryRegion *mr, hwaddr addr, hwaddr size,
++                               unsigned client)
++{
++    uint64_t p;
++
++    (void)client;
++    for (p = addr / fake_target_page;
++         p < (addr + size + fake_target_page - 1) / fake_target_page; p++) {
++        mr->ram_bit[p] = false;
++        if (mr->logging) {
++            mr->protected_[p] = true;
++        }
++    }
++}
++
++void memory_region_set_log(MemoryRegion *mr, bool log, unsigned client)
++{
++    uint64_t p;
++
++    (void)client;
++    mr->logging = log;
++    for (p = 0; p < mr->pages; p++) {
++        /* Enabling logging write-protects the region; the QEMU bitmap is left
++         * exactly as it was, which is to say all-set until something clears it. */
++        mr->protected_[p] = log;
++    }
++}
++
++ram_addr_t memory_region_get_ram_addr(MemoryRegion *mr)
++{
++    return mr->ram_addr;
++}
++
++void memory_region_ref(MemoryRegion *mr) { mr->refs++; }
++void memory_region_unref(MemoryRegion *mr) { mr->refs--; }
++
++void fake_guest_write(MemoryRegion *mr, uint64_t page)
++{
++    mr->version[page]++;
++    if (mr->logging && mr->protected_[page]) {
++        mr->kernel_dirty[page] = true;
++        mr->protected_[page] = false;
++    }
++}
++
++/* ---- bottom half ---- */
++struct QEMUBH {
++    QEMUBHFunc *cb;
++    void *opaque;
++    bool pending;
++};
++static QEMUBH the_bh;
++static uint64_t bh_schedules;
++static bool bh_live;
++
++AioContext *qemu_get_aio_context(void) { return NULL; }
++
++QEMUBH *aio_bh_new(AioContext *ctx, QEMUBHFunc *cb, void *opaque)
++{
++    (void)ctx;
++    the_bh.cb = cb;
++    the_bh.opaque = opaque;
++    the_bh.pending = false;
++    bh_live = true;
++    return &the_bh;
++}
++
++void qemu_bh_schedule(QEMUBH *bh)
++{
++    __atomic_add_fetch(&bh_schedules, 1, __ATOMIC_RELAXED);
++    __atomic_store_n(&bh->pending, true, __ATOMIC_SEQ_CST);
++}
++
++void qemu_bh_delete(QEMUBH *bh)
++{
++    bh->pending = false;
++    bh_live = false;
++}
++
++bool fake_bh_pending(void)
++{
++    return bh_live && __atomic_load_n(&the_bh.pending, __ATOMIC_SEQ_CST);
++}
++
++bool fake_bh_run(void)
++{
++    if (!fake_bh_pending()) {
++        return false;
++    }
++    __atomic_store_n(&the_bh.pending, false, __ATOMIC_SEQ_CST);
++    the_bh.cb(the_bh.opaque);
++    return true;
++}
++
++uint64_t fake_bh_schedules(void)
++{
++    return __atomic_load_n(&bh_schedules, __ATOMIC_RELAXED);
++}
++
++/* ---- world ---- */
++static MemoryRegion the_mr;
++
++void fake_reset_world(void)
++{
++    uint64_t p;
++
++    memset(&the_mr, 0, sizeof(the_mr));
++    the_mr.ram = true;
++    the_mr.ram_addr = 0x40000000;
++    the_mr.pages = FAKE_MAX_PAGES;
++    for (p = 0; p < FAKE_MAX_PAGES; p++) {
++        the_mr.ram_bit[p] = true;   /* QEMU allocates RAM all-dirty */
++    }
++    fake_ranges[0] = (FakeRange){ .gpa = 0x100000,
++                                  .len = FAKE_MAX_PAGES * 4096ull,
++                                  .mr = &the_mr, .offset = 0 };
++    fake_nranges = 1;
++    fake_syncs = 0;
++    bh_schedules = 0;
++    the_bh.pending = false;
++}
+diff --git a/hw/display/reims-vgpu-dirty-test/fake/fake_qemu.h b/hw/display/reims-vgpu-dirty-test/fake/fake_qemu.h
+new file mode 100644
+index 0000000..8bf4528
+--- /dev/null
++++ b/hw/display/reims-vgpu-dirty-test/fake/fake_qemu.h
+@@ -0,0 +1,102 @@
++/*
++ * A model of exactly the QEMU surface reims-vgpu-dirty.c uses, so the real
++ * adapter source can be driven by scripted guests. Not QEMU: it models the
++ * three layers that decide whether a guest store can be seen —
++ *
++ *   protected[]   the hypervisor's write protection of a logged page
++ *   kernel_dirty[] what the hypervisor recorded since the last sync
++ *   ram_bit[]     QEMU's DIRTY_MEMORY_VGA bitmap, which starts all-set
++ *
++ * — and nothing else. SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef FAKE_QEMU_H
++#define FAKE_QEMU_H
++
++#include <glib.h>
++#include <pthread.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++typedef uint64_t hwaddr;
++typedef uint64_t ram_addr_t;
++typedef __int128 Int128;
++#define DIRTY_MEMORY_VGA 0
++#define HWADDR_PRIx PRIx64
++
++static inline bool int128_nz(Int128 a) { return a != 0; }
++static inline uint64_t int128_get64(Int128 a) { return (uint64_t)a; }
++
++typedef struct QemuMutex { pthread_mutex_t m; } QemuMutex;
++static inline void qemu_mutex_init(QemuMutex *m) { pthread_mutex_init(&m->m, NULL); }
++static inline void qemu_mutex_destroy(QemuMutex *m) { pthread_mutex_destroy(&m->m); }
++static inline void qemu_mutex_lock(QemuMutex *m) { pthread_mutex_lock(&m->m); }
++static inline void qemu_mutex_unlock(QemuMutex *m) { pthread_mutex_unlock(&m->m); }
++
++#define RCU_READ_LOCK_GUARD() do { } while (0)
++
++#define FAKE_MAX_PAGES 64
++
++typedef struct MemoryRegion {
++    bool ram;
++    ram_addr_t ram_addr;
++    uint64_t pages;
++    bool logging;
++    bool protected_[FAKE_MAX_PAGES];
++    bool kernel_dirty[FAKE_MAX_PAGES];
++    bool ram_bit[FAKE_MAX_PAGES];
++    uint64_t version[FAKE_MAX_PAGES];   /* guest memory "contents" */
++    int refs;
++} MemoryRegion;
++
++typedef struct FakeRange {
++    hwaddr gpa;
++    uint64_t len;
++    MemoryRegion *mr;
++    hwaddr offset;
++} FakeRange;
++
++typedef struct FlatView FlatView;
++typedef struct AddressSpace { int unused; } AddressSpace;
++extern AddressSpace address_space_memory;
++
++typedef bool (*flatview_cb)(Int128 start, Int128 len, const MemoryRegion *mr,
++                            hwaddr offset_in_region, void *opaque);
++
++/* The test configures the flat view. */
++extern FakeRange fake_ranges[8];
++extern int fake_nranges;
++extern size_t fake_target_page;
++extern uint64_t fake_syncs;
++
++FlatView *address_space_to_flatview(AddressSpace *as);
++void flatview_for_each_range(FlatView *fv, flatview_cb cb, void *opaque);
++size_t qemu_target_page_size(void);
++void memory_global_dirty_log_sync(bool last_stage);
++bool physical_memory_get_dirty_flag(ram_addr_t addr, unsigned client);
++void memory_region_reset_dirty(MemoryRegion *mr, hwaddr addr, hwaddr size,
++                               unsigned client);
++void memory_region_set_log(MemoryRegion *mr, bool log, unsigned client);
++ram_addr_t memory_region_get_ram_addr(MemoryRegion *mr);
++void memory_region_ref(MemoryRegion *mr);
++void memory_region_unref(MemoryRegion *mr);
++
++typedef struct QEMUBH QEMUBH;
++typedef struct AioContext AioContext;
++typedef void QEMUBHFunc(void *opaque);
++AioContext *qemu_get_aio_context(void);
++QEMUBH *aio_bh_new(AioContext *ctx, QEMUBHFunc *cb, void *opaque);
++void qemu_bh_schedule(QEMUBH *bh);
++void qemu_bh_delete(QEMUBH *bh);
++
++/* Test-side controls. */
++void fake_reset_world(void);
++void fake_guest_write(MemoryRegion *mr, uint64_t page);
++bool fake_bh_pending(void);
++/* Run the pending bottom half under the (modelled) BQL; false if none. */
++bool fake_bh_run(void);
++uint64_t fake_bh_schedules(void);
++
++#endif
+diff --git a/hw/display/reims-vgpu-dirty-test/fake/qemu/main-loop.h b/hw/display/reims-vgpu-dirty-test/fake/qemu/main-loop.h
+new file mode 100644
+index 0000000..a7a036a
+--- /dev/null
++++ b/hw/display/reims-vgpu-dirty-test/fake/qemu/main-loop.h
+@@ -0,0 +1 @@
++#include "../fake_qemu.h"
+diff --git a/hw/display/reims-vgpu-dirty-test/fake/qemu/osdep.h b/hw/display/reims-vgpu-dirty-test/fake/qemu/osdep.h
+new file mode 100644
+index 0000000..a7a036a
+--- /dev/null
++++ b/hw/display/reims-vgpu-dirty-test/fake/qemu/osdep.h
+@@ -0,0 +1 @@
++#include "../fake_qemu.h"
+diff --git a/hw/display/reims-vgpu-dirty-test/fake/qemu/rcu.h b/hw/display/reims-vgpu-dirty-test/fake/qemu/rcu.h
+new file mode 100644
+index 0000000..a7a036a
+--- /dev/null
++++ b/hw/display/reims-vgpu-dirty-test/fake/qemu/rcu.h
+@@ -0,0 +1 @@
++#include "../fake_qemu.h"
+diff --git a/hw/display/reims-vgpu-dirty-test/fake/qemu/thread.h b/hw/display/reims-vgpu-dirty-test/fake/qemu/thread.h
+new file mode 100644
+index 0000000..a7a036a
+--- /dev/null
++++ b/hw/display/reims-vgpu-dirty-test/fake/qemu/thread.h
+@@ -0,0 +1 @@
++#include "../fake_qemu.h"
+diff --git a/hw/display/reims-vgpu-dirty-test/fake/system/address-spaces.h b/hw/display/reims-vgpu-dirty-test/fake/system/address-spaces.h
+new file mode 100644
+index 0000000..a7a036a
+--- /dev/null
++++ b/hw/display/reims-vgpu-dirty-test/fake/system/address-spaces.h
+@@ -0,0 +1 @@
++#include "../fake_qemu.h"
+diff --git a/hw/display/reims-vgpu-dirty-test/fake/system/memory.h b/hw/display/reims-vgpu-dirty-test/fake/system/memory.h
+new file mode 100644
+index 0000000..a7a036a
+--- /dev/null
++++ b/hw/display/reims-vgpu-dirty-test/fake/system/memory.h
+@@ -0,0 +1 @@
++#include "../fake_qemu.h"
+diff --git a/hw/display/reims-vgpu-dirty-test/fake/system/physmem.h b/hw/display/reims-vgpu-dirty-test/fake/system/physmem.h
+new file mode 100644
+index 0000000..a7a036a
+--- /dev/null
++++ b/hw/display/reims-vgpu-dirty-test/fake/system/physmem.h
+@@ -0,0 +1 @@
++#include "../fake_qemu.h"
+diff --git a/hw/display/reims-vgpu-dirty-test/fake/system/ram_addr.h b/hw/display/reims-vgpu-dirty-test/fake/system/ram_addr.h
+new file mode 100644
+index 0000000..a7a036a
+--- /dev/null
++++ b/hw/display/reims-vgpu-dirty-test/fake/system/ram_addr.h
+@@ -0,0 +1 @@
++#include "../fake_qemu.h"
+diff --git a/hw/display/reims-vgpu-dirty-test/run.sh b/hw/display/reims-vgpu-dirty-test/run.sh
+new file mode 100755
+index 0000000..c73e830
+--- /dev/null
++++ b/hw/display/reims-vgpu-dirty-test/run.sh
+@@ -0,0 +1,37 @@
++#!/bin/sh
++# Build and run the dirty-adapter model check. No QEMU build required.
++#   ./run.sh [max-length]          check the shim as it is
++#   ./run.sh --mutant NAME         build a deliberately wrong shim; must FAIL
++# SPDX-License-Identifier: GPL-2.0-or-later
++set -eu
++here=$(cd "$(dirname "$0")" && pwd)
++shim="$here/../reims-vgpu-dirty.c"
++out=${TMPDIR:-/tmp}/reims-vgpu-dirty-test.$$
++mkdir -p "$out"
++trap 'rm -rf "$out"' EXIT
++mutant=
++if [ "${1:-}" = "--mutant" ]; then mutant=$2; shift 2; fi
++src="$shim"
++case "$mutant" in
++  "") ;;
++  arm_at_track)   # a "synchronous baseline": readable the instant it is tracked
++    sed 's|s->arm_at = d->harvests + 1;|s->arm_at = 0; s->gen = 1;|' "$shim" > "$out/shim.c"; src="$out/shim.c" ;;
++  no_unlogged)    # arm in the harvest that turned logging on
++    sed 's|if (s->gen == 0 \&\& unlogged) {|if (0) {|' "$shim" > "$out/shim.c"; src="$out/shim.c" ;;
++  no_hit_stamp)   # forget which pages the arming harvest absorbed
++    sed 's|s->page_gen\[g_array_index(hit, size_t, h)\] = s->gen;|(void)h;|' "$shim" > "$out/shim.c"; src="$out/shim.c" ;;
++  no_sync)        # read the bitmap without folding the hypervisor's bits in
++    sed 's|    memory_global_dirty_log_sync(false);|    (void)0;|' "$shim" > "$out/shim.c"; src="$out/shim.c" ;;
++  *) echo "unknown mutant $mutant" >&2; exit 2 ;;
++esac
++cc -std=gnu11 -O1 -g -Wall -Wno-unused-function -Wno-unused-but-set-variable -I"$here/fake" -I"$here/.." \
++   -DSHIM_SRC="\"$src\"" \
++   $(pkg-config --cflags glib-2.0) "$here/test.c" "$here/fake/fake_qemu.c" \
++   $(pkg-config --libs glib-2.0) -lpthread -o "$out/t"
++if [ -n "$mutant" ]; then
++  # A mutant is judged by the model check alone: the directed cases state the
++  # intended mechanism and would fail it for the wrong reason.
++  "$out/t" "${1:-6}" model-only
++else
++  "$out/t" "$@"
++fi
+diff --git a/hw/display/reims-vgpu-dirty-test/test.c b/hw/display/reims-vgpu-dirty-test/test.c
+new file mode 100644
+index 0000000..f6b64a5
+--- /dev/null
++++ b/hw/display/reims-vgpu-dirty-test/test.c
+@@ -0,0 +1,362 @@
++/*
++ * Drives the real reims-vgpu-dirty.c against a model of the hypervisor dirty
++ * bitmap (fake/fake_qemu.[ch]).
++ *
++ * Two questions, answered separately because they fail separately:
++ *
++ *  1. ARMING.  Does a tracked set become readable without the guest ringing a
++ *     doorbell? (directed cases)
++ *
++ *  2. SOUNDNESS.  Over *every* interleaving of guest writes, doorbell harvests,
++ *     main-loop arming harvests, generation reads, host copies and vouch checks
++ *     up to a bounded length, does arming ever let a guest write escape?
++ *     (exhaustive model check)
++ *
++ * The protocol under check is the one the Rust consumers follow: read the
++ * generation (G), THEN copy the pages (C), record G beside the copy; later a
++ * read equal to the recorded G vouches for the copy (V).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "fake_qemu.h"
++
++#include <assert.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <string.h>
++
++/* The shim is included, not linked, so the model can read how many harvests it
++ * has really run (`d->harvests`) instead of inferring it from a call the
++ * mutants remove. */
++#include SHIM_SRC
++
++#define PG 4096ull
++#define GPA(p) (0x100000ull + (p) * PG)
++
++static MemoryRegion *mr(void) { return fake_ranges[0].mr; }
++
++static int failures;
++#define CHECK(c, ...) do { if (!(c)) { failures++; \
++    fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); \
++    fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
++
++/* A world in which an earlier surface already turned logging on, which is the
++ * steady state of a boot after its first tracked surface. */
++static ReimsVgpuDirty *new_dirty(bool logged_already)
++{
++    ReimsVgpuDirty *d;
++
++    fake_reset_world();
++    d = reims_vgpu_dirty_new();
++    if (logged_already) {
++        uint64_t g[1] = { GPA(40) };
++        uint64_t t = reims_vgpu_dirty_track(d, g, 1, PG);
++        int i;
++
++        for (i = 0; i < 4 && reims_vgpu_dirty_gen(d, t) == 0; i++) {
++            fake_bh_run();
++            reims_vgpu_dirty_harvest(d);
++        }
++    }
++    return d;
++}
++
++/* ------------------------------------------------------------ directed */
++
++static void directed(void)
++{
++    uint64_t g[2] = { GPA(2), GPA(3) };
++    ReimsVgpuDirty *d;
++    uint64_t t, runs;
++
++    /* First surface of a boot: the harvest that arms it must first turn logging
++     * on, so two harvests are owed — and neither is a doorbell. */
++    d = new_dirty(false);
++    t = reims_vgpu_dirty_track(d, g, 2, PG);
++    CHECK(t != 0, "track refused");
++    CHECK(fake_bh_pending(), "track did not ask for an arming harvest");
++    CHECK(reims_vgpu_dirty_gen(d, t) == 0, "readable before any harvest");
++    for (runs = 0; reims_vgpu_dirty_gen(d, t) == 0 && runs < 8; runs++) {
++        CHECK(fake_bh_run(), "unarmed set with no harvest pending (run %" PRIu64 ")", runs);
++    }
++    CHECK(reims_vgpu_dirty_gen(d, t) != 0, "never armed without a doorbell");
++    CHECK(runs == 2, "first-region arming took %" PRIu64 " harvests, want 2", runs);
++    CHECK(mr()->logging, "arming did not enable logging");
++    reims_vgpu_dirty_free(d);
++
++    /* Every later surface: logging is already on, one harvest. */
++    d = new_dirty(true);
++    t = reims_vgpu_dirty_track(d, g, 2, PG);
++    CHECK(reims_vgpu_dirty_gen(d, t) == 0, "readable before the harvest");
++    CHECK(fake_bh_run(), "no harvest pending for a new set");
++    CHECK(reims_vgpu_dirty_gen(d, t) == 1, "one harvest should arm at gen 1, got %" PRIu64,
++          reims_vgpu_dirty_gen(d, t));
++    reims_vgpu_dirty_free(d);
++
++    /* The pre-existing behaviour, stated as a test of the *mechanism*: with no
++     * main-loop turn and no doorbell nothing can arm, however often it is read.
++     * This is the 8.24 s window. */
++    d = new_dirty(true);
++    t = reims_vgpu_dirty_track(d, g, 2, PG);
++    {
++        uint64_t before = fake_syncs;
++
++        for (runs = 0; runs < 1000; runs++) {
++            CHECK(reims_vgpu_dirty_gen(d, t) == 0, "armed with no harvest at all");
++        }
++        CHECK(fake_syncs == before, "a read ran a sync; only a harvest may");
++    }
++    reims_vgpu_dirty_free(d);
++
++    /* A burst of tracks is one harvest, not one per track. */
++    d = new_dirty(true);
++    {
++        uint64_t tok[16];
++        uint64_t before = fake_syncs;
++        int i;
++
++        for (i = 0; i < 16; i++) {
++            uint64_t gg[1] = { GPA(10 + i) };
++            tok[i] = reims_vgpu_dirty_track(d, gg, 1, PG);
++        }
++        CHECK(fake_bh_run(), "burst scheduled nothing");
++        CHECK(!fake_bh_pending(), "burst left a second harvest pending");
++        CHECK(fake_syncs == before + 1, "burst cost %" PRIu64 " syncs, want 1",
++              fake_syncs - before);
++        for (i = 0; i < 16; i++) {
++            CHECK(reims_vgpu_dirty_gen(d, tok[i]) != 0, "token %d unarmed after the burst", i);
++        }
++    }
++    reims_vgpu_dirty_free(d);
++
++    /* Untracked before the bottom half runs: harmless. */
++    d = new_dirty(true);
++    t = reims_vgpu_dirty_track(d, g, 2, PG);
++    reims_vgpu_dirty_untrack(d, t);
++    fake_bh_run();
++    CHECK(reims_vgpu_dirty_gen(d, t) == 0, "released token readable");
++    reims_vgpu_dirty_free(d);
++}
++
++/* ---------------------------------------------------------- exhaustive */
++
++enum { W0, W1, H, B, G, C, V, NOPS };
++static const char *opname[] = { "W0", "W1", "H", "B", "G", "C", "V" };
++#define PA 2
++#define PB 3
++
++typedef struct Run {
++    ReimsVgpuDirty *d;
++    uint64_t token;
++    /* Versions of the two tracked pages as the last harvest saw them. */
++    uint64_t seen_at_harvest[2];
++    uint64_t harvests_seen;
++    /* The reader. */
++    uint64_t last_g;
++    bool have_copy;
++    uint64_t copy_g;
++    uint64_t copy_ver[2];
++    /* Armed baseline, captured when the generation first became readable. */
++    bool armed;
++    uint64_t armed_gen;
++    uint64_t armed_ver[2];
++} Run;
++
++static const uint64_t PAGE[2] = { PA, PB };
++
++static void note_harvest(Run *r)
++{
++    if (r->d->harvests != r->harvests_seen) {
++        r->harvests_seen = r->d->harvests;
++        r->seen_at_harvest[0] = mr()->version[PA];
++        r->seen_at_harvest[1] = mr()->version[PB];
++    }
++}
++
++static void fail_run(const char *what, const int *ops, int n, bool logged)
++{
++    int i;
++
++    failures++;
++    fprintf(stderr, "FAIL %s  [logged_already=%d]  ops:", what, logged);
++    for (i = 0; i < n; i++) {
++        fprintf(stderr, " %s", ops[i] == -1 ? "T" : opname[ops[i]]);
++    }
++    fputc('\n', stderr);
++}
++
++static uint64_t peek_gen(Run *r)
++{
++    /* The header documents gen as idempotent and only a consumer's *reads*
++     * schedule work, so the checker reads through the public door and accounts
++     * for that by reading only where the protocol itself reads. */
++    return reims_vgpu_dirty_gen(r->d, r->token);
++}
++
++static bool run_one(const int *ops, int n, bool logged)
++{
++    Run r;
++    int i;
++    bool ok = true;
++    uint64_t pages[16];
++
++    memset(&r, 0, sizeof(r));
++    r.d = new_dirty(logged);
++    r.harvests_seen = r.d->harvests;
++    /* Pages tracked later exist as stale bits already; the model starts that
++     * way (ram_bit all-set) and a prelude surface may have cleared others. */
++
++    for (i = 0; i < n && ok; i++) {
++        int op = ops[i];
++
++        if (op == -1) {
++            uint64_t g[2] = { GPA(PA), GPA(PB) };
++
++            if (!r.token) {
++                r.token = reims_vgpu_dirty_track(r.d, g, 2, PG);
++            }
++            continue;
++        }
++        switch (op) {
++        case W0: fake_guest_write(mr(), PA); break;
++        case W1: fake_guest_write(mr(), PB); break;
++        case H:  reims_vgpu_dirty_harvest(r.d); note_harvest(&r); break;
++        case B:  fake_bh_run(); note_harvest(&r); break;
++        case G:
++            if (r.token) {
++                r.last_g = peek_gen(&r);
++            }
++            break;
++        case C:
++            if (r.token && r.last_g) {
++                r.have_copy = true;
++                r.copy_g = r.last_g;
++                r.copy_ver[0] = mr()->version[PA];
++                r.copy_ver[1] = mr()->version[PB];
++            }
++            break;
++        case V:
++            if (r.token && r.have_copy) {
++                uint64_t g = peek_gen(&r);
++
++                if (g == r.copy_g) {
++                    int k;
++
++                    /* I: a vouched copy is no older than what the last sync
++                     * had already seen. */
++                    for (k = 0; k < 2; k++) {
++                        if (r.seen_at_harvest[k] > r.copy_ver[k]) {
++                            fail_run("I: vouched a copy older than the last harvest's view",
++                                     ops, i + 1, logged);
++                            ok = false;
++                        }
++                    }
++                }
++            }
++            break;
++        }
++        if (!ok || !r.token) {
++            continue;
++        }
++        /* Every op: derive the armed baseline lazily at the first readable
++         * generation, from the versions the *harvest that produced it* saw. */
++        if (!r.armed) {
++            uint64_t g = peek_gen(&r);
++
++            if (g != 0) {
++                r.armed = true;
++                r.armed_gen = g;
++                r.armed_ver[0] = r.seen_at_harvest[0];
++                r.armed_ver[1] = r.seen_at_harvest[1];
++            }
++        }
++        if (r.armed) {
++            int64_t found = reims_vgpu_dirty_written_since(r.d, r.token, r.armed_gen,
++                                                           pages, 16);
++            int k, m;
++
++            if (found < 0) {
++                fail_run("written_since refused an armed set", ops, i + 1, logged);
++                ok = false;
++                continue;
++            }
++            for (k = 0; k < 2; k++) {
++                bool reported = false;
++                bool wrote_after_arm = r.seen_at_harvest[k] > r.armed_ver[k];
++
++                for (m = 0; m < found; m++) {
++                    if (pages[m] == GPA(PAGE[k])) {
++                        reported = true;
++                    }
++                }
++                /* J: nothing reported that was not written after arming. */
++                if (reported && !wrote_after_arm) {
++                    fail_run("J: reported a write that never happened (stale bit read as a guest store)",
++                             ops, i + 1, logged);
++                    ok = false;
++                }
++                /* K: every write a harvest saw after arming is reported. */
++                if (wrote_after_arm && !reported) {
++                    fail_run("K: a harvested guest write is missing from the report",
++                             ops, i + 1, logged);
++                    ok = false;
++                }
++            }
++        }
++    }
++    reims_vgpu_dirty_free(r.d);
++    return ok;
++}
++
++static uint64_t nruns;
++
++static void enumerate(int *ops, int n, int max, bool logged, int tracked)
++{
++    int op;
++
++    if (n > 0 && tracked) {
++        nruns++;
++        if (!run_one(ops, n, logged) && failures > 10) {
++            return;
++        }
++    }
++    if (n == max) {
++        return;
++    }
++    if (!tracked) {
++        /* A prefix of writes and harvests, then the registration. */
++        ops[n] = -1;
++        enumerate(ops, n + 1, max, logged, 1);
++        if (n < 2) {
++            for (op = W0; op <= B; op++) {
++                ops[n] = op;
++                enumerate(ops, n + 1, max, logged, 0);
++            }
++        }
++        return;
++    }
++    for (op = 0; op < NOPS; op++) {
++        ops[n] = op;
++        enumerate(ops, n + 1, max, logged, 1);
++    }
++}
++
++int main(int argc, char **argv)
++{
++    int ops[16];
++    int max = argc > 1 ? atoi(argv[1]) : 8;
++
++    if (!(argc > 2 && !strcmp(argv[2], "model-only"))) {
++        directed();
++    }
++    if (failures) {
++        fprintf(stderr, "directed cases failed: %d\n", failures);
++        return 1;
++    }
++    enumerate(ops, 0, max, false, 0);
++    enumerate(ops, 0, max, true, 0);
++    printf("reims-vgpu-dirty: directed cases ok; %" PRIu64
++           " interleavings checked (max length %d), %d failures\n",
++           nruns, max, failures);
++    return failures ? 1 : 0;
++}
+diff --git a/hw/display/reims-vgpu-dirty.c b/hw/display/reims-vgpu-dirty.c
+index b7f216a..e0e0ae0 100644
+--- a/hw/display/reims-vgpu-dirty.c
++++ b/hw/display/reims-vgpu-dirty.c
+@@ -7,6 +7,7 @@
+ #include "qemu/osdep.h"
+ #include "qemu/thread.h"
+ #include "qemu/rcu.h"
++#include "qemu/main-loop.h"
+ #include "exec/target_page.h"
+ #include "system/address-spaces.h"
+ #include "system/memory.h"
+@@ -87,8 +88,51 @@ struct ReimsVgpuDirty {
+      * writes into one sync.
+      */
+     uint64_t reads_since_harvest;
++    /*
++     * Runs a harvest on the main loop, under the BQL, without a guest doorbell.
++     * Scheduled whenever a set exists whose generation still reads 0 — that is,
++     * by `reims_vgpu_dirty_track` and by every generation read that came back 0
++     * — and rescheduled by its own callback while some set is still waiting on
++     * a second harvest. `qemu_bh_schedule` is thread-safe and idempotent while
++     * the bottom half is pending, so the drain thread may call it as often as it
++     * reads.
++     */
++    QEMUBH *arm_bh;
+ };
+ 
++static bool reims_vgpu_dirty_run(ReimsVgpuDirty *d, bool force);
++
++/*
++ * A set is waiting to arm: ask the main loop for the harvest that arms it.
++ *
++ * Arming used to be a side effect of the next *guest doorbell write* that
++ * followed a generation read (`reims_vgpu_dirty_harvest` was called from nowhere
++ * else). A set tracked while the guest is quiet — or inside one long drain
++ * tranche, which drains the work of a single doorbell — therefore read 0 for as
++ * long as the guest stayed away from the device: measured at up to 8.24 s, with
++ * the window re-gathered on every bind.
++ *
++ * Any thread.
++ */
++static void reims_vgpu_dirty_want_arm(ReimsVgpuDirty *d)
++{
++    if (d->arm_bh) {
++        qemu_bh_schedule(d->arm_bh);
++    }
++}
++
++static void reims_vgpu_dirty_arm_bh(void *opaque)
++{
++    ReimsVgpuDirty *d = opaque;
++
++    /* BQL held: main-loop bottom halves run under it. Forced, because the
++     * harvest this stands in for was owed by a set, not by a generation read
++     * that may already have been consumed. */
++    if (reims_vgpu_dirty_run(d, true)) {
++        reims_vgpu_dirty_want_arm(d);
++    }
++}
++
+ static void reims_vgpu_dirty_set_free(gpointer p)
+ {
+     ReimsVgpuDirtySet *s = p;
+@@ -106,6 +150,7 @@ ReimsVgpuDirty *reims_vgpu_dirty_new(void)
+     d->sets = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
+                                     reims_vgpu_dirty_set_free);
+     d->logged = g_hash_table_new(NULL, NULL);
++    d->arm_bh = aio_bh_new(qemu_get_aio_context(), reims_vgpu_dirty_arm_bh, d);
+     return d;
+ }
+ 
+@@ -117,6 +162,12 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d)
+     if (!d) {
+         return;
+     }
++    /* Before anything it could touch is torn down; the BQL is held, so the
++     * callback is not running. */
++    if (d->arm_bh) {
++        qemu_bh_delete(d->arm_bh);
++        d->arm_bh = NULL;
++    }
+     /* BQL: memory_region_set_log is a MemoryRegion transaction. */
+     g_hash_table_iter_init(&it, d->logged);
+     while (g_hash_table_iter_next(&it, &key, &val)) {
+@@ -235,7 +286,21 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
+     d->next_token++;
+     token = d->next_token;
+     g_hash_table_insert(d->sets, g_memdup2(&token, sizeof(token)), s);
++    /*
++     * A new set is a consumer the next harvest has something to tell, whether
++     * or not a generation read has followed yet: without this a harvest that
++     * nothing has read since the last one is skipped, and the set would wait
++     * for a reader as well as for a harvest.
++     */
++    d->reads_since_harvest++;
+     qemu_mutex_unlock(&d->lock);
++    /*
++     * The harvest that arms this set must not wait for the guest to ring a
++     * doorbell. It cannot run here: track is called from the drain thread,
++     * which must never take the BQL, and the accelerator's dirty-log sync needs
++     * it. The main loop can, and it is the same function the doorbell calls.
++     */
++    reims_vgpu_dirty_want_arm(d);
+     return token;
+ }
+ 
+@@ -253,6 +318,7 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
+ {
+     ReimsVgpuDirtySet *s;
+     uint64_t gen = 0;
++    bool unarmed = false;
+ 
+     if (!d || token == 0) {
+         return 0;
+@@ -261,9 +327,16 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
+     s = g_hash_table_lookup(d->sets, &token);
+     if (s) {
+         gen = s->gen;
++        unarmed = gen == 0;
+     }
+     d->reads_since_harvest++;
+     qemu_mutex_unlock(&d->lock);
++    if (unarmed) {
++        /* Idempotent while pending. Asked on every unarmed read, not just at
++         * track, so a wakeup that was consumed before this set could arm (it
++         * needed a second harvest) is never the last one. */
++        reims_vgpu_dirty_want_arm(d);
++    }
+     return gen;
+ }
+ 
+@@ -436,6 +509,18 @@ static bool reims_vgpu_dirty_page_written(const ReimsVgpuDirtySlice *sl,
+ 
+ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
+ {
++    reims_vgpu_dirty_run(d, false);
++}
++
++/*
++ * One harvest. Returns whether a set is still unarmed afterwards, i.e. whether
++ * another harvest is owed to it. `force` skips the "nothing has read since the
++ * last harvest" shortcut, which is a statement about generation readers and
++ * does not apply to a harvest a waiting set asked for.
++ */
++static bool reims_vgpu_dirty_run(ReimsVgpuDirty *d, bool force)
++{
++    bool pending = false;
+     ReimsVgpuDirtySlice *slices;
+     g_autoptr(GArray) written = NULL;
+     g_autoptr(GArray) hit = NULL;
+@@ -445,13 +530,14 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
+     guint w;
+ 
+     if (!d) {
+-        return;
++        return false;
+     }
+ 
+     qemu_mutex_lock(&d->lock);
+-    if (g_hash_table_size(d->sets) == 0 || d->reads_since_harvest == 0) {
++    if (g_hash_table_size(d->sets) == 0 ||
++        (!force && d->reads_since_harvest == 0)) {
+         qemu_mutex_unlock(&d->lock);
+-        return;
++        return false;
+     }
+     qemu_mutex_unlock(&d->lock);
+ 
+@@ -554,6 +640,9 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
+         } else if (any) {
+             s->gen++;
+         }
++        if (s->gen == 0) {
++            pending = true;
++        }
+         /*
+          * Stamp after the generation, and only once it is readable. A page
+          * stamped during the startup window would carry a generation no reader
+@@ -638,4 +727,5 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
+             memory_region_set_log(slices[i].mr, true, DIRTY_MEMORY_VGA);
+         }
+     }
++    return pending;
+ }
+diff --git a/hw/display/reims-vgpu-dirty.h b/hw/display/reims-vgpu-dirty.h
+index afc78dd..a1ef3e9 100644
+--- a/hw/display/reims-vgpu-dirty.h
++++ b/hw/display/reims-vgpu-dirty.h
+@@ -41,6 +41,15 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d);
+  * and must not be mistaken for their absence. Guest RAM is one MemoryRegion, so
+  * after the first tracked surface of a boot no harvest enables anything and the
+  * window is one.
++ *
++ * That harvest does not wait for a guest doorbell. track (and every generation
++ * read that comes back 0) schedules a main-loop bottom half that runs the same
++ * harvest under the BQL, so the window is bounded by the main loop's latency
++ * and not by how long the guest stays away from the device. It cannot be
++ * closed inside this call: the drain thread calls it, the accelerator's
++ * dirty-log sync needs the BQL, and a generation read before that sync would
++ * either vouch for pages whose bits have not been folded in or pretend the
++ * stale bits were a write.
+  */
+ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
+                                 size_t count, size_t page_size);
+-- 
+2.43.0
+
