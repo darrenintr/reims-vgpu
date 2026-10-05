@@ -692,7 +692,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     // has staged successfully. A bind reflection calls `Unused` or does not
     // declare is skipped before resolving its descriptor, walking its pages, or
     // allocating its staging Vec.
-    let mut staged_bufs: Vec<StagedBuffer> = Vec::new();
+    let mut staged_bufs: Vec<StagedBuffer> = Vec::with_capacity(acc.buffers.len());
     let mut buffer_accesses = Vec::with_capacity(acc.buffers.len());
     let mut buffer_readonly_count = 0usize;
     let mut buffer_writable_count = 0usize;
@@ -762,7 +762,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         }
     }
 
-    let mut staged_tex: Vec<StagedTexture<VulkanStage>> = Vec::new();
+    let mut staged_tex: Vec<StagedTexture<VulkanStage>> = Vec::with_capacity(acc.textures.len());
     let mut storage_writeonly_count = 0usize;
     for t in &acc.textures {
         use crate::runtime::spirv_bind::{
@@ -1217,7 +1217,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     // Derive it once per dispatch instead of walking every SPIR-V instruction
     // once to filter guest samplers and again to provision defaults.
     let reflected_samplers = kernel_shader.variant(false, false).samplers.clone();
-    let mut samplers = Vec::new();
+    let mut samplers = Vec::with_capacity(reflected_samplers.len());
     for s in &acc.samplers {
         let binding = crate::runtime::spirv_bind::SAMPLER_BINDING_BASE + s.index;
         if reflected_samplers
