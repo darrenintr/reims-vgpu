@@ -2940,7 +2940,7 @@ fn writeback_texture<R: RailStage, M: HostMemory + HostOps>(
     task_id: u32,
     tex: &StagedTexture<R>,
 ) -> Result<(), ComputeStatus> {
-    writeback_texture_bytes(state, host, task_id, tex, bytes)
+    writeback_texture_bytes(state, host, task_id, tex, &tex.bytes)
 }
 
 /// Write a staged texture's output from an arbitrary tight-row byte slice.
@@ -3046,9 +3046,7 @@ fn writeback_texture_bytes<R: RailStage, M: HostMemory + HostOps>(
                 ));
                 return Err(ComputeStatus::GuestIo("compute_wb_tex_linear_cache_store"));
             }
-            crate::runtime::surface_cache::mirror_linear_color_cache(
-                state, host, &window, bytes,
-            );
+            crate::runtime::surface_cache::mirror_linear_color_cache(state, host, &window, bytes);
             // Kept although the span is no longer needed here: the overflow is
             // a real refusal with a name, and `write_linear_guest_within` would only
             // return a bare `false` for it.
