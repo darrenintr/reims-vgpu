@@ -235,10 +235,19 @@ pub fn note_registry_levels(state: &crate::model::DeviceState) {
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
     static PEAK_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
-    let shape = state.bound_buffers.shape();
+    // This function is called from every post-tranche sweep. Keep the level's
+    // high-water exact with the O(1) length, but do not build the O(n)
+    // (task, reference) histogram until the one-second report actually fires.
+    //
+    // The old order called `shape()` before this cadence gate. With the iOS
+    // Simulator holding ~20-27k fallback entries and hundreds of tranches per
+    // second, the diagnostic itself consumed 150-195 ms/s in
+    // `post_bindlv_us` while producing only one line. The census must observe
+    // the workload, not become a fifth of it.
+    let entries = state.bound_buffers.len();
     let peak = PEAK_ENTRIES
-        .fetch_max(shape.entries as u64, Ordering::Relaxed)
-        .max(shape.entries as u64);
+        .fetch_max(entries as u64, Ordering::Relaxed)
+        .max(entries as u64);
 
     let now = crate::observe::elapsed_ms() as u64;
     let last = LAST_MS.load(Ordering::Relaxed);
@@ -252,6 +261,8 @@ pub fn note_registry_levels(state: &crate::model::DeviceState) {
     {
         return;
     }
+
+    let shape = state.bound_buffers.shape();
     crate::observe::off(format!(
         "bound_buffers (levels, not per-interval) entries={} peak={} pairs={} \
          multi_offset_pairs={} max_offsets={}",
