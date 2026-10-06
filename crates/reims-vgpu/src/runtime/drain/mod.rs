@@ -4781,7 +4781,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     };
     {
         let _phase = present_phase(PresentPhase::RescueChildFirst);
-        drain_other_child_fifos(state, host, skip);
+        drain_pending_other_child_fifos(state, host, skip);
     }
     // This used to run a second child rescue immediately after the first.
     // The pair came from the archive's "before and after wait_surface" shape,
@@ -4812,7 +4812,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         }
         // Body-layer child work may be doorbell'd from main packets.
         let _phase = present_phase(PresentPhase::RescueChildAfterMain);
-        drain_other_child_fifos(state, host, skip);
+        drain_pending_other_child_fifos(state, host, skip);
     }
 
     // Preflight translation keeps an EXEC packet at its channel head. If one
@@ -7813,8 +7813,37 @@ pub fn drain_other_child_fifos<H: HostMemory + HostOps>(
     host: &mut H,
     skip_channel: u32,
 ) {
-    let _span = census::tranche_span(census::TrancheCost::Resweep);
     let mask = state.drainable_child_mask();
+    drain_other_child_fifos_mask(state, host, skip_channel, mask);
+}
+
+/// Present-path rescue: consume only child work that has actually been
+/// published pending (plus translation-held work that must retain ordering).
+///
+/// The periodic `device_poll` already performs the archive/Dekker open-domain
+/// scan via `publish_stranded_fifos`, turning every open domain into pending
+/// asynchronous work. Repeating that open-domain scan synchronously from every
+/// DisplaySwap is much stronger than the rescue requires: under iOS Simulator
+/// it made one present execute 1-2 seconds of unrelated child work before the
+/// frame could reach the host window. Doorbelled work remains immediate here;
+/// genuinely stranded work is still found by the periodic poll and scheduled
+/// on the ordinary worker.
+fn drain_pending_other_child_fifos<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    skip_channel: u32,
+) {
+    let mask = state.pending.child_mask | state.translation_deferred_mask;
+    drain_other_child_fifos_mask(state, host, skip_channel, mask);
+}
+
+fn drain_other_child_fifos_mask<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    skip_channel: u32,
+    mask: u32,
+) {
+    let _span = census::tranche_span(census::TrancheCost::Resweep);
     let nested = state.draining_mask;
 
     // A cold-translation EXEC is already the oldest accepted item in the host
@@ -7856,8 +7885,6 @@ pub fn drain_other_child_fifos<H: HostMemory + HostOps>(
             continue;
         }
         remaining &= !(1u32 << ch);
-        // Clear pending bit for channels we actually drain (archive poll_tick
-        // consumes pending when it drains). Leave skip/nested bits alone.
         state.pending.child_mask &= !(1u32 << ch);
         drain_child_fifo(state, host, ch);
         if state.translation_deferred_mask != 0 {
