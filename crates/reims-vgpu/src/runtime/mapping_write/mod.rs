@@ -958,7 +958,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             let selected = if skip.is_empty() {
                 None
             } else {
-                let mut runs = Vec::new();
+                let mut runs: Vec<(u64, u64)> = Vec::new();
                 for y in 0..mh {
                     let row_lo =
                         base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
