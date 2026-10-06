@@ -69,6 +69,21 @@ const POOL_SLOT_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
         | vk::BufferUsageFlags::STORAGE_BUFFER.as_raw(),
 );
 
+/// Staging buckets whose first allocation is too expensive to leave on a draw's
+/// critical path on a discrete host.
+///
+/// These are structural size classes, not application or device-name special
+/// cases. A driven workload that rapidly introduces large sampled surfaces can
+/// need two full-frame-ish uploads before the first one retires. Creating those
+/// buffers lazily also creates and maps their backing upload slabs while the
+/// engine lock is held, turning allocator latency directly into a dropped frame.
+///
+/// Two 8 MiB slots share one 16 MiB upload slab; the 16 MiB slot occupies a
+/// second block. The 64 KiB slot primes the small class. Total warm backing is
+/// therefore about 34 MiB, and all slots enter the ordinary free lists: there is
+/// no separate lifetime or reuse rule for warmed memory.
+const DISCRETE_STAGING_PREWARM: [u64; 4] = [64 << 10, 8 << 20, 8 << 20, 16 << 20];
+
 /// Whether the identity-only lookup runs, given what the environment said.
 ///
 /// Split from the read below so the one thing left to get wrong is testable
@@ -671,6 +686,40 @@ impl ResourcePools {
         )
     }
 
+    /// Populate the normal staging free list without putting a buffer in flight.
+    ///
+    /// This deliberately uses `acquire_staging` rather than duplicating its
+    /// buffer/memory policy. The acquired slot is live only in the pool's CPU
+    /// bookkeeping; no command buffer has seen it, so it can move straight back
+    /// to the free list without a fence.
+    unsafe fn prewarm_staging_slot(
+        &mut self,
+        ctx: &DeviceContext,
+        size: u64,
+        counters: &EngineCounters,
+    ) -> Result<(), DrawError> {
+        let slot = unsafe { self.acquire_staging(ctx, size, counters)? };
+        let Some(index) = self
+            .staging_live
+            .iter()
+            .rposition(|live| live.buffer == slot.buffer)
+        else {
+            crate::observe::fail(format!(
+                "staging_prewarm status=bookkeeping_miss bytes={size} bucket={}",
+                slot.size
+            ));
+            return Ok(());
+        };
+        let slot = self.staging_live.swap_remove(index);
+        let bucket = slot.size;
+        self.staging_free.entry(bucket).or_default().push(slot);
+        crate::observe::off(format!(
+            "staging_prewarm status=ready bytes={size} bucket={bucket} free={}",
+            self.staging_free.get(&bucket).map_or(0, Vec::len)
+        ));
+        Ok(())
+    }
+
     pub(crate) unsafe fn ensure_init(
         &mut self,
         ctx: &DeviceContext,
@@ -744,6 +793,29 @@ impl ResourcePools {
         self.cur = 0;
         self.in_flight = 0;
         self.initialized = true;
+
+        // Discrete hosts pay real allocation + mapping latency for upload
+        // memory. Move the first small/large slab allocations to device-pool
+        // initialization instead of letting an arbitrary guest draw become the
+        // allocator's synchronization point. Unified hosts do not take this arm:
+        // retaining tens of MiB there consumes the same memory the guest uses,
+        // and their allocation cost is a different measurement.
+        if matches!(
+            ctx.caps.memory.topology,
+            crate::backend::vulkan::caps::memory_topology::MemoryTopology::Discrete
+        ) {
+            for size in DISCRETE_STAGING_PREWARM {
+                if let Err(error) = unsafe { self.prewarm_staging_slot(ctx, size, counters) } {
+                    // Prewarming is a performance hint only. The ordinary miss
+                    // path remains correct and will retry lazily, so a host that
+                    // cannot spare the warm memory must still initialize.
+                    crate::observe::fail(format!(
+                        "staging_prewarm status=failed bytes={size} error={error}"
+                    ));
+                    break;
+                }
+            }
+        }
         Ok(())
     }
 
