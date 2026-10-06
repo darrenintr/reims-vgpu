@@ -2543,27 +2543,43 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
         if base_off.checked_add(frame_len as u64).is_none() {
             return false;
         }
-        // With no physical row padding, the engine's tight result is already
-        // the exact mapping byte window. Write it through the fragmented-run
-        // importer directly; a second frame allocation/copy is redundant.
+        // The engine's compute/readback output is tightly packed even when the
+        // IOSurface is not: e.g. the Simulator's 1290x2796 BGRA surfaces carry
+        // 5160 texel bytes in a wider guest row pitch. Materialising that pitch
+        // into a ~14 MiB frame before the fragmented-page walk is pure staging
+        // traffic; the padding is explicitly not part of the store.
+        //
+        // `WriteRect` already describes exactly this shape. It walks the guest
+        // span once, advances by `surface_bpr` on the destination, consumes
+        // back-to-back `rb` bytes on the source, and never writes the padding.
+        // Keep the exact full-plane bound the old dense fast path required so
+        // this widens only the source layout, not what guest memory is covered.
         let window_len = span_end
             .checked_sub(base_off)
             .and_then(|len| usize::try_from(len).ok());
         if origin_x == 0
             && origin_y == 0
-            && rb == bpr
-            && src_stride == surface_bpr
+            && src_stride as usize == rb
             && Some(frame_len) == window_len
         {
+            let Some(rect) =
+                mapper::RectStride::new(surface_bpr as u64, rb as u64, height as u64)
+            else {
+                return false;
+            };
+            crate::runtime::drain::note_store_route("rectwr_frag_rect_n");
             crate::observe::off(format!(
-                "mapping_write full_tight_direct mid={mapping_id} bytes={frame_len} bpr={surface_bpr} rows={height}"
+                "mapping_write full_packed_rect_direct mid={mapping_id} packed={} span={frame_len} bpr={surface_bpr} rows={height}",
+                rect.packed()
             ));
-            if !mapper::write_mapping_bytes(
+            if !mapper::write_mapping_rect_only(
                 state,
                 host,
                 mapping_id,
                 base_off,
-                &src[..frame_len],
+                rect,
+                &src[..rect.packed()],
+                None,
                 &vouched,
             ) {
                 return false;
