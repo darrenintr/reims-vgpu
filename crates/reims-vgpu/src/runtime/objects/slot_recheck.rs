@@ -40,10 +40,11 @@
 //!
 //! # What it costs
 //!
-//! One quiet probe read per *distinct* watched `(task, ref)` per drain tranche,
-//! and nothing at all when nothing is watched — which is every rail except
-//! macos-26, where rails 11 through 15 record zero `list_miss_slot_empty` in a
-//! driven boot.
+//! Rechecks are diagnostic work, not guest progress, so they are deliberately
+//! bounded: at most [`PROBES_PER_SWEEP`] watched slots are probed per drain
+//! tranche in round-robin order. Every admitted watch remains live until it
+//! fills or its task/lifetime ends; the budget only changes sampling cadence.
+//! Nothing at all runs when nothing is watched.
 
 use crate::model::DeviceState;
 use crate::runtime::decode::resource::{decode_list_object_entry, OBJECT_LIST_ENTRY_LEN};
@@ -89,10 +90,26 @@ struct Watch {
 /// true.
 struct Ledger {
     watches: std::collections::HashMap<WatchKey, Watch>,
+    /// Fair probe order. One key is queued exactly once while its watch is live.
+    ///
+    /// A HashMap-prefix budget is not fair: an empty slot among the first keys
+    /// would be selected again forever and refs later in the table could never
+    /// be observed filling. Rotating the keys makes the bound independent of
+    /// hash iteration order.
+    probe_order: std::collections::VecDeque<WatchKey>,
     /// How many sweeps have run. A watch admitted now belongs to the tranche the
     /// next one closes, which is what [`Watch::closing_sweep`] records.
     sweep: u64,
 }
+
+/// Maximum guest object-list re-reads one tranche may spend on this diagnostic.
+///
+/// This is intentionally a work budget rather than a time budget: a time budget
+/// makes the set sampled depend on host speed, while eight probes is eight probes
+/// on every pathway. With hundreds of long-lived misses this turns an O(watches)
+/// post-sweep into bounded work while round-robin ordering still samples every
+/// watch repeatedly.
+const PROBES_PER_SWEEP: usize = 8;
 
 impl Ledger {
     const CAPACITY: usize = 1024;
@@ -100,6 +117,7 @@ impl Ledger {
     fn new() -> Self {
         Self {
             watches: std::collections::HashMap::new(),
+            probe_order: std::collections::VecDeque::new(),
             sweep: 0,
         }
     }
@@ -124,6 +142,7 @@ impl Ledger {
                 closing_sweep: self.sweep.saturating_add(1),
             },
         );
+        self.probe_order.push_back(key);
         true
     }
 
@@ -139,11 +158,31 @@ impl Ledger {
     fn begin_sweep(&mut self) -> Vec<(WatchKey, Watch)> {
         self.sweep = self.sweep.saturating_add(1);
         let sweep_now = self.sweep;
-        self.watches
-            .iter()
-            .filter(|(_, w)| w.closing_sweep < sweep_now)
-            .map(|(k, w)| (*k, *w))
-            .collect()
+        if self.probe_order.is_empty() {
+            return Vec::new();
+        }
+
+        let mut due = Vec::with_capacity(PROBES_PER_SWEEP.min(self.probe_order.len()));
+        // Inspect at most the population that existed when this sweep began.
+        // Retired keys can remain queued until their next turn; finding one
+        // absent drops it instead of re-queueing it.
+        let population = self.probe_order.len();
+        for _ in 0..population {
+            let Some(key) = self.probe_order.pop_front() else {
+                break;
+            };
+            let Some(&watch) = self.watches.get(&key) else {
+                continue;
+            };
+            self.probe_order.push_back(key);
+            if watch.closing_sweep < sweep_now {
+                due.push((key, watch));
+                if due.len() == PROBES_PER_SWEEP {
+                    break;
+                }
+            }
+        }
+        due
     }
 
     /// The level line, or `None` when nothing is watched. Takes `now` rather
@@ -496,11 +535,13 @@ fn note_ended_detail(task_id: u32, ref_: u32, miss: ListMiss, age_us: u64) {
     ));
 }
 
-/// Re-read every watched slot that was recorded before this sweep.
+/// Re-read a bounded round-robin slice of watched slots recorded before this sweep.
 ///
 /// Runs at the tail of a drain tranche, with the same `state` and host the
-/// lookup used. Returns early with the lock untouched when nothing is watched,
-/// which is every tranche on every rail that does not produce the miss.
+/// lookup used. [`PROBES_PER_SWEEP`] bounds guest page-table work regardless of
+/// how many stale diagnostic watches accumulated. The ledger never drops a live
+/// watch for being over budget; rotating order makes every one eventually due.
+/// Returns immediately when nothing is watched.
 pub fn sweep<M: HostMemory>(state: &DeviceState, host: &M) {
     let due = ledger()
         .lock()
@@ -656,6 +697,34 @@ mod tests {
         // And it stays due until something retires it — a slot the guest never
         // publishes must keep being asked until the task dies.
         assert_eq!(ledger.begin_sweep().len(), 1);
+    }
+
+    /// A large diagnostic backlog is bounded without starving its tail.
+    #[test]
+    fn sweep_budget_rotates_through_every_watch() {
+        let mut ledger = Ledger::new();
+        let count = PROBES_PER_SWEEP * 3 + 1;
+        for ref_ in 0..count as u32 {
+            assert!(ledger.admit((1, ref_), 0));
+        }
+
+        // Close the admission tranche first. No watch may be sampled yet.
+        assert!(ledger.begin_sweep().is_empty());
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..4 {
+            let batch = ledger.begin_sweep();
+            assert!(
+                batch.len() <= PROBES_PER_SWEEP,
+                "one tranche exceeded the diagnostic probe budget"
+            );
+            seen.extend(batch.into_iter().map(|(key, _)| key));
+        }
+        assert_eq!(
+            seen.len(),
+            count,
+            "round-robin budgeting must eventually sample the tail"
+        );
     }
 
     /// A miss recorded by a *later* tranche must not be answered by the sweep
