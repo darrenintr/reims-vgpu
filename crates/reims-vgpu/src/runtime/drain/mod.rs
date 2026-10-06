@@ -4783,10 +4783,18 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         let _phase = present_phase(PresentPhase::RescueChildFirst);
         drain_other_child_fifos(state, host, skip);
     }
-    {
-        let _phase = present_phase(PresentPhase::RescueChildSecond);
-        drain_other_child_fifos(state, host, skip);
-    }
+    // This used to run a second child rescue immediately after the first.
+    // The pair came from the archive's "before and after wait_surface" shape,
+    // but there is no wait_surface (or any other guest-producing boundary)
+    // between them on this path any more. Running the same all-child sweep
+    // twice back-to-back therefore only consumes work that arrived while the
+    // first sweep itself was executing. Under iOS Simulator that turned one
+    // present into multi-second synchronous work (measured 1.385 s + 0.693 s)
+    // and starved the host window. Newly rung channels are already folded by
+    // the outer drain/refill machinery; root work below still performs its
+    // dedicated child-after-main rescue when it can actually create new child
+    // work. Keep the first rescue as the ordering/Dekker barrier and remove
+    // the boundary-less duplicate.
     // Main-ring Dekker only (not full drain_stranded): guest may
     // publish root control work while child drains ran. Full
     // drain_stranded re-enters this child channel and wedged iBoot
