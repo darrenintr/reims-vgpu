@@ -233,7 +233,7 @@ pub(super) fn mapper_ref_texture_destination<M: HostMemory + HostOps>(
     // plane-correct for a ref-texture view and already a sub-rectangle where the
     // dispatch writes one, and it is the same window the readback rail lands
     // through — so the two rails cannot name different bytes of one surface.
-    match crate::runtime::mapping_write::vulkan::licence_mapper_ref_texture_surface(
+    match crate::runtime::mapping_write::vulkan::licence_mapper_ref_texture_surface_selective_heap(
         state,
         host,
         held,

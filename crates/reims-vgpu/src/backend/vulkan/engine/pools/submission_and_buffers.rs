@@ -255,6 +255,38 @@ impl ResourcePools {
         unsafe { self.host_ram_imports.bind(ctx, guest_ref) }
     }
 
+    /// Admit every unique guest-RAM parent an operation needs before it
+    /// records any GPU work.
+    ///
+    /// The budget check runs over the complete set first, so the common refusal
+    /// mutates nothing. Driver-specific import failures can arrive only while
+    /// warming the admitted parents; already-created parents remain reusable,
+    /// but the caller still falls back before recording its copy.
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must own every Vulkan import in this pool.
+    pub(crate) unsafe fn prepare_guest_ram_refs<'a>(
+        &mut self,
+        ctx: &DeviceContext,
+        refs: impl IntoIterator<Item = &'a crate::runtime::guest_ram::GuestRef>,
+    ) -> Result<(), host_ram::HostRamDecline> {
+        let refs: Vec<_> = refs.into_iter().collect();
+        self.host_ram_imports
+            .preflight_refs(refs.iter().copied())?;
+
+        let mut seen = std::collections::HashSet::new();
+        for guest_ref in refs {
+            let import = guest_ref.import();
+            if seen.insert(import.id()) {
+                unsafe {
+                    self.host_ram_imports.warm(ctx, import)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Import a RAMBlock ahead of any reference into it.
     ///
     /// # Safety

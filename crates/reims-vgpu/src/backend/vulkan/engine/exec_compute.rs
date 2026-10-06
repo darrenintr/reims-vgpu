@@ -799,9 +799,41 @@ pub(crate) unsafe fn execute_compute_inner(
                 pools.acquire_readback_extra(ctx, resource.bytes.len() as u64, counters)?,
             ),
             super::types::ComputeImageDestination::GuestPages { target, .. } => {
-                ComputeImageDst::Direct(unsafe {
-                    super::plan_guest_copy(ctx, pools, counters, target)?
-                })
+                match unsafe {
+                    pools.prepare_guest_ram_refs(
+                        ctx,
+                        target.runs.iter().map(|run| &run.guest),
+                    )
+                } {
+                    Ok(()) => ComputeImageDst::Direct(unsafe {
+                        super::plan_guest_copy(ctx, pools, counters, target)?
+                    }),
+                    Err(decline) => {
+                        // The runtime deliberately offered a selective target on
+                        // a whole-guest heap refusal. It is direct only when the
+                        // complete set fits and every required parent imports
+                        // before any copy resource is acquired; otherwise this
+                        // storage output stays on the exact readback arm it
+                        // would have taken before the selective candidate existed.
+                        crate::runtime::drain::note_store_route(
+                            "compute_direct_preflight_fallback",
+                        );
+                        if crate::observe::first_sight(
+                            "compute_direct_preflight_fallback",
+                            u64::from(resource.binding),
+                        ) {
+                            crate::observe::off(format!(
+                                "compute_direct_preflight_fallback bind={} dims={}x{} reason={decline:?}",
+                                resource.binding, resource.width, resource.height
+                            ));
+                        }
+                        ComputeImageDst::Readback(pools.acquire_readback_extra(
+                            ctx,
+                            resource.bytes.len() as u64,
+                            counters,
+                        )?)
+                    }
+                }
             }
         };
         simg_slots.push(PreparedStorageImage {

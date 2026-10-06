@@ -29,7 +29,7 @@
 //! in [`crate::runtime::guest_ram`]'s module doc and is not repeated as a
 //! guarantee here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ash::vk;
 
@@ -94,6 +94,16 @@ pub enum HostRamDecline {
     /// The guest ended this parent allocation's lifetime. Old child objects
     /// may finish retiring, but no new view may resurrect its import identity.
     Retired { import_id: u64 },
+    /// The complete operation's not-yet-imported parents would put the live
+    /// host-pointer set past the backend's published heap budget.
+    ///
+    /// This is a routing answer, not a cached property of one pointer: another
+    /// guest allocation may retire later and make the same candidate fit.
+    BudgetFull {
+        live: u64,
+        incoming: u64,
+        budget: u64,
+    },
     /// No memory type could be named for the pointer. Carries which of the two
     /// checks refused — see [`ImportTypeRefusal`], whose doc says why they are
     /// not one finding.
@@ -138,6 +148,7 @@ impl Decline for HostRamDecline {
         match self {
             Self::Unsupported { .. } => "host_ram_import_unsupported",
             Self::Retired { .. } => "host_ram_import_retired",
+            Self::BudgetFull { .. } => "host_ram_import_budget_full",
             Self::NoImportableMemoryType { .. } => "host_ram_import_no_importable_memory_type",
             Self::BufferExcludesMemoryType { .. } => "host_ram_import_buffer_excludes_memory_type",
             Self::CreateBuffer { .. } => "host_ram_import_create_buffer",
@@ -154,6 +165,15 @@ impl Decline for HostRamDecline {
         match self {
             Self::Unsupported { rung } => vec![("rung", rung.slug().to_string())],
             Self::Retired { import_id } => vec![("import_id", import_id.to_string())],
+            Self::BudgetFull {
+                live,
+                incoming,
+                budget,
+            } => vec![
+                ("live_mb", (live >> 20).to_string()),
+                ("incoming_mb", (incoming >> 20).to_string()),
+                ("budget_mb", (budget >> 20).to_string()),
+            ],
             Self::NoImportableMemoryType { host_base, refusal } => {
                 let mut fields = vec![("host_base", format!("{host_base:#x}"))];
                 match refusal {
@@ -254,6 +274,49 @@ impl HostRamImports {
     fn remove_live(&mut self, key: u64) -> Option<ImportedHostRam> {
         self.kinds.remove(&key);
         self.live.remove(&key).map(|entry| entry.allocation)
+    }
+
+    /// Check whether every unique parent named by `refs` can be present at
+    /// once, without importing anything.
+    ///
+    /// This is the admission half of the compute selective path. It is pure:
+    /// no Vulkan object is created and no cache state changes. A successful
+    /// answer therefore lets the following binds run without a budget refusal
+    /// under the engine lock; a failed answer lets the caller choose readback
+    /// before acquiring scratch or descriptor resources.
+    pub(crate) fn preflight_refs<'a>(
+        &self,
+        refs: impl IntoIterator<Item = &'a GuestRef>,
+    ) -> Result<(), HostRamDecline> {
+        let live = self.imported_bytes();
+        let mut incoming = 0u64;
+        let mut seen = HashSet::new();
+
+        for guest_ref in refs {
+            let import = guest_ref.import();
+            let key = import.id().get();
+            if import.is_retired() {
+                return Err(HostRamDecline::Retired { import_id: key });
+            }
+            if self.live.contains_key(&key) || !seen.insert(key) {
+                continue;
+            }
+            if let Some(decline) = self.declined.get(&key) {
+                return Err(*decline);
+            }
+            incoming = incoming.saturating_add(import.len());
+        }
+
+        if let Some(budget) = crate::runtime::guest_ram::import_budget() {
+            if live.saturating_add(incoming) > budget {
+                return Err(HostRamDecline::BudgetFull {
+                    live,
+                    incoming,
+                    budget,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Resolve `guest_ref` to a bindable range, importing its RAMBlock if this
@@ -397,6 +460,17 @@ impl HostRamImports {
         }
         if let Some(decline) = self.declined.get(&key) {
             return Err(*decline);
+        }
+        if let Some(budget) = crate::runtime::guest_ram::import_budget() {
+            let live = self.imported_bytes();
+            let incoming = import.len();
+            if live.saturating_add(incoming) > budget {
+                return Err(HostRamDecline::BudgetFull {
+                    live,
+                    incoming,
+                    budget,
+                });
+            }
         }
         let made = match unsafe { import_ramblock(ctx, import) } {
             Ok(made) => made,
@@ -733,6 +807,11 @@ mod tests {
                 rung: HostPointerImport::Unqueried,
             },
             HostRamDecline::Retired { import_id: 1 },
+            HostRamDecline::BudgetFull {
+                live: 1 << 30,
+                incoming: 1 << 20,
+                budget: 1 << 30,
+            },
             HostRamDecline::NoImportableMemoryType {
                 host_base: 0,
                 refusal: ImportTypeRefusal::NoTypeMeetsRequest {
