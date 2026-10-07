@@ -1546,22 +1546,9 @@ impl ResourcePools {
             wait_started,
         );
         waited.map_err(|e| {
-            // The wait that every macos-11 freeze lands in. Until now the
-            // failure said only that *a* wait timed out; this names the
-            // submission it timed out on, which is the question two
-            // sessions of switch-bisecting could not reach. Emitted before
-            // the error is mapped, because `wait_error` may turn it into a
-            // device loss and the teardown that follows clears the ring.
-            let held = match crate::runtime::gpu_hang_trail::submission(index) {
-                Some(note) => format!("{note}"),
-                None => "none (this slot's work was never recorded)".to_string(),
-            };
             crate::observe::fail(format!(
-                "vk_engine_fence_wedged slot={index} result={e:?} held={held}"
+                "vk_engine_fence_wedged slot={index} result={e:?}"
             ));
-            if let Some(rest) = crate::runtime::gpu_hang_trail::outstanding() {
-                crate::observe::fail(format!("vk_engine_fence_wedged_queue {rest}"));
-            }
             Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesRetire)
         })?;
         ctx.device
@@ -1577,9 +1564,6 @@ impl ResourcePools {
         unsafe { self.readback_span_read(ctx, index) };
         let pending = self.slots[index].pending.take().expect("checked above");
         self.in_flight = self.in_flight.saturating_sub(1);
-        // Its fence has signalled, so this submission is no longer a candidate
-        // for a wedge. Paired with the `note_submit` in `finish_entry_async`.
-        crate::runtime::gpu_hang_trail::note_retired(index);
         self.drain_cleanup(&ctx.device, pending);
         self.release_graveyard(&ctx.device, 1 << index);
         Ok(())
@@ -1769,11 +1753,6 @@ impl ResourcePools {
         );
         self.slots[self.cur].pending = Some(cleanup);
         self.in_flight += 1;
-        // The submission is now outstanding, and this is the one point both
-        // submit paths reach — a batch flush and a lone draw's own submit. The
-        // trail's per-slot record is cleared again in `retire_slot`, so a slot
-        // holding one is a submission whose fence has not signalled.
-        crate::runtime::gpu_hang_trail::note_submit(self.cur);
         self.admit_recorded_sampled(device, admissions);
     }
 
