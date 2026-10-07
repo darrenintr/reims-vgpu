@@ -914,7 +914,6 @@ pub(crate) unsafe fn execute_compute_inner(
         pools.begin_slot_recording(
             ctx,
             cb,
-            super::gpu_span::Kind::Compute,
             VkOp::ComputeExecResetCb,
             VkOp::ComputeExecBeginCb,
         )?
