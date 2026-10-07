@@ -588,8 +588,7 @@ impl TickScale {
 /// retires a slot before reusing it — see [`super::gpu_span::SlotSpan`].
 pub(crate) struct DrawSpanProbe {
     pub pool: vk::QueryPool,
-    /// How a raw tick difference becomes nanoseconds. See [`TickScale`], which
-    /// [`TimestampProbe`] shares so the mask cannot be omitted from one of them.
+    /// How a raw tick difference becomes nanoseconds. See [`TickScale`].
     pub scale: TickScale,
 }
 
@@ -2559,11 +2558,8 @@ mod draw_span_probe_tests {
         );
     }
 
-    /// A queue family that writes no timestamps yields no scale, so neither
-    /// probe is built and the census reports zero rather than a wrong number.
-    /// One constructor is what stops a mask being derived beside a period it
-    /// does not belong to — which is how the readback probe came to have a
-    /// period and no mask at all.
+    /// A queue family that writes no timestamps yields no scale, so the draw
+    /// span probe is not built. The period and valid-bit mask stay one answer.
     #[test]
     fn a_queue_family_without_timestamps_yields_no_scale() {
         assert!(TickScale::resolve(0, 1.0).is_none());
