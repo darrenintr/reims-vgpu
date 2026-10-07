@@ -3,8 +3,6 @@
 //! Drain FIFOs, parse wire (using [`crate::contract`]), resolve memory, plan
 //! ops, update [`crate::model`] state. No GPU API calls here.
 
-/// The split of [`chain_phase`]'s largest column, `binds_us`.
-pub mod bind_phase;
 /// Product-path blit fill/copy execution against guest GVA.
 pub mod blit_exec;
 /// Draw-time buffer binds, resolved once per reference and held until the
@@ -20,7 +18,6 @@ pub mod buffer_write_gen;
 pub mod census;
 /// Where a draw chain's wall clock goes on the runtime side of the engine
 /// boundary, which is 82% of it.
-pub mod chain_phase;
 /// The byte runs in which a newly rendered row differs from the guest's.
 pub mod changed_runs;
 /// Product-path compute bind/dispatch (pipeline + buffers + direct dispatch).
@@ -118,8 +115,6 @@ pub mod render_writeback;
 pub mod resident_target;
 /// The guest's per-resource validity quad, from both of its producers.
 pub mod resource_validity;
-/// The split of [`chain_phase`]'s largest *undivided* column, `sampled_us`.
-pub mod sampled_phase;
 /// Guest surface → host BGRA8 for the QEMU console.
 pub mod scanout;
 /// SPIR-V set-0 binding relocation for metal2vulkan + internal Vulkan engine (Linux).
