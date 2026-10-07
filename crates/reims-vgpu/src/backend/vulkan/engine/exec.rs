@@ -4278,7 +4278,6 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.begin_slot_recording(
                 ctx,
                 cb,
-                super::gpu_span::Kind::Draw,
                 VkOp::ExecResetCb,
                 VkOp::ExecBeginCb,
             )?
