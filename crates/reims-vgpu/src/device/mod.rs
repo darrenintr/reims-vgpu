@@ -590,40 +590,7 @@ pub fn device_drain(id: u64) -> bool {
         drain_ns,
         publish_started.elapsed().as_micros() as u64,
     );
-    // Everything from here to the return is `gap_post_us`: the per-tranche
-    // sweeps below run on the worker's own wall clock and are outside both
-    // `drain_us` and `publish_us`, so `duty` cannot see them.
     let busy_end_us = crate::observe::elapsed_us();
-    use crate::runtime::drain::{post_sweep, PostSweep};
-    // Same one-second cadence, so the cache trend lines up row-for-row with
-    // `store_routes` and `drain_duty`. Measure-only; see `note_cache_levels`.
-    post_sweep(PostSweep::CacheLevels, || {
-        crate::runtime::surface_cache::note_cache_levels(&device.state, &host)
-    });
-    // The ordering plane's own residue, on the same one-second cadence as the
-    // levels above and for the reason `backing_outstanding_census` is emitted
-    // beside `store_routes`: the routes count what *happened* to a pipeline and
-    // a pipeline that was declared and never advanced is counted once and never
-    // again, so a table accumulating builds nobody is running reads exactly like
-    // a healthy one. `pending` is the pipelines a transaction can be waiting on.
-    post_sweep(PostSweep::PipelineTable, || {
-        if let Some(line) = device.state.pipeline_occupancy_census() {
-            crate::observe::off(line);
-        }
-    });
-    // Beside it and on the same cadence: a page the guest released is judged
-    // against the write census, which only moves when this device writes. Also
-    // returns immediately when nothing is watched.
-    post_sweep(PostSweep::ReleasedPages, || {
-        crate::runtime::released_pages::sweep(&mut device.state);
-        crate::runtime::released_pages::note_levels(&device.state);
-    });
-    // The bind registry's own levels, on that same cadence and read against the
-    // `bb_retire_*` routes: what the retirements dropped, and what the survivors
-    // look like.
-    post_sweep(PostSweep::BindLevels, || {
-        crate::runtime::bound_buffers::note_registry_levels(&device.state)
-    });
     // The present-completion ack, re-homed off the QEMU paint — ONLY while the
     // host window is the display. With the window live no per-present
     // `ScanoutUpdate` is enqueued, so `display_surface::device_scanout_copy` —
