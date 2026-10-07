@@ -1783,6 +1783,19 @@ pub enum ComputeSampledSource {
     /// copy". A Metal kernel reaches it by declaring
     /// `texture2d_ms<T, access::read>` and calling `read(coord, sample)`.
     MultisampleTarget(TargetIdentity),
+    /// A device-local copy from a retained single-sample render target into a
+    /// pooled transient.
+    ///
+    /// The render rail's counterpart of [`Self::ResidentCopy`]. A window a draw
+    /// rendered and stored is in two places on the copying rail — the target
+    /// and the guest pages the Store wrote — and a kernel sampling it used to
+    /// read the pages back, which on the iOS Simulator is 15 MB a frame of
+    /// bytes the GPU had already produced. The runtime names this source only
+    /// when the target's content is ready and nothing has written the pages
+    /// since; the engine re-checks the shape and refuses by name.
+    ///
+    /// Single-level only, for the reason [`Self::ResidentCopy`] gives.
+    TargetCopy(TargetIdentity),
 }
 
 /// Pixel formats the product compute path maps, re-exported from the rail that

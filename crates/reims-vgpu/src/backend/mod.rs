@@ -998,6 +998,23 @@ pub(crate) trait Backend: Copy {
         None
     }
 
+    /// Whether a retained render target holds this sampled whole-surface
+    /// window, so the guest read that would stage it is unnecessary.
+    ///
+    /// Asked only after [`Self::resident_serve`] declined, and only for a
+    /// sampled binding: a compute resident is the more specific answer, and a
+    /// storage binding's seed is the kernel's own output. The rail answers
+    /// [`ResidentServe::Target`] or `None`; a rail that retains no render
+    /// targets keeps this default and every such binding reads the guest.
+    fn render_target_serve<M: HostMemory + HostOps>(
+        &self,
+        _state: &DeviceState,
+        _host: &M,
+        _window: &crate::runtime::compute_exec::SampledSurfaceWindow,
+    ) -> Option<ResidentServe> {
+        None
+    }
+
     /// Move the resident a writeback debt was armed against into one
     /// mapper-ref-texture mapping's guest pages, and release this rail's hold on
     /// that resident.
@@ -1837,6 +1854,20 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.resident_serve(key, mirror_generation, is_storage, pixel_format),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.resident_serve(key, mirror_generation, is_storage, pixel_format),
+        }
+    }
+
+    fn render_target_serve<M: HostMemory + HostOps>(
+        &self,
+        state: &DeviceState,
+        host: &M,
+        window: &crate::runtime::compute_exec::SampledSurfaceWindow,
+    ) -> Option<ResidentServe> {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.render_target_serve(state, host, window),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.render_target_serve(state, host, window),
         }
     }
 

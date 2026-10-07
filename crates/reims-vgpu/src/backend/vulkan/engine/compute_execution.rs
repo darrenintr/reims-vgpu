@@ -134,6 +134,32 @@ pub enum ComputeExecutionDecline {
         resource_width: u32,
         resource_height: u32,
     },
+    /// A sampled binding was told a single-sample render target holds its
+    /// window, and no retained target answers to that identity any more.
+    ///
+    /// The runtime asked the registry the same question while staging, so this
+    /// is the target being reclaimed between that answer and the dispatch.
+    /// `prior` separates that from a target that was never created.
+    TargetSampleAbsent {
+        binding: u32,
+        identity: TargetIdentity,
+        prior: Option<ResidentReclaim>,
+    },
+    /// The render target answers to the identity but is not a byte-identical
+    /// source for the copy: nothing is rendered into it yet, it is
+    /// multisampled, or its extent or format is not the binding's.
+    TargetSampleUnusable {
+        binding: u32,
+        identity: TargetIdentity,
+        content_ready: bool,
+        resident_samples: u32,
+        resident_width: u32,
+        resident_height: u32,
+        resident_format: ash::vk::Format,
+        resource_width: u32,
+        resource_height: u32,
+        resource_format: StorageImageFormat,
+    },
 }
 
 impl Decline for ComputeExecutionDecline {
@@ -167,6 +193,8 @@ impl Decline for ComputeExecutionDecline {
             }
             Self::MultisampleSampleAbsent { .. } => "vk_compute_exec_multisample_sample_absent",
             Self::MultisampleSampleUnusable { .. } => "vk_compute_exec_multisample_sample_unusable",
+            Self::TargetSampleAbsent { .. } => "vk_compute_exec_target_sample_absent",
+            Self::TargetSampleUnusable { .. } => "vk_compute_exec_target_sample_unusable",
         }
     }
 
@@ -334,6 +362,45 @@ impl Decline for ComputeExecutionDecline {
                 ]);
                 fields
             }
+            Self::TargetSampleAbsent {
+                binding,
+                identity,
+                prior,
+            } => {
+                let mut fields = vec![("binding", binding.to_string())];
+                fields.extend(super::draw_execution::identity_fields(identity));
+                fields.push((
+                    "prior",
+                    prior.map_or_else(|| "none".to_string(), |p| p.slug().to_string()),
+                ));
+                fields
+            }
+            Self::TargetSampleUnusable {
+                binding,
+                identity,
+                content_ready,
+                resident_samples,
+                resident_width,
+                resident_height,
+                resident_format,
+                resource_width,
+                resource_height,
+                resource_format,
+            } => {
+                let mut fields = vec![("binding", binding.to_string())];
+                fields.extend(super::draw_execution::identity_fields(identity));
+                fields.extend([
+                    ("content_ready", u8::from(*content_ready).to_string()),
+                    ("resident_samples", resident_samples.to_string()),
+                    ("resident_width", resident_width.to_string()),
+                    ("resident_height", resident_height.to_string()),
+                    ("resident_format", format!("{resident_format:?}")),
+                    ("resource_width", resource_width.to_string()),
+                    ("resource_height", resource_height.to_string()),
+                    ("resource_format", format!("{resource_format:?}")),
+                ]);
+                fields
+            }
         }
     }
 }
@@ -476,6 +543,23 @@ mod tests {
                 resource_width: 8,
                 resource_height: 8,
             },
+            ComputeExecutionDecline::TargetSampleAbsent {
+                binding: 36,
+                identity: target_identity(),
+                prior: None,
+            },
+            ComputeExecutionDecline::TargetSampleUnusable {
+                binding: 36,
+                identity: target_identity(),
+                content_ready: false,
+                resident_samples: 1,
+                resident_width: 8,
+                resident_height: 8,
+                resident_format: ash::vk::Format::B8G8R8A8_UNORM,
+                resource_width: 8,
+                resource_height: 8,
+                resource_format: StorageImageFormat::Bgra8Unorm,
+            },
         ]
     }
 
@@ -512,7 +596,11 @@ mod tests {
         // never the enum's own size; they are here so that it is. The other two
         // are the multisample pair: a `texture2d_ms` binding whose retained
         // target is gone, and one whose target cannot serve it.
-        assert_eq!(before, 12, "the compute executor's reason census moved");
+        //
+        // 14 with the single-sample pair beside it: a sampled binding copied
+        // from a render target whose target is gone, and one whose target is
+        // not a byte-identical source.
+        assert_eq!(before, 14, "the compute executor's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate compute-execution slug");
     }
 
