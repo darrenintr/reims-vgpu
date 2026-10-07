@@ -48,9 +48,6 @@ pub mod fence_exec;
 pub mod gather_witness;
 /// Guest-physical control-plane writes via HostOps map_pages.
 pub mod gpa_map;
-/// The last few pieces of work handed to the GPU, so a host GPU hang can name
-/// what it was running instead of only that a fence stopped signalling.
-pub mod gpu_hang_trail;
 /// The bound on every GPU reference to guest RAM — one import per RAMBlock,
 /// and the only type that can name a byte inside one.
 ///
