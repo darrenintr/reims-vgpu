@@ -3167,7 +3167,6 @@ unsafe fn copy_image_level0_to_host_delivered(
             pools.begin_slot_recording(
                 ctx,
                 cb,
-                gpu_span::Kind::Readback,
                 ops.reset_cb,
                 ops.begin_cb,
             )?
@@ -4089,7 +4088,6 @@ pub fn overlay_guest_bytes_onto_resident(
                 pools.begin_slot_recording(
                     ctx,
                     pair.0,
-                    gpu_span::Kind::Draw,
                     VkOp::ResidentOverlayResetCb,
                     VkOp::ResidentOverlayBeginCb,
                 )?;
@@ -5219,7 +5217,6 @@ unsafe fn copy_image_level0_to_buffer(
             pools.begin_slot_recording(
                 ctx,
                 cb,
-                gpu_span::Kind::Store,
                 VkOp::GuestWriteResetCb,
                 VkOp::GuestWriteBeginCb,
             )?
