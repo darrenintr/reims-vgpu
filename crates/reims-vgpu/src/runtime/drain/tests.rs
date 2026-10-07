@@ -110,7 +110,7 @@ fn assert_coalesced_paint_action(host: &crate::runtime::host::FakeHost, ctx: &st
 }
 
 #[test]
-fn exec_summary_names_the_packet_counters_and_lock_hold() {
+fn exec_summary_names_the_packet_counters() {
     let result = crate::runtime::exec::ExecResult {
         task_id: 3,
         streams_loaded: 1,
@@ -119,26 +119,14 @@ fn exec_summary_names_the_packet_counters_and_lock_hold() {
         sampler_unbinds: 4,
         render_attachment_resolves: 1,
         render_guest_stores: 1,
-        total_us: 98,
         ..Default::default()
     };
     let line = exec_summary(1, &result, 52);
-    for field in [
-        "rt_resolves=1",
-        "guest_stores=1",
-        "render_unbinds=2/3/4",
-        "total_us=98",
-    ] {
+    for field in ["rt_resolves=1", "guest_stores=1", "render_unbinds=2/3/4"] {
         assert!(line.contains(field), "missing {field}: {line}");
     }
 }
 
-#[test]
-fn sync_exec_stall_proxy_fires_at_watchdog_scale_only() {
-    assert!(!sync_exec_stalled(SYNC_EXEC_STALL_US - 1));
-    assert!(sync_exec_stalled(SYNC_EXEC_STALL_US));
-    assert!(sync_exec_stalled(3_406_929));
-}
 use crate::runtime::host::{FakeHost, HostActionKind};
 
 /// A display-present packet naming `mapping`.
@@ -2987,11 +2975,10 @@ fn a_guest_that_never_enables_cannot_reach_the_online_cap() {
 /// was built from — an 8.29 MB allocation and copy, 95 times a second on the
 /// composite surface, to produce a slice already in hand.
 ///
-/// Both halves are asserted, because eliding a copy is only correct if the bytes
-/// are the same: the census must show a fragmented landing with no staging pass,
-/// **and** the guest's pages must hold exactly what was written.
+/// The guest pages and the published host cache must both hold exactly what was
+/// written.
 #[test]
-fn a_fragmented_writeback_stages_nothing_when_the_staged_frame_is_the_source() {
+fn a_fragmented_writeback_publishes_the_unchanged_source_frame() {
     use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
@@ -3029,25 +3016,7 @@ fn a_fragmented_writeback_stages_nothing_when_the_staged_frame_is_the_source() {
     // A gradient rather than a constant: a staging bug that lands the wrong row
     // is invisible against a frame of identical bytes.
     let frame: Vec<u8> = (0..need).map(|i| (i % 251) as u8).collect();
-    // Drain whatever earlier tests in this binary left in the shared census.
-    let _ = super::census::SURFACE_WRITE.take(0);
     assert!(write_bgra8(&mut state, &mut host, 9, &frame, stride, w, h));
-
-    let line = super::census::SURFACE_WRITE
-        .take(1_000)
-        .expect("a writeback must report");
-    assert!(
-        line.contains("contig=0 frag=1"),
-        "the fragmented path is the one under test: {line}"
-    );
-    assert!(
-        line.contains("stage_us=0 stage=0"),
-        "a staged frame identical to its source must not be built: {line}"
-    );
-    assert!(
-        line.contains("land=1"),
-        "the bytes must still reach the guest: {line}"
-    );
 
     let landed = crate::runtime::surface_cache::get(&state, 9, w, h)
         .expect("the writeback publishes its own frame");

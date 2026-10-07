@@ -376,11 +376,6 @@ pub fn read_published_rgba8(key: &ResidentColorKey, content_gen: u64) -> Option<
     let stride = (key.width as usize).checked_mul(RGBA8_BPP as usize)?;
     let need = stride.checked_mul(key.height as usize)?;
     let texture = borrow_published(key, content_gen)?;
-    // Priced, because `getBytes:` on a tiled texture is not a memcpy — it
-    // linearizes — and this readback replaced a `copy_from_slice` of a host
-    // `Vec` for two callers that run about once a frame each. A rail that spends
-    // more here than the host copy it removed has to be able to say so.
-    let _span = crate::runtime::chain_phase::CostSpan::new("metal_resident_read_us");
     let mut rgba = vec![0u8; need];
     // SAFETY: every render into a resident colour target completes before its
     // Store publishes it (`render_core_mrt` waits), and `borrow_published`

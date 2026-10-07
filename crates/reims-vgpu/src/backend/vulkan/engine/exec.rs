@@ -676,11 +676,8 @@ unsafe fn stage_buffer_content(
     let mut gather_owed = false;
     let bound = match content {
         BufferContent::Bytes(b) => {
-            let slot = {
-                pools.acquire_staging(ctx, b.len() as u64, counters)?
-            };
+            let slot = { pools.acquire_staging(ctx, b.len() as u64, counters)? };
             pools.write_staging(ctx, &slot, b)?;
-            drop(_s);
             BoundBuffer::from(slot)
         }
         BufferContent::GuestRuns(src) => {
@@ -725,9 +722,7 @@ unsafe fn stage_buffer_content(
                 // CPU gathers the runs into the mapped staging span, with no
                 // intermediate `cpu_bytes()` heap Vec (this is the
                 // deferred-submit hot path, ~4.8 binds/draw under compositing).
-                let slot = {
-                    pools.acquire_staging(ctx, src.total_len, counters)?
-                };
+                let slot = { pools.acquire_staging(ctx, src.total_len, counters)? };
                 pools.write_staging_from_runs(
                     ctx,
                     &slot,
@@ -735,7 +730,6 @@ unsafe fn stage_buffer_content(
                     src.source_offset,
                     src.total_len,
                 )?;
-                drop(_s);
                 if snapshot_volatile {
                     counters
                         .buffer_snapshot_binds
@@ -3430,11 +3424,8 @@ pub(crate) unsafe fn execute_draw_inner(
                 shifted[prefix..].copy_from_slice(bytes);
                 shifted
             };
-            let slot = {
-                pools.acquire_staging(ctx, shifted.len() as u64, counters)?
-            };
+            let slot = { pools.acquire_staging(ctx, shifted.len() as u64, counters)? };
             pools.write_staging(ctx, &slot, &shifted)?;
-            drop(_s);
             BoundBuffer::from(slot)
         } else {
             stage_buffer_content(
@@ -3539,18 +3530,14 @@ pub(crate) unsafe fn execute_draw_inner(
                 },
             ));
         }
-        let slot = {
-            pools.acquire_staging(ctx, wide.len() as u64, counters)?
-        };
+        let slot = { pools.acquire_staging(ctx, wide.len() as u64, counters)? };
         {
             pools.write_staging(ctx, &slot, &wide)?;
         }
         counters.note_seed_upload(wide.len() as u64);
         Some(slot)
     } else if let Some(rgba8) = seed_bytes {
-        let slot = {
-            pools.acquire_staging(ctx, rgba8.len() as u64, counters)?
-        };
+        let slot = { pools.acquire_staging(ctx, rgba8.len() as u64, counters)? };
         // Vulkan buffer→image copies do not perform format conversion, so the
         // staged bytes must already be in the attachment's physical order —
         // otherwise partial draws preserve an exact R/B-exchanged seed outside
@@ -3798,9 +3785,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     Some(source)
                 }
                 None => {
-                    let slot = {
-                        pools.acquire_staging(ctx, seed.source.total_len, counters)?
-                    };
+                    let slot = { pools.acquire_staging(ctx, seed.source.total_len, counters)? };
                     {
                         pools.write_staging_from_runs(
                             ctx,
@@ -4274,14 +4259,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // A batch joiner's CB is already recording (opened by the batch opener);
     // its commands append after the previous draw's end_render_pass.
     if !joins {
-        unsafe {
-            pools.begin_slot_recording(
-                ctx,
-                cb,
-                VkOp::ExecResetCb,
-                VkOp::ExecBeginCb,
-            )?
-        };
+        unsafe { pools.begin_slot_recording(ctx, cb, VkOp::ExecResetCb, VkOp::ExecBeginCb)? };
     }
     // What this draw records that a render pass instance cannot contain, on the
     // two ladders [`PassObstacles`] keeps.
@@ -5523,10 +5501,6 @@ pub(crate) unsafe fn execute_draw_inner(
     // pools.batch_flush (next begin_entry / retire / explicit flush).
     let defer_submit = batch_eligible;
     if !defer_submit {
-        // Last command before the CB ends, so the stamp bounds every draw and
-        // copy this submission recorded. A deferred draw is sealed by
-        // `batch_flush` instead, on the same slot.
-        unsafe { pools.gpu_span_seal_current(ctx, cb) };
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecEndCb, e)))?;

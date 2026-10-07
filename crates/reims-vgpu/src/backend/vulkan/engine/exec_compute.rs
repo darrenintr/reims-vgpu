@@ -911,12 +911,7 @@ pub(crate) unsafe fn execute_compute_inner(
     // The ring slot's CB retired at begin_entry and its fence is unsignaled —
     // no pre-record wait remains (pre_record_wait_us stays 0 on this path).
     unsafe {
-        pools.begin_slot_recording(
-            ctx,
-            cb,
-            VkOp::ComputeExecResetCb,
-            VkOp::ComputeExecBeginCb,
-        )?
+        pools.begin_slot_recording(ctx, cb, VkOp::ComputeExecResetCb, VkOp::ComputeExecBeginCb)?
     };
 
     // Seed sampled images (staging upload or resident device copy)
@@ -1385,7 +1380,6 @@ pub(crate) unsafe fn execute_compute_inner(
         );
     }
 
-    unsafe { pools.gpu_span_seal_current(ctx, cb) };
     ctx.device
         .end_command_buffer(cb)
         .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ComputeExecEndCb, e)))?;

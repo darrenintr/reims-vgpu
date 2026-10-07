@@ -63,13 +63,6 @@ struct QueuedGfxWrite {
     offset: u64,
     data: u64,
     size: u32,
-    /// When the vCPU published this write, or `None` when it was applied
-    /// straight through without ever entering the queue.
-    ///
-    /// The guest's store retires the moment this is pushed, so the guest cannot
-    /// see the delay; the age measured against this stamp is the only place the
-    /// deferral becomes visible. See [`crate::runtime::drain::DoorbellCensus`].
-    queued_at: Option<std::time::Instant>,
 }
 
 /// One live device. Registry lookup and MMIO ingress remain short even while

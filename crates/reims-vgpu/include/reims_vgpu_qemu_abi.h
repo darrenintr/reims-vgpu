@@ -344,6 +344,12 @@ typedef struct ReimsVgpuHostOps {
      * token, or 0 when this host cannot observe such writes at all. Callers
      * must read a 0 token as "assume written on every check".
      *
+     * track is called from the drain thread and only registers the set. A
+     * generation reads 0 until a harvest has run over it; that harvest is
+     * scheduled on the main loop by track and by every generation read that
+     * returns 0, and also runs at guest doorbell writes. The first region of a
+     * boot needs two (the first turns logging on).
+     *
      * untrack_guest_writes releases a token. guest_write_gen returns a
      * monotonic count of host observations that some page of the set was
      * written, or 0 for an unknown token; it is safe from any thread, while

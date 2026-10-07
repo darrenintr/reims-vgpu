@@ -204,19 +204,29 @@ pub struct AdmissionScope;
 pub struct PacketSpan;
 
 #[inline(always)]
-pub fn tranche_span(_cost: TrancheCost) -> TrancheSpan { TrancheSpan }
+pub fn tranche_span(_cost: TrancheCost) -> TrancheSpan {
+    TrancheSpan
+}
 
 #[inline(always)]
-pub fn present_phase(_phase: PresentPhase) -> TrancheSpan { TrancheSpan }
+pub fn present_phase(_phase: PresentPhase) -> TrancheSpan {
+    TrancheSpan
+}
 
 #[inline(always)]
-pub fn admission_scope(_opcode: u16, _channel: Option<u32>) -> AdmissionScope { AdmissionScope }
+pub fn admission_scope(_opcode: u16, _channel: Option<u32>) -> AdmissionScope {
+    AdmissionScope
+}
 
 #[inline(always)]
-pub fn present_scope(_channel: u32, _mapping: u32) -> TrancheSpan { TrancheSpan }
+pub fn present_scope(_channel: u32, _mapping: u32) -> TrancheSpan {
+    TrancheSpan
+}
 
 #[inline(always)]
-pub fn packet_span(_opcode: u16) -> PacketSpan { PacketSpan }
+pub fn packet_span(_opcode: u16) -> PacketSpan {
+    PacketSpan
+}
 
 #[inline(always)]
 pub fn note_tranche_cost(_cost: TrancheCost, _ns: u64) {}

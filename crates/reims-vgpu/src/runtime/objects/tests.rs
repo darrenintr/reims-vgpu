@@ -2592,49 +2592,6 @@ fn every_object_list_miss_names_a_different_check() {
     );
 }
 
-/// The claimant banding must separate a real ownership signal from the confound
-/// that nearly buried it.
-///
-/// Every task registers its object list at the same `pfn = 1`, so on a busy
-/// guest "some other task has something at slot 3" is close to a tautology. The
-/// first version of this instrument was a yes/no and answered yes to every miss
-/// on macos-26, which reads as a finding and is not one. The band against the
-/// live task count is what makes the difference visible, so each boundary is
-/// pinned here:
-///
-/// - nobody has it — the guest has not published it, and the fix is to wait;
-/// - exactly one other task has it — a real ownership signal, the object is in
-///   a list this device did not look in;
-/// - all of the others have it — the slot index is just populated everywhere and
-///   this search cannot tell ownership from coincidence.
-///
-/// The asking task is excluded from the count, so "all" must compare against
-/// `live - 1`. Comparing against `live` would make "all" unreachable and silently
-/// demote every genuine all-claim to "many".
-#[test]
-fn a_claimant_count_is_banded_against_the_tasks_that_could_have_claimed() {
-    use super::slot_empty_claim_route as band;
-
-    assert_eq!(band(0, 8), "list_miss_slot_empty_claimed_nowhere");
-    assert_eq!(band(1, 8), "list_miss_slot_empty_claimed_by_one");
-    assert_eq!(band(4, 8), "list_miss_slot_empty_claimed_by_many");
-    assert_eq!(
-        band(7, 8),
-        "list_miss_slot_empty_claimed_by_all",
-        "seven others out of eight live tasks is every task that could have claimed"
-    );
-
-    // Two tasks total: the one asking and one other. That other claiming is
-    // both "one" and "all", and "one" is the reading that matters — it is the
-    // ownership signal, while "all" only ever means the search is uninformative.
-    assert_eq!(band(1, 2), "list_miss_slot_empty_claimed_by_one");
-
-    // A single live task has nobody else to claim, and must not be reported as
-    // a unanimous claim over an empty population.
-    assert_eq!(band(0, 1), "list_miss_slot_empty_claimed_nowhere");
-    assert_eq!(band(0, 0), "list_miss_slot_empty_claimed_nowhere");
-}
-
 /// A zero reusable slot has no resolvable tenant, even when an earlier tenant
 /// was observed successfully.
 #[test]

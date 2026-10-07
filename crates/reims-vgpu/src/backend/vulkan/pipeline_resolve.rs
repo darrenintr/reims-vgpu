@@ -589,13 +589,6 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         pipeline_ref,
         PipelineState::Translating,
     );
-    // The same three sub-phases the call site used to open around this work,
-    // moved in with it. They are inert outside a live `ChainTimer`, so the two
-    // non-draw callers of the loaders below are unaffected — and on the draw
-    // rail `pl_desc_us` brackets the task registry lookup on a hit and this
-    // construction on a miss, so the lifecycle correction remains measurable.
-    use crate::runtime::chain_phase::{enter, Phase};
-    enter(Phase::PipelineMtlb);
     let v_mtlb = load_mtlb(
         state,
         host,
@@ -618,7 +611,6 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         task_id,
         function_ref: desc.fragment_func_ref,
     })?;
-    enter(Phase::PipelineAir);
     let v_air = crate::runtime::mtlb::extract_air(&v_mtlb).map_err(|reason| {
         DrawPreparationDecline::VertexAirExtract {
             function_ref: desc.vertex_func_ref,
@@ -631,7 +623,6 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
             reason,
         }
     })?;
-    enter(Phase::PipelineXlate);
     let vertex = crate::runtime::m2v_cache::translate_cached_reflected(
         v_air,
         metal2vulkan::passes::Stage::Vertex,

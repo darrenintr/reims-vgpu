@@ -6106,7 +6106,6 @@ fn apply_clear<M: HostMemory + HostOps>(
     ok
 }
 
-
 mod report;
 use report::{
     note_clear_dropped, note_color_subresource_unsupported, note_compute_refusal,

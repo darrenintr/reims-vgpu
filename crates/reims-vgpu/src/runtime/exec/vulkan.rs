@@ -191,7 +191,6 @@ pub(crate) fn preflight_compute_translations<M: HostMemory + HostOps>(
     dispatches: &[(u32, [u32; 3])],
     pending: &mut Vec<u32>,
 ) {
-    use crate::runtime::drain::{note_preflight_part, note_preflight_pipe, PreflightPart};
     for &(pipeline_ref, local_size) in dispatches {
         let loaded = compute_exec::load_compute_pipeline(state, host, task_id, pipeline_ref)
             .and_then(|pipeline| {

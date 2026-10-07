@@ -102,7 +102,9 @@ pub enum SurfaceWritePhase {
 pub(crate) struct VblCensus;
 impl VblCensus {
     #[inline(always)]
-    pub(crate) fn note(&self, _arm: usize, _now_ms: u64) -> Option<String> { None }
+    pub(crate) fn note(&self, _arm: usize, _now_ms: u64) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -111,7 +113,9 @@ impl WindowPublishCensus {
     #[inline(always)]
     pub(crate) fn note(&self, _arm: WindowPublish) {}
     #[inline(always)]
-    pub(crate) fn take(&self, _win_ms: u64) -> Option<String> { None }
+    pub(crate) fn take(&self, _win_ms: u64) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -122,7 +126,9 @@ impl SurfaceWriteCensus {
     #[inline(always)]
     pub(crate) fn note_path(&self, _contiguous: bool, _bytes: u64) {}
     #[inline(always)]
-    pub(crate) fn take(&self, _win_ms: u64) -> Option<String> { None }
+    pub(crate) fn take(&self, _win_ms: u64) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -133,7 +139,9 @@ impl ResidentArmCensus {
     #[inline(always)]
     pub(crate) fn note_flush(&self, _now_us: u64) {}
     #[inline(always)]
-    pub(crate) fn take(&self, _win_ms: u64) -> Option<String> { None }
+    pub(crate) fn take(&self, _win_ms: u64) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -142,7 +150,9 @@ impl DrainDutyCensus {
     #[inline(always)]
     pub(crate) fn note_skipped(&self) {}
     #[inline(always)]
-    pub(crate) fn note_gap_entry(&self, entry_us: u64) -> u64 { entry_us }
+    pub(crate) fn note_gap_entry(&self, entry_us: u64) -> u64 {
+        entry_us
+    }
     #[inline(always)]
     pub(crate) fn note_irq_armed(&self, _now_us: u64) {}
     #[inline(always)]
@@ -154,11 +164,17 @@ impl DrainDutyCensus {
     #[inline(always)]
     pub(crate) fn note_phase(&self, _phase: DrainPhase, _us: u64) {}
     #[inline(always)]
-    pub(crate) fn take_flush_rails(&self) -> Option<String> { None }
+    pub(crate) fn take_flush_rails(&self) -> Option<String> {
+        None
+    }
     #[inline(always)]
-    pub(crate) fn take_readback_split(&self) -> Option<String> { None }
+    pub(crate) fn take_readback_split(&self) -> Option<String> {
+        None
+    }
     #[inline(always)]
-    pub(crate) fn last_window_ms(&self) -> u64 { 0 }
+    pub(crate) fn last_window_ms(&self) -> u64 {
+        0
+    }
     #[inline(always)]
     pub(crate) fn note_readback(&self, _phase: ReadbackPhase, _us: u64) {}
     #[inline(always)]
@@ -170,21 +186,29 @@ impl DrainDutyCensus {
     #[inline(always)]
     pub(crate) fn note_proc(&self, _opcode: u16, _ns: u64) {}
     #[inline(always)]
-    pub(crate) fn take_proc_ops(&self) -> Option<String> { None }
+    pub(crate) fn take_proc_ops(&self) -> Option<String> {
+        None
+    }
     #[inline(always)]
     pub(crate) fn note_preflight(&self, _part: PreflightPart, _ns: u64) {}
     #[inline(always)]
     pub(crate) fn note_preflight_pipe(&self) {}
     #[inline(always)]
-    pub(crate) fn take_preflight_parts(&self) -> Option<String> { None }
+    pub(crate) fn take_preflight_parts(&self) -> Option<String> {
+        None
+    }
     #[inline(always)]
     pub(crate) fn note_exec(&self, _phase: ExecPhase, _ns: u64) {}
     #[inline(always)]
-    pub(crate) fn take_exec_phases(&self) -> Option<String> { None }
+    pub(crate) fn take_exec_phases(&self) -> Option<String> {
+        None
+    }
     #[inline(always)]
     pub(crate) fn note_finish(&self, _phase: FinishPhase, _ns: u64, _entries: u64) {}
     #[inline(always)]
-    pub(crate) fn take_finish_phases(&self) -> Option<String> { None }
+    pub(crate) fn take_finish_phases(&self) -> Option<String> {
+        None
+    }
     #[inline(always)]
     pub(crate) fn note_regs(&self, _op: RegsOp, _ns: u64) {}
     #[inline(always)]
@@ -200,18 +224,26 @@ pub(crate) struct VcpuLockCensus;
 pub(crate) const UNCONTENDED_POLL: u64 = 1024;
 impl VcpuLockCensus {
     #[inline(always)]
-    pub(crate) fn note_uncontended(&self, _now_ms: impl FnOnce() -> u64) -> Option<String> { None }
+    pub(crate) fn note_uncontended(&self, _now_ms: impl FnOnce() -> u64) -> Option<String> {
+        None
+    }
     #[inline(always)]
-    pub(crate) fn note_wait(&self, _us: u64, _now_ms: u64) -> Option<String> { None }
+    pub(crate) fn note_wait(&self, _us: u64, _now_ms: u64) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct DoorbellCensus;
 impl DoorbellCensus {
     #[inline(always)]
-    pub(crate) fn note_direct(&self, _now_ms: impl FnOnce() -> u64) -> Option<String> { None }
+    pub(crate) fn note_direct(&self, _now_ms: impl FnOnce() -> u64) -> Option<String> {
+        None
+    }
     #[inline(always)]
-    pub(crate) fn note_lock_free(&self, _now_ms: impl FnOnce() -> u64) -> Option<String> { None }
+    pub(crate) fn note_lock_free(&self, _now_ms: impl FnOnce() -> u64) -> Option<String> {
+        None
+    }
     #[inline(always)]
     pub(crate) fn note_queued(&self, _offset: u64, _age_us: u64, _now_ms: u64) -> Option<String> {
         None
@@ -251,9 +283,13 @@ pub fn note_resident_window_flushed() {}
 #[inline(always)]
 pub fn note_tranche_started(_now_us: u64) {}
 #[inline(always)]
-pub fn tranche_seq() -> u64 { 0 }
+pub fn tranche_seq() -> u64 {
+    0
+}
 #[inline(always)]
-pub fn tranche_elapsed_us() -> u64 { 0 }
+pub fn tranche_elapsed_us() -> u64 {
+    0
+}
 #[inline(always)]
 pub fn note_list_lookup_age(_hit: bool, _us: u64) {}
 
@@ -282,13 +318,16 @@ pub fn note_drain_tranche(
     _host: &dyn crate::runtime::host::HostOps,
     _drain_ns: u64,
     _publish_us: u64,
-) {}
+) {
+}
 
 #[inline(always)]
 pub fn note_drain_skipped() {}
 
 #[inline(always)]
-pub fn note_drain_entry() -> u64 { crate::observe::elapsed_us() }
+pub fn note_drain_entry() -> u64 {
+    crate::observe::elapsed_us()
+}
 
 #[inline(always)]
 pub fn note_drain_lock_wait(_us: u64) {}

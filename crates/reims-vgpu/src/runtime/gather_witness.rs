@@ -307,14 +307,29 @@
 //!
 //! **What it does not do, and why the rest was left alone.**
 //!
-//! - *A synchronous baseline.* Reading a generation immediately after
-//!   `track_guest_writes` cannot cover the writes made before logging was on,
-//!   and `HostOps::track_guest_writes` states that enabling logging is deferred
-//!   to a bottom half under the BQL. The shim's arming rule lives in the QEMU
-//!   submodule, which this checkout does not carry, so a change there was not
-//!   audited and none is made. The Rust-side conclusion stands on its own: until
-//!   the shim can say *at which harvest* logging became active, the first
-//!   gather after arming is the earliest the baseline can describe.
+//! - *A synchronous baseline.* Audited against the shim
+//!   (`reims-vgpu-dirty.c`, submodule `bd88218`), and not possible inside
+//!   `track_guest_writes`. A set armed only in `reims_vgpu_dirty_harvest`, which
+//!   was called from the guest-doorbell MMIO handlers and nowhere else, and only
+//!   when a generation read had followed the previous harvest. There was no
+//!   bottom half: a set tracked while the guest was quiet, or inside one long
+//!   drain tranche (the work of one doorbell), read 0 until the guest next rang
+//!   the device — the 8.24 s `gather_storm_ready` tail.
+//!
+//!   A baseline cannot be taken in the call itself. `track_guest_writes` runs on
+//!   the drain thread, which must not take the BQL that the accelerator's
+//!   dirty-log sync needs; and a generation made readable *without* a harvest
+//!   would leave every bit that predates the set in the bitmap, so the first
+//!   real harvest would report all of them as guest stores. `guest_written_pages`
+//!   hands those to the writeback rail, which drops the GPU's store for pages it
+//!   believes the guest wrote. (The vouch itself would survive: over-reporting
+//!   is the safe direction for a reuse decision, and the wrong one for a
+//!   writeback.) The shim now schedules the harvest on the main loop when a set
+//!   is tracked and on every generation read that returns 0, so the window is a
+//!   main-loop turn rather than the guest's next doorbell. The model check in
+//!   the shim's `reims-vgpu-dirty-test/` covers every interleaving of guest
+//!   writes, harvests, reads, copies and vouches to a bounded length, and fails
+//!   a mutant that arms at track.
 //! - *Reusing one gathered image inside the arming window.* No half of the
 //!   witness can vouch there, and "unarmed means unchanged" is exactly the
 //!   inference this module exists to refuse. A content compare is the one other
@@ -1001,9 +1016,10 @@ pub struct Rearm {
 
 /// Where a bind sits in the device's own timeline: which drain tranche and when.
 ///
-/// The dirty tracker only answers at harvest points, and harvests are driven by
-/// the doorbells the drain consumes, so two binds in one tranche had no harvest
-/// *the drain thread could see* between them. Carried as a value into
+/// The dirty tracker only answers at harvest points. Harvests run at the guest
+/// doorbells, and a tracked set that is not yet armed also asks the main loop
+/// for one, so two binds in one tranche can still have no harvest *the drain
+/// thread could see* between them. Carried as a value into
 /// [`observe`] rather than read there so a test can state it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct BindClock {

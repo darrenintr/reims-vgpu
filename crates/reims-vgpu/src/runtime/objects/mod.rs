@@ -32,7 +32,6 @@ use crate::runtime::host::HostMemory;
 use crate::runtime::texture;
 use std::sync::Arc;
 
-
 /// Fail-visible, de-duplicated per `(task_id, ref)`, for the mapper-ref-texture resolve
 /// blind spot: an object ref that IS a mapper-ref-texture IOSurface texture but whose
 /// descriptor cannot be read, cannot register a Metal/Vulkan texture, or carries
@@ -1260,8 +1259,6 @@ impl ListMiss {
             Self::SlotEmpty => "list_miss_slot_empty",
         }
     }
-
-
 }
 
 /// Lookup one object-list slot for `task_id` / `ref_`, reporting a miss.

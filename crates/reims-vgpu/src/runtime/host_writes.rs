@@ -383,7 +383,6 @@ impl HostWrites {
     pub fn wrote_any_since(&self, since: u64, pages: &[u64]) -> HostWriteVerdict {
         self.pages.verdict(since, pages, self.page_shift)
     }
-
 }
 
 #[cfg(test)]

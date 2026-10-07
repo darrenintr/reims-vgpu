@@ -850,8 +850,6 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     // not that path's problem. See `pixel_format::Rgba8ToRow`.
     let store_rail = pixel_format::Rgba8ToRow::for_format(format);
 
-    let frame_bytes = (mh as u64).saturating_mul(tight as u64);
-
     // Fast path: one packed view, poke rows in place.
     if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
         // SAFETY: contig covers span_end; revalidated in ensure_contig_view.
@@ -950,11 +948,8 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             } else {
                 let mut runs: Vec<(u64, u64)> = Vec::new();
                 for y in 0..mh {
-                    let row_lo =
-                        base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
-                    for (lo, hi) in
-                        unskipped(row_lo, row_lo.saturating_add(tight as u64), skip)
-                    {
+                    let row_lo = base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
+                    for (lo, hi) in unskipped(row_lo, row_lo.saturating_add(tight as u64), skip) {
                         match runs.last_mut() {
                             Some(last) if last.1 == lo => last.1 = hi,
                             _ => runs.push((lo, hi)),
@@ -1041,9 +1036,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             let mut runs: Vec<(u64, u64)> = Vec::new();
             for y in 0..mh {
                 let row_lo = base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
-                for (lo, hi) in
-                    unskipped(row_lo, row_lo.saturating_add(tight as u64), skip)
-                {
+                for (lo, hi) in unskipped(row_lo, row_lo.saturating_add(tight as u64), skip) {
                     match runs.last_mut() {
                         Some(last) if last.1 == lo => last.1 = hi,
                         _ => runs.push((lo, hi)),
@@ -2467,8 +2460,7 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
             && src_stride as usize == rb
             && Some(frame_len) == window_len
         {
-            let Some(rect) =
-                mapper::RectStride::new(surface_bpr as u64, rb as u64, height as u64)
+            let Some(rect) = mapper::RectStride::new(surface_bpr as u64, rb as u64, height as u64)
             else {
                 return false;
             };

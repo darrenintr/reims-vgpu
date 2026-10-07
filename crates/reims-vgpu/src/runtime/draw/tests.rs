@@ -3619,30 +3619,38 @@ fn view_swizzle_remaps_rgba8_pixels() {
     // Every CPU remap must report itself: this is the path the Vulkan
     // pathway replaced with a component mapping, and an unreported
     // invocation is a texture that silently lost its zero-copy crossing.
+    let capture = crate::observe::FailCapture::start();
     crate::runtime::census::view_swizzle_census::reset_for_tests();
+    let texture_ref = u32::MAX - 1;
     // Reims VGPU selectors: 0=zero 1=one 2=R 3=G 4=B 5=A → BGRA order + forced alpha one.
     let plan = pixel_format::swizzle_plan(&[4, 3, 2, 1]).unwrap();
     let mut rgba = vec![10u8, 20, 30, 40, 50, 60, 70, 80];
-    apply_view_swizzle_rgba8(&mut rgba, Some(&plan), 1).unwrap();
+    apply_view_swizzle_rgba8(&mut rgba, Some(&plan), texture_ref).unwrap();
     assert_eq!(&rgba[0..4], &[30, 20, 10, 255]);
     assert_eq!(&rgba[4..8], &[70, 60, 50, 255]);
     // Identity is a no-op.
     let id = pixel_format::swizzle_identity();
     let before = rgba.clone();
-    apply_view_swizzle_rgba8(&mut rgba, Some(&id), 1).unwrap();
+    apply_view_swizzle_rgba8(&mut rgba, Some(&id), texture_ref).unwrap();
     assert_eq!(rgba, before);
     // No plan leaves buffer untouched.
-    apply_view_swizzle_rgba8(&mut rgba, None, 1).unwrap();
+    apply_view_swizzle_rgba8(&mut rgba, None, texture_ref).unwrap();
     assert_eq!(rgba, before);
     // Odd length fails visibly.
     let mut bad = vec![1u8, 2, 3];
-    assert!(apply_view_swizzle_rgba8(&mut bad, Some(&plan), 1).is_none());
+    assert!(apply_view_swizzle_rgba8(&mut bad, Some(&plan), texture_ref).is_none());
     // One non-identity remap ran and said so; the identity and None calls did
     // not, and neither did the length-rejected one. Read off the always-on sink
     // rather than a counter: the line is what a boot actually has to show.
-    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    let lines = capture.lines();
     assert_eq!(
-        log.match_indices("view_swizzle_cpu_remap").count(),
+        lines
+            .iter()
+            .filter(|line| {
+                line.contains("view_swizzle_cpu_remap")
+                    && line.contains(&format!("ref={texture_ref}"))
+            })
+            .count(),
         1,
         "exactly one CPU remap must be reported"
     );

@@ -6062,7 +6062,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         exec_summary(channel_id, &result, packet.payload.len())
                     });
                 }
-                }
             }
         }
         CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN => {

@@ -3163,14 +3163,7 @@ unsafe fn copy_image_level0_to_host_delivered(
     // recording and holds the draws the copy is about to read; resetting it
     // would discard them and beginning it again is invalid.
     if appended.is_none() {
-        unsafe {
-            pools.begin_slot_recording(
-                ctx,
-                cb,
-                ops.reset_cb,
-                ops.begin_cb,
-            )?
-        };
+        unsafe { pools.begin_slot_recording(ctx, cb, ops.reset_cb, ops.begin_cb)? };
     }
     // A deferred draw may have left its render pass standing in this same
     // command buffer. The image barrier and copy below are outside-pass
@@ -3271,7 +3264,6 @@ unsafe fn copy_image_level0_to_host_delivered(
         // draws and the copy together.
         pools.batch_flush(ctx, counters)?;
     } else {
-        unsafe { pools.gpu_span_seal_current(ctx, cb) };
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
@@ -4135,7 +4127,6 @@ pub fn overlay_guest_bytes_onto_resident(
             &back,
         );
         if appended.is_none() {
-            pools.gpu_span_seal_current(ctx, cb);
             ctx.device
                 .end_command_buffer(cb)
                 .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ResidentOverlayEndCb, e)))?;
@@ -5196,8 +5187,6 @@ unsafe fn copy_image_level0_to_buffer(
     snap: &ResidentReadSnapshot,
     plan: &GuestCopyPlan,
 ) -> Result<(), DrawError> {
-    use crate::runtime::drain::{note_readback_phase, ReadbackPhase};
-    let submit_started = std::time::Instant::now();
     // Appended to a recording batch where there is one, for the reason
     // `copy_image_level0_to_host_delivered` gives: `begin_entry` would submit
     // that batch only to submit this copy behind it, and the copy has to be
@@ -5214,32 +5203,12 @@ unsafe fn copy_image_level0_to_buffer(
     };
     if appended.is_none() {
         unsafe {
-            pools.begin_slot_recording(
-                ctx,
-                cb,
-                VkOp::GuestWriteResetCb,
-                VkOp::GuestWriteBeginCb,
-            )?
+            pools.begin_slot_recording(ctx, cb, VkOp::GuestWriteResetCb, VkOp::GuestWriteBeginCb)?
         };
     }
     unsafe { pools.close_open_pass(&ctx.device, cb) };
-    // The device's own clock, for the reason the readback rail takes it: `fence_us`
-    // is CPU wall clock and cannot tell "the GPU is copying eight megabytes across
-    // PCIe" from "the round trip costs more than the work". Those have opposite
-    // fixes — a damage rect shrinks the first and does nothing at all to the
-    // second — so the rail that is now most of a flush must not be read without
-    // this pair. Slot 0 stamps the command buffer's start, slot 1 the point after
-    // the barrier where the draws ahead are known done, slot 2 the end of the copy.
-    //
-    // The reset must be recorded into the same command buffer: a query pool's
-    // results are undefined until reset, and resetting on the host needs
-    // `hostQueryReset`, a Vulkan 1.2 feature this device does not ask for.
-    // Unconditional, for the reason `copy_image_level0_to_host_delivered` states
-    // at length: the barrier is a layout transition *and* a dependency, and this
-    // rail needs the dependency whether or not the layout already matches. A
-    // render pass leaves its attachment in [`caches::color0_pass_exit_layout`],
-    // so the common case is a real transition too, and it must still order this
-    // copy after the draws that produced the pixels.
+    // The barrier transitions the source and orders this transfer read after the
+    // rendering or compute writes that produced the pixels.
     let read_access = pools::ResidentAccess::transfer_read(snap.guest_backing.is_some());
     let barrier = [ash::vk::ImageMemoryBarrier::default()
         .src_access_mask(RESIDENT_READ_SRC_ACCESS)
@@ -5275,7 +5244,6 @@ unsafe fn copy_image_level0_to_buffer(
         // draws and this copy together.
         pools.batch_flush(ctx, counters)?;
     } else {
-        unsafe { pools.gpu_span_seal_current(ctx, cb) };
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))?;

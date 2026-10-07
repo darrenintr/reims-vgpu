@@ -1331,9 +1331,7 @@ impl ResourcePools {
             wait_started,
         );
         waited.map_err(|e| {
-            crate::observe::fail(format!(
-                "vk_engine_fence_wedged slot={index} result={e:?}"
-            ));
+            crate::observe::fail(format!("vk_engine_fence_wedged slot={index} result={e:?}"));
             Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesRetire)
         })?;
         ctx.device
@@ -1896,9 +1894,6 @@ impl ResourcePools {
         counters
             .batch_flush_draws
             .fetch_add(batch.draws, Ordering::Relaxed);
-        // `self.cur` is still the slot the batch was opened on; submission and
-        // cleanup ownership remain tied to that slot.
-        let slot = self.cur;
         counters.batch_flush_close_us.fetch_add(
             close_started.elapsed().as_micros() as u64,
             Ordering::Relaxed,
