@@ -841,7 +841,7 @@ impl ExecPhase {
     /// How many phases there are. The census arrays are sized from this, so a
     /// new variant that forgets to bump it fails to build [`Self::ALL`] rather
     /// than overflowing an array at report time.
-    pub(crate) const COUNT: usize = 5;
+    pub(crate) const COUNT: usize = 4;
 
     const ALL: [ExecPhase; Self::COUNT] = [
         ExecPhase::Load,
@@ -1141,10 +1141,6 @@ impl RegsOp {
 pub enum PostSweep {
     /// `surface_cache::note_cache_levels` — self-gated to a one-second cadence.
     CacheLevels,
-    /// `objects::slot_recheck::sweep` — deliberately per tranche, because the
-    /// sampling interval is the resolution of the answer it gives. Watches
-    /// nothing on every rail but macos-26.
-    SlotRecheck,
     /// `released_pages::sweep` + `note_levels`, timed as one because they are
     /// the two halves of the same question and neither has a caller elsewhere.
     ReleasedPages,
@@ -1163,7 +1159,6 @@ impl PostSweep {
 
     const ALL: [PostSweep; Self::COUNT] = [
         PostSweep::CacheLevels,
-        PostSweep::SlotRecheck,
         PostSweep::ReleasedPages,
         PostSweep::BindLevels,
         PostSweep::PipelineTable,
@@ -1172,17 +1167,15 @@ impl PostSweep {
     const fn index(self) -> usize {
         match self {
             PostSweep::CacheLevels => 0,
-            PostSweep::SlotRecheck => 1,
-            PostSweep::ReleasedPages => 2,
-            PostSweep::BindLevels => 3,
-            PostSweep::PipelineTable => 4,
+            PostSweep::ReleasedPages => 1,
+            PostSweep::BindLevels => 2,
+            PostSweep::PipelineTable => 3,
         }
     }
 
     const fn label(self) -> &'static str {
         match self {
             PostSweep::CacheLevels => "cachelv",
-            PostSweep::SlotRecheck => "slotre",
             PostSweep::ReleasedPages => "relpg",
             PostSweep::BindLevels => "bindlv",
             PostSweep::PipelineTable => "pipetbl",
@@ -2921,13 +2914,6 @@ pub fn note_drain_tranche(
         // refusal that never recovered is only visible as the residue.
         if let Some(outstanding) = crate::runtime::objects::backing_outstanding_census() {
             crate::observe::off(outstanding);
-        }
-        // The same reason and the same place: `store_routes` counts the watches
-        // that *ended*, and a slot still waiting is skipped by every sweep it
-        // survives, so without this line the misses and the verdicts do not
-        // reconcile and the difference reads as lost records.
-        if let Some(watching) = crate::runtime::objects::slot_recheck::outstanding_census() {
-            crate::observe::off(watching);
         }
         // Onto the census cadence rather than a timer of its own, so a reader
         // pairing the footprint against `store_routes` is reading one clock.
