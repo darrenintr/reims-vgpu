@@ -2546,53 +2546,86 @@ pub fn max_render_target_dimension() -> u32 {
 /// What this Vulkan device can execute, for the GPU-dependent half of the
 /// guest's device-info reply.
 ///
-/// Before a device is resolved the answer is the Vulkan 1.2 floor rather than
-/// the reply table's own values: the served reply is only ever *reduced* by
-/// this, so a boot that answers before the device is up must not be the one
-/// that promises the most.
+/// # The device is brought up to answer, not read if it happens to be up
+///
+/// The guest asks this once per boot, when its driver loads, and keeps the
+/// answer for the life of the boot. It cannot ask again. Its Metal plugin
+/// answers `supportsTextureSampleCount:`, `maxThreadsPerThreadgroup`,
+/// `maxThreadgroupMemoryLength` and the D24S8 query straight from it, and
+/// pipeline creation validates against them. The context on this rail is
+/// created lazily, by the first draw, dispatch or probe that calls
+/// `ContextOwner::ensure`. A guest that loads its driver before anything has
+/// drawn (the ordinary boot order) was therefore answered from the Vulkan 1.2
+/// floor: one sample, no D24S8, 128x128x64 threads, 16 KiB, no fp16. It kept
+/// that answer even after the device came up a moment later. On a host that
+/// can do far more, every pipeline the guest builds with 4x MSAA or a larger
+/// threadgroup then fails guest-side validation and returns nil. No fail line
+/// on this device names that, because the pipeline never reaches it.
+///
+/// So this asks `ensure`, as the other host-capability probes
+/// ([`supports_storage_image_write_without_format`],
+/// [`supports_sampled_layout_linear_filter`]) already do. The floor is still
+/// the answer when bring-up fails, and that failure is reported once as a
+/// `vk_engine_probe` decline: a device that cannot open promises the least.
+/// The served reply is still only ever a *reduction* of `DEVICE_INFO_CAPS`.
 pub fn device_info_limits() -> crate::model::DeviceInfoLimits {
     use crate::backend::vulkan::caps::device_features::{
         VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES, VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
     };
-    lock_engine()
-        .owner
-        .ctx
-        .as_ref()
-        .map(|ctx| crate::model::DeviceInfoLimits {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref counters,
+        ..
+    } = &mut *guard;
+    match owner.ensure(counters) {
+        Ok(ctx) => crate::model::DeviceInfoLimits {
             max_sample_count: ctx.features.max_sample_count,
             d24_stencil8: ctx.features.d24_unorm_s8_attachment,
             max_threads_per_threadgroup: ctx.features.max_compute_workgroup_size,
             max_threadgroup_memory_bytes: ctx.features.max_compute_shared_memory_bytes,
             native_fp16: ctx.features.float16,
-        })
-        .unwrap_or(crate::model::DeviceInfoLimits {
-            max_sample_count: 1,
-            d24_stencil8: false,
-            max_threads_per_threadgroup: VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
-            max_threadgroup_memory_bytes: VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES,
-            native_fp16: false,
-        })
+        },
+        Err(error) => {
+            engine_probe_decline(EngineProbe::DeviceInfoLimits, &error)
+                .fail_once(EngineProbe::DeviceInfoLimits.discriminant());
+            crate::model::DeviceInfoLimits {
+                max_sample_count: 1,
+                d24_stencil8: false,
+                max_threads_per_threadgroup: VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
+                max_threadgroup_memory_bytes: VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES,
+                native_fp16: false,
+            }
+        }
+    }
 }
 
 /// `(maxTotalThreadsPerThreadgroup, threadExecutionWidth)` for this host, as
 /// the guest's `CmdGetComputeInfo` asks for them.
 ///
-/// Both are device limits, so both are queried. Before a device is resolved
-/// the answer is the Vulkan 1.2 required minimum and a single lane — the pair
-/// no dispatch can be oversized against.
+/// Both are device limits, so both are queried, and the device is brought up
+/// to answer them for the reason [`device_info_limits`] gives. When bring-up
+/// fails the answer is the Vulkan 1.2 required minimum and a single lane, the
+/// pair no dispatch can be oversized against.
 pub fn compute_threadgroup_limits() -> (u32, u32) {
     use crate::backend::vulkan::caps::device_features::VULKAN_MIN_COMPUTE_WORKGROUP_INVOCATIONS;
-    lock_engine()
-        .owner
-        .ctx
-        .as_ref()
-        .map(|ctx| {
-            (
-                ctx.features.max_compute_workgroup_invocations,
-                ctx.features.subgroup_size,
-            )
-        })
-        .unwrap_or((VULKAN_MIN_COMPUTE_WORKGROUP_INVOCATIONS, 1))
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref counters,
+        ..
+    } = &mut *guard;
+    match owner.ensure(counters) {
+        Ok(ctx) => (
+            ctx.features.max_compute_workgroup_invocations,
+            ctx.features.subgroup_size,
+        ),
+        Err(error) => {
+            engine_probe_decline(EngineProbe::ComputeThreadgroupLimits, &error)
+                .fail_once(EngineProbe::ComputeThreadgroupLimits.discriminant());
+            (VULKAN_MIN_COMPUTE_WORKGROUP_INVOCATIONS, 1)
+        }
+    }
 }
 
 /// Pin a content-ready resident render target against LRU eviction (deferred
@@ -2632,6 +2665,8 @@ pub fn unpin_resident_target(identity: &TargetIdentity) {
 enum EngineProbe {
     StorageWriteWithoutFormat,
     SampledLayoutLinearFilter,
+    DeviceInfoLimits,
+    ComputeThreadgroupLimits,
 }
 
 impl EngineProbe {
@@ -2639,6 +2674,8 @@ impl EngineProbe {
         match self {
             Self::StorageWriteWithoutFormat => "storage_write_without_format",
             Self::SampledLayoutLinearFilter => "sampled_layout_linear_filter",
+            Self::DeviceInfoLimits => "device_info_limits",
+            Self::ComputeThreadgroupLimits => "compute_threadgroup_limits",
         }
     }
 
@@ -2648,6 +2685,8 @@ impl EngineProbe {
         match self {
             Self::StorageWriteWithoutFormat => 7,
             Self::SampledLayoutLinearFilter => 9,
+            Self::DeviceInfoLimits => 10,
+            Self::ComputeThreadgroupLimits => 11,
         }
     }
 }
