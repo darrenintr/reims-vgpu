@@ -561,23 +561,6 @@ impl ResourcePools {
     fn evict_sampled_entry(&mut self, index: usize, route: SampledVictimRoute) -> SampledSlot {
         let evicted = self.sampled_cache.remove(index);
         self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_sub(evicted.content_len);
-        if let (Some(identity), SampledFingerprint::Gathered) =
-            (evicted.identity, evicted.fingerprint)
-        {
-            // What the departure cost, for the `gather_storm_evict` line: an
-            // entry a newer generation of its window had replaced, or one that
-            // never answered a lookup, was dead weight and its eviction freed a
-            // slot for free. Only an entry that was current and had been useful
-            // is a gather the cap caused.
-            crate::runtime::gather_storm::note_image_evicted(
-                crate::runtime::gather_storm::EvictedImage {
-                    content_key: identity.key,
-                    bytes: evicted.content_len as u64,
-                    hits: evicted.hits,
-                    superseded: evicted.superseded,
-                },
-            );
-        }
         if let Some(identity) = evicted.identity {
             self.sampled_victims.push_front(SampledVictim {
                 key: evicted.slot.key(),
