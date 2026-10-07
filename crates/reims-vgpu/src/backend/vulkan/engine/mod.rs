@@ -1734,7 +1734,6 @@ pub fn quiesce_guest_writes() {
     if !GUEST_WRITE_DEBT.load(Ordering::Acquire) {
         return;
     }
-    let started = std::time::Instant::now();
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -1767,15 +1766,6 @@ pub fn quiesce_guest_writes() {
     // Under the same lock as the flag it accompanies, so no reader can see the
     // flag set beside a footprint that has already been forgotten.
     clear_guest_write_pages();
-    // Reported as `ReadbackPhase::Fence` because it *is* that phase — the same
-    // block on the same fences, moved. Its count is now settles rather than
-    // windows, which is the whole of what this change did to the rail, so
-    // `fence` no longer tracks `submit` and a reading that assumes it does is
-    // reading the old shape.
-    crate::runtime::drain::note_readback_phase(
-        crate::runtime::drain::ReadbackPhase::Fence,
-        started.elapsed().as_micros() as u64,
-    );
 }
 
 /// Whether any guest-page writeback is submitted and not yet settled.
@@ -3106,7 +3096,6 @@ unsafe fn copy_image_level0_to_host_delivered(
     ops: ReadbackOps,
     delivery: ReadbackDelivery,
 ) -> Result<ReadbackResult, DrawError> {
-    let submit_started = std::time::Instant::now();
     // The slot is claimed *after* the entry, and the order is load-bearing.
     //
     // `begin_entry` submits any open draw batch first, and that flush runs
@@ -3203,7 +3192,6 @@ unsafe fn copy_image_level0_to_host_delivered(
     // pool's results are undefined until reset, and resetting on the host needs
     // `hostQueryReset`, which is a Vulkan 1.2 feature this device does not ask
     // for.
-    unsafe { pools.readback_span_arm(ctx, cb) };
     // Nothing else supplies it. Queue submission order starts command buffers
     // in order; it does not finish them in order, and it is not a memory
     // dependency. A render pass's implicit final subpass dependency carries
@@ -3246,7 +3234,6 @@ unsafe fn copy_image_level0_to_host_delivered(
     // span from it to the end of the copy contains both. This slot is what
     // separates them: everything before it has reached TRANSFER, which after the
     // barrier means the draws are done.
-    unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::TRANSFER, 1) };
     let region = [ash::vk::BufferImageCopy::default()
         .image_subresource(color_subresource_layers())
         .image_extent(ash::vk::Extent3D {
@@ -3278,7 +3265,6 @@ unsafe fn copy_image_level0_to_host_delivered(
     // `pools::BATCH_MAX_DRAWS`.
     ctx.device
         .cmd_copy_image_to_buffer(cb, image, read_layout, readback.buffer, &region);
-    unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2) };
     if appended.is_some() {
         // `batch_flush` ends the command buffer, submits it with the fence
         // `batch_open_recording` handed back, and seals the batch's cleanup —
@@ -3299,23 +3285,12 @@ unsafe fn copy_image_level0_to_host_delivered(
     // Split three ways rather than timed as a whole: the submit and the copy
     // scale with the surface, the fence does not scale with anything we control,
     // and the fix for one is not the fix for the others.
-    use crate::runtime::drain::{note_readback_phase, ReadbackPhase};
-    note_readback_phase(
-        ReadbackPhase::Submit,
-        submit_started.elapsed().as_micros() as u64,
-    );
-    let fence_started = std::time::Instant::now();
     pools.wait_entry_fence(ctx, counters, fence)?;
-    note_readback_phase(
-        ReadbackPhase::Fence,
-        fence_started.elapsed().as_micros() as u64,
-    );
     // The three queries this command buffer wrote are read when its ring slot
     // retires, by `readback_span_read`, which is the one place a slot's fence is
     // known signalled. They used to be read here, against this call's own fence
     // — correct for this writer and not for the guest-page writeback, which
     // shares the probe and does not wait.
-    let map_started = std::time::Instant::now();
     let out = match lease.disarm() {
         // The mapping is already established for the slot's lifetime, so all
         // this owes is the invalidate a non-coherent readback owes any reader.
@@ -3358,7 +3333,6 @@ unsafe fn copy_image_level0_to_host_delivered(
         None => pools::read_back_slot(ctx, &readback, rb_size, ops.map, ops.invalidate)
             .map(ReadbackResult::Copied),
     };
-    note_readback_phase(ReadbackPhase::Map, map_started.elapsed().as_micros() as u64);
     out
 }
 
@@ -5271,7 +5245,6 @@ unsafe fn copy_image_level0_to_buffer(
     // The reset must be recorded into the same command buffer: a query pool's
     // results are undefined until reset, and resetting on the host needs
     // `hostQueryReset`, a Vulkan 1.2 feature this device does not ask for.
-    unsafe { pools.readback_span_arm(ctx, cb) };
     // Unconditional, for the reason `copy_image_level0_to_host_delivered` states
     // at length: the barrier is a layout transition *and* a dependency, and this
     // rail needs the dependency whether or not the layout already matches. A
@@ -5295,9 +5268,7 @@ unsafe fn copy_image_level0_to_buffer(
         &[],
         &barrier,
     );
-    unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::TRANSFER, 1) };
     unsafe { record_guest_copy_plan(ctx, pools, cb, snap.image, read_access.layout(), plan) };
-    unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2) };
     unsafe { release_guest_copy_to_host(ctx, cb, plan) };
     // The wait this rail no longer takes here.
     //
@@ -5325,10 +5296,6 @@ unsafe fn copy_image_level0_to_buffer(
         let sealed = pools.seal_entry(Vec::new(), Vec::new());
         pools.finish_entry_async(&ctx.device, sealed);
     }
-    note_readback_phase(
-        ReadbackPhase::Submit,
-        submit_started.elapsed().as_micros() as u64,
-    );
     Ok(())
 }
 
