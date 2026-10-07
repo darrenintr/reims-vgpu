@@ -2915,12 +2915,6 @@ pub fn note_drain_tranche(
         if let Some(routes) = take_store_routes() {
             crate::observe::off(routes);
         }
-        // Beside `store_routes` because it divides two of its lines: `gw_unarmed`
-        // into why the hypervisor half had no answer, and `gw_rail_*` into which
-        // windows moved the bytes.
-        for line in crate::runtime::gather_storm::take_lines(DRAIN_DUTY.last_window_ms()) {
-            crate::observe::off(line);
-        }
         // Beside `store_routes` deliberately: the two are read against each
         // other. `backing_fail` lines equal `backing_recovered +
         // backing_superseded` from that line plus this one's `n`, and a
