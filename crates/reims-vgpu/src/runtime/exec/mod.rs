@@ -4945,7 +4945,6 @@ fn finish_stream<M: HostMemory + HostOps>(
     // Opens in `Prelude` and is charged to whichever part is open until it
     // drops, so the six tile this function rather than sampling it. See
     // [`finish_phase`] for what the split is for.
-    let mut fin = finish_phase::FinishTimer::open();
     note_stream_draw_drops(task_id, acc);
     // Archive ApplePVGPUDrawJob: clear/load seed is private initial_rgba for the
     // async job; guest pages are written once at completion. Apply clear-to-guest
@@ -5212,7 +5211,6 @@ fn finish_stream<M: HostMemory + HostOps>(
             dirty_color_targets(state, host, task_id, &acc.color_targets);
         }
         for (di, pd) in draw_list.iter().enumerate() {
-            fin.enter(crate::runtime::drain::FinishPhase::Retarget);
             let mut req = if di == 0 {
                 let Some(req) = first_req.take() else {
                     break;
@@ -5225,7 +5223,6 @@ fn finish_stream<M: HostMemory + HostOps>(
                 retarget_render_pass_draw(template, pd)
             };
             {
-                fin.enter(crate::runtime::drain::FinishPhase::Binds);
                 fill_draw_binds_from_pending(&mut req, pd);
                 (req.continues_render_pass, req.render_pass_continues) =
                     render_pass_chain_position(di, draw_list.len());
@@ -5279,7 +5276,6 @@ fn finish_stream<M: HostMemory + HostOps>(
                     out.render_guest_stores = out.render_guest_stores.saturating_add(1);
                 }
                 let draw_started = std::time::Instant::now();
-                fin.enter(crate::runtime::drain::FinishPhase::Encode);
                 let encode = crate::backend::selected().encode_draw_chain(
                     state,
                     host,
@@ -5287,7 +5283,6 @@ fn finish_stream<M: HostMemory + HostOps>(
                     do_writeback,
                     force_full_store,
                 );
-                fin.enter(crate::runtime::drain::FinishPhase::Result);
                 // Read before the status is matched: a draw whose Store failed
                 // still ran its query, and the count is the guest's answer
                 // either way.
@@ -5426,7 +5421,6 @@ fn finish_stream<M: HostMemory + HostOps>(
                 }
             }
         }
-        fin.enter(crate::runtime::drain::FinishPhase::Tail);
         write_visibility_results(state, host, task_id, acc, &visibility_counts);
         // Encode never landed Stores (NoMetal stubs, missing MTLB/pipeline, or
         // mrt resolve fail). Honor CLEAR load+store into guest/host pages so
@@ -6179,7 +6173,6 @@ fn apply_clear<M: HostMemory + HostOps>(
     ok
 }
 
-pub(crate) mod finish_phase;
 
 mod report;
 use report::{
