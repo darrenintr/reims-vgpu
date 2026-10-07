@@ -719,6 +719,46 @@ fn a_compute_refusal_names_its_check_and_ok_names_nothing() {
     }
 }
 
+/// A dispatch whose kernel will not translate keeps its reason and names the
+/// step that refused on the same line.
+///
+/// `compute_record reason=compute_vk_translate` used to be the whole record
+/// line. The translation cache's own slug went out only on a separate
+/// `compute_linux_m2v` line latched once per pipeline. Two different steps are
+/// driven here and must render two different `step=` values under the one
+/// reason.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_kernel_that_will_not_translate_names_the_step_on_its_record_line() {
+    use crate::observe::Emit;
+    use crate::runtime::m2v_cache::M2vCacheDecline;
+
+    let render = |decline: &M2vCacheDecline| {
+        Emit::refusal(
+            "compute_record",
+            &kernel_translate_refusal(decline, "ready"),
+        )
+        .expect("a translate failure is a refusal")
+        .field("pipe", 7)
+        .render()
+    };
+    assert_eq!(
+        render(&M2vCacheDecline::KernelTranslate {
+            detail: "x".to_string()
+        }),
+        "compute_record reason=compute_vk_translate class=execute \
+         step=m2v_kernel_translate model_pipeline=ready recovery=metal_failed pipe=7"
+    );
+    assert_eq!(
+        render(&M2vCacheDecline::KernelLocalSizeMismatch {
+            requested: [8, 8, 1],
+            reflected: Some([32, 1, 1]),
+        }),
+        "compute_record reason=compute_vk_translate class=execute \
+         step=m2v_kernel_local_size_mismatch model_pipeline=ready recovery=metal_failed pipe=7"
+    );
+}
+
 /// Two different buffer-staging checks, two different slugs — the property
 /// that a shared `MissingBuffer` could not express.
 ///

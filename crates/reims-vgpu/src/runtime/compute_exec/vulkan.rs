@@ -536,6 +536,32 @@ pub(crate) fn render_target_serve<M: HostMemory + HostOps>(
     ))
 }
 
+/// The refusal a dispatch takes when its kernel's AIR will not become SPIR-V.
+///
+/// `reason=compute_vk_translate` is unchanged, so a count of it still reads
+/// against older boots. What it gains is `step=`, the translation cache's own
+/// slug for the step that refused: `m2v_kernel_translate` (metal2vulkan),
+/// `m2v_kernel_local_size_mismatch`, a layout-repair or reflection refusal,
+/// `m2v_translation_pending_at_sync_boundary`, and so on. That slug used to
+/// reach the log only through `compute_linux_m2v`, a separate line latched
+/// once per pipeline. So a `compute_record` line (7 per Simulator run) did not
+/// say which step it was, and reading it meant pairing two lines by `pipe=`.
+/// The steps need different owners (the translator, the cache's keying, the
+/// pre-scan), so a count that cannot split them cannot be acted on.
+///
+/// `model_pipeline` is the ordering plane's state for the pipeline, the same
+/// field `compute_linux_m2v` carries.
+pub(crate) fn kernel_translate_refusal(
+    decline: &crate::runtime::m2v_cache::M2vCacheDecline,
+    model_pipeline: &'static str,
+) -> ComputeStatus {
+    ComputeStatus::RailRefused(
+        crate::backend::refusal::RailRefusal::execute("compute_vk_translate")
+            .field("step", crate::observe::Decline::slug(decline))
+            .field("model_pipeline", model_pipeline),
+    )
+}
+
 /// Linux product compute path (doorbell / BQL).
 ///
 /// Stages buffers/textures with device `page_shift`, translates the kernel AIR
@@ -672,7 +698,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 .field("pipe", acc.pipeline_ref)
                 .field("model_pipeline", model_pipeline)
                 .fail_once(acc.pipeline_ref as u64);
-            return ComputeStatus::MetalFailed("compute_vk_translate");
+            return kernel_translate_refusal(&e, model_pipeline);
         }
     };
     if let Some(unsupported) = crate::runtime::spirv_bind::first_unsupported_vulkan_interface(
