@@ -7585,13 +7585,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let mut images: Vec<crate::backend::vulkan::engine::SampledImageResource> = Vec::new();
         let mut samplers: Vec<crate::backend::vulkan::engine::SamplerResource> = Vec::new();
         let mut sampler_binds: std::collections::BTreeSet<u32> = Default::default();
-        // Where each provisioned sampler's state came from, keyed by binding, for
-        // the hang trail. A `SamplerResource` cannot be asked this after the
-        // fact: a translated guest sampler that happens to be `Linear`/`Linear`
-        // and one this device invented are the same value, and only one of them
-        // is something the guest asked for. See
-        // [`crate::runtime::gpu_hang_trail::SamplerNote`].
-        let mut sampler_origin: std::collections::BTreeMap<u32, u8> = Default::default();
         {
             let mut push_tex = |index: u32,
                                 texture_ref: u32,
@@ -8182,11 +8175,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 let smp_bind = SAMPLER_BINDING_BASE + index + base_off;
                 if sampler_binds.insert(smp_bind) {
                     let mut sampler = if sampler_ref != 0 {
-                        sampler_origin.insert(smp_bind, b'g');
                         load_vulkan_sampler(state, host, req.task_id, sampler_ref, smp_bind)
                             .map_err(DrawError::DrawPreparation)?
                     } else {
-                        sampler_origin.insert(smp_bind, b'd');
                         crate::backend::vulkan::engine::SamplerResource::normalized_default(
                             smp_bind,
                         )
@@ -8261,13 +8252,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     if sampler_binds.insert(reflected.binding) {
                         let binding = reflected.binding;
                         if let Some(state) = reflected.static_state {
-                            sampler_origin.insert(binding, b'c');
                             samplers.push(
                                 reflected_static_sampler_resource(stage, binding, state)
                                     .map_err(DrawError::DrawPreparation)?,
                             );
                         } else {
-                            sampler_origin.insert(binding, b'd');
                             samplers.push(
                                 crate::backend::vulkan::engine::SamplerResource::normalized_default(
                                     binding,
@@ -9358,147 +9347,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             ));
         });
 
-        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::AssembleTrail);
-        // Asked of the module rather than of m2v's reflection, which is the
-        // whole point: the render path's existing unbound guard walks
-        // `f_shader.reflection.bindings`, so a binding the translated SPIR-V
-        // carries and the reflection omits is checked by nothing.
-        // `descriptor_static_use` cannot close it either — it answers
-        // `NotDeclared` for anything that is not a `UniformConstant`, which by
-        // construction excludes every storage buffer.
-        // Memoized on the `Arc`, because this is a per-draw walk of the whole
-        // module and the words behind an `Arc` cannot change.
-        let frag_declared_bindings =
-            crate::runtime::spirv_bind::declared_binding_numbers_memoized(&f_words);
-        let frag_layout_bindings: Vec<u32> = resources
-            .storage_buffers
-            .iter()
-            .map(|s| s.binding)
-            .chain(resources.sampled_images.iter().map(|i| i.binding))
-            .chain(resources.samplers.iter().map(|s| s.binding))
-            .collect();
-        let frag_gap =
-            crate::runtime::gpu_hang_trail::gap(&frag_declared_bindings, &frag_layout_bindings);
-        // The hang trail, recorded here because this is the last point at which
-        // the guest's pipeline ref and both translated module sizes are in scope
-        // together: past it the engine keys on digests and the ref is gone. See
-        // [`crate::runtime::gpu_hang_trail`] for what reads it and why a counter
-        // could not answer the question.
-        // What the draw is about to sample, lowest binding first. The trail's
-        // whole subject is a fragment module that walks a pointer chain through
-        // a sampled image, and until this it recorded the module's *size* and
-        // nothing about its inputs — so a wedged boot could not say which rail
-        // supplied the walked texture, what format the shader would read it as,
-        // or whether the extent was the one the guest meant.
-        //
-        // Sorted here rather than relied upon: `sampled_images` is in the order
-        // the two texture loops pushed it, vertex stage first, so the fragment
-        // bindings are neither first nor contiguous.
-        let mut sampled_notes = [crate::runtime::gpu_hang_trail::SampledNote::default();
-            crate::runtime::gpu_hang_trail::SAMPLED_KEPT];
-        let mut by_binding: Vec<&crate::backend::vulkan::engine::SampledImageResource> =
-            resources.sampled_images.iter().collect();
-        by_binding.sort_unstable_by_key(|i| i.binding);
-        for (slot, image) in sampled_notes.iter_mut().zip(by_binding.iter()) {
-            *slot = crate::runtime::gpu_hang_trail::SampledNote {
-                binding: image.binding,
-                kind: match &image.source {
-                    crate::backend::vulkan::engine::SampledSource::Bytes(_) => 1,
-                    crate::backend::vulkan::engine::SampledSource::Target(_) => 2,
-                    crate::backend::vulkan::engine::SampledSource::GuestRuns(..) => 3,
-                },
-                format: image.format.as_raw() as u32,
-                width: image.width,
-                height: image.height,
-                // Only the CPU-bytes rail has bytes here to read. The gather
-                // rail's texels are in guest RAM and the target rail's are on
-                // the GPU; reading either one would be a device-memory access
-                // taken to write a log line, which is not a trade this makes.
-                texel0: match &image.source {
-                    crate::backend::vulkan::engine::SampledSource::Bytes(b) => b
-                        .get(..4)
-                        .map(|t| u32::from_le_bytes([t[0], t[1], t[2], t[3]]))
-                        .unwrap_or(0),
-                    _ => 0,
-                },
-            };
-        }
-        // And what it will sample them *through*. All four of the uber shader's
-        // unbounded loops share one sampler, and a `LINEAR` filter on a texture
-        // whose texels are the next UV walks a blend of two cells rather than
-        // either — so the third of the wedge's three hypotheses is a property of
-        // this list and of nothing the trail recorded before.
-        let mut sampler_notes = [crate::runtime::gpu_hang_trail::SamplerNote::default();
-            crate::runtime::gpu_hang_trail::SAMPLER_KEPT];
-        let mut smp_by_binding: Vec<&crate::backend::vulkan::engine::SamplerResource> =
-            resources.samplers.iter().collect();
-        smp_by_binding.sort_unstable_by_key(|s| s.binding);
-        for (slot, smp) in sampler_notes.iter_mut().zip(smp_by_binding.iter()) {
-            // The ordinals as the guest wrote them, parsed here rather than
-            // carried pre-parsed: `?` is then a real reading — an ordinal
-            // outside the enum — and not a shape this trail cannot express.
-            use reims_vgpu_core::sampler::{AddressMode as A, Filter as F, MipFilter as M};
-            let filter = |ordinal: u32| match F::parse(ordinal) {
-                Some(F::Nearest) => b'N',
-                Some(F::Linear) => b'L',
-                None => b'?',
-            };
-            let address = |ordinal: u32| match A::parse(ordinal) {
-                Some(A::ClampToEdge) => b'e',
-                Some(A::MirrorClampToEdge) => b'E',
-                Some(A::Repeat) => b'r',
-                Some(A::MirrorRepeat) => b'R',
-                Some(A::ClampToZero) => b'z',
-                Some(A::ClampToBorderColor) => b'b',
-                None => b'?',
-            };
-            *slot = crate::runtime::gpu_hang_trail::SamplerNote {
-                binding: smp.binding,
-                min_filter: filter(smp.min_filter),
-                mag_filter: filter(smp.mag_filter),
-                mip_filter: match M::parse(smp.mip_filter) {
-                    Some(M::NotMipmapped) => b'n',
-                    Some(M::Nearest) => b'N',
-                    Some(M::Linear) => b'L',
-                    None => b'?',
-                },
-                address_u: address(smp.address_mode_u),
-                address_v: address(smp.address_mode_v),
-                // `?` is a sampler that reached the list by a route that did not
-                // record where its state came from, which is the reading that
-                // would send the next session looking for a fourth path rather
-                // than concluding anything about the three.
-                provenance: sampler_origin.get(&smp.binding).copied().unwrap_or(b'?'),
-                unnormalized: smp.unnormalized_coordinates,
-            };
-        }
-        crate::runtime::gpu_hang_trail::note_draw(crate::runtime::gpu_hang_trail::DrawNote {
-            sampled: sampled_notes,
-            sampled_count: resources.sampled_images.len() as u32,
-            samplers: sampler_notes,
-            sampler_count: resources.samplers.len() as u32,
-            pipeline_ref: req.pipeline_ref,
-            vert_words: v_words.len() as u32,
-            frag_words: f_words.len() as u32,
-            width: w,
-            height: h,
-            vertex_count,
-            instance_count: req.instance_count,
-            // Asked of the module rather than of m2v's reflection, which is the
-            // whole point: the render path's existing unbound guard walks
-            // `f_shader.reflection.bindings`, so a binding the translated
-            // SPIR-V carries and the reflection omits is checked by nothing.
-            // `descriptor_static_use` cannot close it either — it answers
-            // `NotDeclared` for anything that is not a `UniformConstant`, which
-            // by construction excludes every storage buffer.
-            frag_declared: frag_declared_bindings.len() as u32,
-            // What the engine will build the layout from: the storage binds this
-            // draw resolved, at the numbers they will carry, plus the textures
-            // and samplers it provided at theirs.
-            frag_provided: frag_layout_bindings.len() as u32,
-            frag_gap: frag_gap.0,
-            frag_gap_lo: frag_gap.1,
-        });
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         resources.vert_spirv = v_words;
         resources.frag_spirv = f_words;
