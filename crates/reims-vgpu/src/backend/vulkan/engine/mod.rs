@@ -3282,15 +3282,7 @@ unsafe fn copy_image_level0_to_host_delivered(
         let sealed = pools.seal_entry(Vec::new(), Vec::new());
         pools.finish_entry_async(&ctx.device, sealed);
     }
-    // Split three ways rather than timed as a whole: the submit and the copy
-    // scale with the surface, the fence does not scale with anything we control,
-    // and the fix for one is not the fix for the others.
     pools.wait_entry_fence(ctx, counters, fence)?;
-    // The three queries this command buffer wrote are read when its ring slot
-    // retires, by `readback_span_read`, which is the one place a slot's fence is
-    // known signalled. They used to be read here, against this call's own fence
-    // — correct for this writer and not for the guest-page writeback, which
-    // shares the probe and does not wait.
     let out = match lease.disarm() {
         // The mapping is already established for the slot's lifetime, so all
         // this owes is the invalidate a non-coherent readback owes any reader.
