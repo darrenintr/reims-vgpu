@@ -3648,6 +3648,7 @@ impl GuestPageTarget {
             pitch_bytes: self.pitch_bytes(),
             width_texels: self.width,
             height_texels: self.height,
+            bytes_per_texel: self.bytes_per_texel(),
         }
     }
 
@@ -3958,6 +3959,7 @@ fn plan_overlay_regions(
         pitch_bytes: overlay.pitch_bytes,
         width_texels: overlay.width,
         height_texels: overlay.height,
+        bytes_per_texel: BPT,
     };
     let mut regions = Vec::new();
     for span in overlay.spans {
