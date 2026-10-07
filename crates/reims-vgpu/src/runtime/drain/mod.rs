@@ -2283,14 +2283,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
     let translating = match (arrived.submission.as_ref(), built.payload.exec()) {
         (Some(submission), Some(resolved)) => {
             let _span = tranche_span(TrancheCost::AdmitPreflight);
-            let mut measured_ns = 0u64;
-            crate::runtime::exec::preflight_submission(
-                state,
-                host,
-                submission,
-                resolved,
-                &mut measured_ns,
-            )
+            crate::runtime::exec::preflight_submission(state, host, submission, resolved)
         }
         _ => Vec::new(),
     };
@@ -2623,16 +2616,8 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             note_store_route("parked_translations_already_ready");
             continue;
         }
-        let mut measured_ns = 0u64;
-        let preflight_started = std::time::Instant::now();
-        let pending = crate::runtime::exec::preflight_submission(
-            state,
-            &*host,
-            submission,
-            resolved,
-            &mut measured_ns,
-        );
-        census::note_tranche_since(census::TrancheCost::PumpPreflight, preflight_started);
+        let pending =
+            crate::runtime::exec::preflight_submission(state, &*host, submission, resolved);
         if !pending.is_empty() {
             // The pump's own withdrawal arm. A position can be parked on one
             // pipeline while another it binds is `Ready` from an earlier
@@ -5585,7 +5570,7 @@ enum ChildPacketDisposition {
 /// `note_store_route` counter that is not conditioned on failure.
 fn exec_summary(channel_id: u32, result: &crate::runtime::exec::ExecResult, plen: usize) -> String {
     format!(
-        "exec_indirect2 ch={channel_id} task={} streams={} saw_draw={} clears={} draws_ok={} draws_fail={} rt_resolves={} guest_stores={} icb_ok={} icb_fail={} compute_ctrl_fail={} compute_icb_fail={} render_unbinds={}/{}/{} total_us={} plen={plen}",
+        "exec_indirect2 ch={channel_id} task={} streams={} saw_draw={} clears={} draws_ok={} draws_fail={} rt_resolves={} guest_stores={} icb_ok={} icb_fail={} compute_ctrl_fail={} compute_icb_fail={} render_unbinds={}/{}/{} plen={plen}",
         result.task_id,
         result.streams_loaded,
         result.saw_draw as u8,
@@ -5601,18 +5586,7 @@ fn exec_summary(channel_id: u32, result: &crate::runtime::exec::ExecResult, plen
         result.buffer_unbinds,
         result.texture_unbinds,
         result.sampler_unbinds,
-        result.total_us,
     )
-}
-
-/// A synchronous ExecIndirect2 holding `DeviceInner` for this long starves the
-/// guest's read-to-clear completion/status registers. This is a diagnostic
-/// proxy only; it never changes packet ordering or completion behavior.
-const SYNC_EXEC_STALL_US: u64 = 250_000;
-
-#[inline]
-fn sync_exec_stalled(total_us: u64) -> bool {
-    total_us >= SYNC_EXEC_STALL_US
 }
 
 /// Whether a child opcode is one of the reference host's retired slots.
@@ -6097,15 +6071,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         exec_summary(channel_id, &result, packet.payload.len())
                     });
                 }
-                if sync_exec_stalled(result.total_us) {
-                    crate::observe::fail(format!(
-                        "TRANSPORT reason=sync_exec_lock_hold ch={channel_id} task={} total_us={} draws={} rt_resolves={} guest_stores={} threshold_us={SYNC_EXEC_STALL_US}",
-                        result.task_id,
-                        result.total_us,
-                        result.metal_draws_ok.saturating_add(result.metal_draws_fail),
-                        result.render_attachment_resolves,
-                        result.render_guest_stores
-                    ));
                 }
             }
         }
