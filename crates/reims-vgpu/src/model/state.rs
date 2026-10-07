@@ -3095,12 +3095,6 @@ pub struct DeviceState {
     pub max_mapping_id_seen: u32,
     /// Count of MapMemory2/UnmapMemory packets (verbose census).
     pub map_family_events: u64,
-    /// Per-task page-table node pages, for the host-write guard.
-    ///
-    /// Observation only — see [`crate::runtime::node_guard`]. These pages
-    /// belong to the task's address space, so a reused id inheriting them would
-    /// be watching memory that is now somebody else's.
-    pub node_guard: std::collections::BTreeMap<u32, crate::runtime::node_guard::NodeWatch>,
     /// Live object refs per task, as `(task_id, ref)`.
     ///
     /// This is membership for host-copy teardown. [`Self::task_resources`]
@@ -3589,7 +3583,6 @@ impl DeviceState {
             max_mapping_id_seen: 0,
             tasks: TaskTable::new(),
             map_family_events: 0,
-            node_guard: std::collections::BTreeMap::new(),
             objects: std::collections::BTreeSet::new(),
             task_resources: TaskResources::default(),
             lifecycle: Mutex::new(reims_vgpu_core::lifecycle::Lifecycle::new()),
@@ -4099,9 +4092,6 @@ impl DeviceState {
         if let Some(rail) = self.rail.get() {
             rail.delete_task(task_id);
         }
-        // The watched pages were nodes of the tree this id is losing;
-        // after a redefine they describe whatever the guest has since done with them.
-        self.node_guard.remove(&task_id);
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
@@ -4162,8 +4152,6 @@ impl DeviceState {
         // HostOps views we held (does not touch host_gva_surfaces encode).
         // Runtime flushes retired_views via HostOps::unmap_pages.
         self.retire_task_gva_views(task_id);
-        // The page-table node watch belongs to this task's address space.
-        self.node_guard.remove(&task_id);
         self.tasks.remove(task_id);
         true
     }
