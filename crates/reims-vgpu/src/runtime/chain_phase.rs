@@ -217,20 +217,12 @@ pub enum Phase {
     /// under it: a guest object-list read plus a descriptor read per draw, on
     /// every draw that binds any depth state at all.
     AssembleDepth = 15,
-    /// The GPU hang trail and the fragment binding-gap check that feeds it.
-    ///
-    /// `declared_binding_numbers` is a **linear walk of the whole fragment
-    /// module**, run per draw against words behind an `Arc` that cannot change
-    /// — the same shape as the `pl_shader_us` finding, which was 63 ms of every
-    /// second spent deriving a key for a module already in hand. Charged apart
-    /// so the walk can be sized before it is memoized.
-    AssembleTrail = 16,
 }
 
 impl Phase {
     /// Highest ordinal, so [`PHASES`] is derived from the enum rather than
     /// hand-counted beside it.
-    const LAST: Phase = Phase::AssembleTrail;
+    const LAST: Phase = Phase::AssembleDepth;
 }
 
 const PHASES: usize = Phase::LAST as usize + 1;
@@ -272,11 +264,10 @@ pub struct ChainPhaseWindow {
     /// `prep_us` used to be alone. It was two until the CLEAR-seed rail was
     /// retired — see [`Phase::PrepPages`].
     pub prep_pages_us: u64,
-    /// The three spans carved out of `assemble_us`; the four together are what
-    /// `assemble_us` used to be alone.
+    /// The two spans carved out of `assemble_us`; together with the residue
+    /// they are what `assemble_us` used to be alone.
     pub assemble_target_us: u64,
     pub assemble_depth_us: u64,
-    pub assemble_trail_us: u64,
     pub chains: u64,
     pub max_us: u64,
 }
@@ -302,7 +293,6 @@ pub fn take_window() -> Option<ChainPhaseWindow> {
         prep_pages_us: to_us(ACC[Phase::PrepPages as usize].swap(0, Ordering::Relaxed)),
         assemble_target_us: to_us(ACC[Phase::AssembleTarget as usize].swap(0, Ordering::Relaxed)),
         assemble_depth_us: to_us(ACC[Phase::AssembleDepth as usize].swap(0, Ordering::Relaxed)),
-        assemble_trail_us: to_us(ACC[Phase::AssembleTrail as usize].swap(0, Ordering::Relaxed)),
         chains,
         max_us: to_us(MAX_NS.swap(0, Ordering::Relaxed)),
     };
@@ -364,9 +354,7 @@ fn charge(phase: Phase, ns: u64) {
         Phase::Binds => C::ChBinds,
         Phase::Sampled => C::ChSampled,
         Phase::Seed => C::ChSeed,
-        Phase::Assemble | Phase::AssembleTarget | Phase::AssembleDepth | Phase::AssembleTrail => {
-            C::ChAssemble
-        }
+        Phase::Assemble | Phase::AssembleTarget | Phase::AssembleDepth => C::ChAssemble,
         Phase::Engine => C::ChEngine,
         Phase::Store => C::ChStore,
     };
@@ -497,11 +485,7 @@ mod tests {
     /// same terms as the pipeline ones, and each lands in its own field.
     ///
     /// Both halves matter. A sub-phase whose charge also reached the residue
-    /// would double-count and read as the largest bar on the line; a sub-phase
-    /// wired to the wrong `ACC` slot would report one part's time under
-    /// another's name, which is worse than not splitting at all because it
-    /// still looks like an answer. The three sleeps are different lengths so a
-    /// crossed pair cannot pass.
+    /// Assemble sub-phases stay disjoint from the residue.
     #[test]
     fn each_assemble_sub_phase_is_carved_out_and_lands_in_its_own_field() {
         let _ = take_window();
@@ -511,47 +495,14 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
             enter(Phase::AssembleDepth);
             std::thread::sleep(std::time::Duration::from_millis(4));
-            enter(Phase::AssembleTrail);
-            std::thread::sleep(std::time::Duration::from_millis(6));
             enter(Phase::Store);
         }
         let w = take_window().expect("one chain ran");
-        // Lower bounds and one sum, because `thread::sleep` promises *at least*
-        // its duration and says nothing about the excess. This test used to
-        // bound each field on both sides with a 1.5 ms window; an Apple Silicon
-        // host returns from all three of these sleeps about 25 % late, which is
-        // 1.5 ms on the 6 ms one alone, so the window failed on the host's timer
-        // rather than on the accounting it exists to check. Both claims below
-        // are invariant under any overshoot, because the overshoot lands inside
-        // the phase that was open when it happened.
-        //
-        // A crossed pair still cannot pass: the three spans are disjoint slices
-        // of one chain, so any assignment other than the intended one hands some
-        // field a shorter sleep than its bound.
+        assert!(w.assemble_target_us >= 2_000, "{w:?}");
+        assert!(w.assemble_depth_us >= 4_000, "{w:?}");
         assert!(
-            w.assemble_target_us >= 2_000,
-            "the 2 ms sleep charged the target rails: {w:?}"
-        );
-        assert!(
-            w.assemble_depth_us >= 4_000,
-            "the 4 ms sleep charged the depth load: {w:?}"
-        );
-        assert!(
-            w.assemble_trail_us >= 6_000,
-            "the 6 ms sleep charged the trail: {w:?}"
-        );
-        // Carved out of `assemble_us`, not added beside it: the residue plus the
-        // three sub-phases are slices of the one chain `max_us` measured, so a
-        // sub-phase that also charged the residue — or charged twice — would put
-        // the sum over the whole.
-        assert!(
-            w.assemble_target_us + w.assemble_depth_us + w.assemble_trail_us + w.assemble_us
-                <= w.max_us,
-            "the three sub-phases and the residue are carved out of one chain: {w:?}"
-        );
-        assert!(
-            w.assemble_us < 1_000,
-            "and none of the three reached the residue: {w:?}"
+            w.assemble_target_us + w.assemble_depth_us + w.assemble_us <= w.max_us,
+            "{w:?}"
         );
     }
 
