@@ -600,13 +600,6 @@ pub fn device_drain(id: u64) -> bool {
     post_sweep(PostSweep::CacheLevels, || {
         crate::runtime::surface_cache::note_cache_levels(&device.state, &host)
     });
-    // Per tranche rather than per census window, unlike the levels above: this
-    // measures how long a slot the guest named takes to appear, so the sampling
-    // interval is the resolution of the answer. Returns immediately when nothing
-    // is watched, which is every tranche on every rail but macos-26.
-    post_sweep(PostSweep::SlotRecheck, || {
-        crate::runtime::objects::slot_recheck::sweep(&device.state, &host)
-    });
     // The ordering plane's own residue, on the same one-second cadence as the
     // levels above and for the reason `backing_outstanding_census` is emitted
     // beside `store_routes`: the routes count what *happened* to a pipeline and
