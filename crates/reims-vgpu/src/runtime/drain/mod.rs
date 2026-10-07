@@ -6349,62 +6349,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         result.render_attachment_resolves,
                         result.render_guest_stores
                     ));
-                    // What the engine was holding while this tranche waited.
-                    // This line is the only join anywhere between a stalled
-                    // submission and the pipeline objects in it, and a host GPU
-                    // hang is the case it exists for: the counts above say a
-                    // tranche took seconds, and nothing else says what it took
-                    // them on. Emitted beside the count rather than folded into
-                    // it because the two have different lengths and a reader
-                    // greps for one or the other.
-                    if let Some(trail) = crate::runtime::gpu_hang_trail::trail() {
-                        crate::observe::fail(format!(
-                            "TRANSPORT reason=sync_exec_lock_hold_trail ch={channel_id} {trail}"
-                        ));
-                    }
-                    // The trail above is what this device *recorded*; this is
-                    // what it is still *waiting on*. They are different
-                    // questions and the second is the one a stall asks: the
-                    // oldest outstanding submission is the one every later one
-                    // is queued behind, and a stall whose oldest carries
-                    // `draws=0` is a wedge that is not in a draw at all.
-                    //
-                    // `None` here is a reading rather than a gap — it says this
-                    // tranche is blocked on something the submission ring did
-                    // not submit.
-                    if let Some(outstanding) = crate::runtime::gpu_hang_trail::outstanding() {
-                        crate::observe::fail(format!(
-                            "TRANSPORT reason=sync_exec_lock_hold_outstanding ch={channel_id} \
-                             {outstanding}"
-                        ));
-                    }
-                    // The trail above is the last twelve draws, which at this
-                    // rail's rate is the last half millisecond — and a wedged
-                    // device goes on drawing about one draw per stall, so by the
-                    // second stall the trail is entirely post-wedge. The first
-                    // stall's is not, but even that one reaches only the
-                    // millisecond before the wait, while the wedge on the rail
-                    // this was built for begins in the ~300 ms after an
-                    // application's first window.
-                    //
-                    // Latched to the first stall of the boot, on purpose. It is a
-                    // per-process record, so every later stall would print the
-                    // same list one draw further on and the log would carry a
-                    // dozen near-identical copies of a line whose value is that
-                    // there is one of it.
-                    if crate::observe::first_sight("sync_exec_lock_hold_pipes", 0) {
-                        if let Some(firsts) =
-                            crate::runtime::gpu_hang_trail::recent_pipeline_firsts()
-                        {
-                            crate::observe::fail(format!(
-                                "TRANSPORT reason=sync_exec_lock_hold_pipes ch={channel_id} \
-                                 {firsts} (the pipelines this device drew for the first time \
-                                 most recently, oldest first, each with how many draws ago — \
-                                 a wedge in the second an application opens its first window \
-                                 has new pipelines in front of it and nothing else says which)"
-                            ));
-                        }
-                    }
                 }
             }
         }
