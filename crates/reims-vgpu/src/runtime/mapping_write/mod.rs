@@ -1338,7 +1338,6 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
         }
     };
     if publication == FramePublication::HostCache {
-        let _span_cache = crate::runtime::chain_phase::CostSpan::new("surface_changed_cache_us");
         // Converted straight into the cache buffer, overwriting the previous
         // frame. What that costs is measured: ~0.90 ms a flush moving 16.6 MB,
         // which is memory-bound.
