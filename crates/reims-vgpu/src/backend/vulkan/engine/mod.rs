@@ -17,7 +17,6 @@ mod desc_arena;
 mod device_lost;
 mod digest;
 mod draw_execution;
-mod draw_phase;
 mod draw_preparation;
 pub(crate) mod draw_validation;
 mod driver_breadcrumb;
@@ -46,11 +45,9 @@ pub use pools::sampled_working_set::census as sampled_working_set_census;
 /// Reference interval used only to keep reuse-distance census bands stable.
 /// Residency policy does not read it.
 pub(crate) use pools::IDLE_MAINTENANCE_START_MS;
-pub mod gather_phase;
 pub mod gpu_span;
 pub mod reason;
 mod slab;
-pub mod stage_phase;
 pub mod types;
 pub mod vk_call;
 #[cfg(feature = "host-window")]
@@ -58,7 +55,6 @@ mod window_present;
 
 pub use context::MAX_DEVICE_RECREATES;
 pub(crate) use counters::{CounterSnapshot, EngineCounters, TargetReadDelivery};
-pub(crate) use draw_phase::take_window as draw_phase_window;
 pub(crate) use draw_preparation::DrawPreparationDecline;
 // Read only under `host-window`, which is what the boot harness builds. Its
 // absence there is a build failure and not a warning, so the `expect` says the
