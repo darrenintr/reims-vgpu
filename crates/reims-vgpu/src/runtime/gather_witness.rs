@@ -1461,7 +1461,6 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
         note_store_route("gw_unnameable");
         note_store_route_n("gw_unnameable_kb", span / 1024);
     }
-    crate::runtime::gather_storm::note_bind(key, rail, span, &seen);
     GatherOutcome {
         identity: seen.vouch.nameable().then_some(GatheredIdentity {
             key: key.content_key(),
@@ -1576,7 +1575,6 @@ fn observe<M: crate::runtime::host::HostOps>(
         // the table reports the same loss on every pass and the count above
         // already says how often.
         if let Some((victim, span)) = witness.evict_oldest(host) {
-            crate::runtime::gather_storm::note_window_evicted(victim);
             crate::observe::emit::Emit::decline(
                 "gather_witness",
                 &GatherWitnessFault::TrackedWindowEvicted {
