@@ -7832,7 +7832,6 @@ fn a_pipeline_whose_inputs_cannot_load_is_not_a_pending_translation() {
     let state = DeviceState::new(crate::model::DeviceId(1), 12);
     let host = crate::runtime::host::FakeHost::new();
     let submission = super::ExecSubmission::stated(1, vec![stream]);
-    let mut measured_ns = 0u64;
     // The transaction the walk would have built for that record, stated here
     // because this test drives the rail directly rather than through admission.
     let mut builder = reims_vgpu_core::exec::ExecBuilder::new();
@@ -8121,8 +8120,7 @@ fn a_submission_frames_each_stream_once_and_preflight_frames_none() {
     let resolved = reims_vgpu_core::exec::ExecWork::default();
 
     let before = store_route_count("exec_stream_framed");
-    let mut measured_ns = 0u64;
-    let pending = preflight_submission(&state, &host, &submission, &resolved, &mut measured_ns);
+    let pending = preflight_submission(&state, &host, &submission, &resolved);
     assert!(pending.is_empty(), "the fixture resolves no leases");
     assert_eq!(
         store_route_count("exec_stream_framed"),
