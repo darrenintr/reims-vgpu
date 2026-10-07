@@ -604,10 +604,6 @@ pub struct ExecResult {
     /// Render ICB execute ok / fail (`0x14`/`0x15`).
     pub render_icb_ok: u32,
     pub render_icb_fail: u32,
-    /// Wall-clock for the whole synchronous packet body. A packet holding the
-    /// device lock past `SYNC_EXEC_STALL_US` starves the guest's read-to-clear
-    /// completion registers; the drain reports that as a typed TRANSPORT line.
-    pub total_us: u64,
 }
 
 /// How many command buffers one exec packet carried, in buckets.
@@ -824,7 +820,6 @@ fn read_submission<M: HostMemory + HostOps>(
     host: &M,
     payload: &[u8],
     out: &mut ExecResult,
-    measured_ns: &mut u64,
 ) -> Option<ExecSubmission> {
     if payload.len() < CHILD_EXEC_INDIRECT_HEADER_LEN as usize {
         return None;
@@ -881,13 +876,9 @@ fn read_submission<M: HostMemory + HostOps>(
 
     // This call's measured spans, summed, so `Header` can be the leftover. The
     // census's own totals cover the whole window and cannot answer for one call.
-    let load_started = std::time::Instant::now();
     let streams = load_command_streams(state, host, task_id, payload, cbufs_off, cmdbuf_count);
     out.streams_loaded += u32::try_from(streams.len()).unwrap_or(u32::MAX);
     note_command_stream_count(streams.len());
-    let load_ns = load_started.elapsed().as_nanos() as u64;
-    *measured_ns += load_ns;
-    crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Load, load_ns);
 
     Some(ExecSubmission {
         task_id,
@@ -925,9 +916,7 @@ pub fn preflight_submission<M: HostMemory + HostOps>(
     host: &M,
     submission: &ExecSubmission,
     resolved: &reims_vgpu_core::exec::ExecWork,
-    measured_ns: &mut u64,
 ) -> Vec<u32> {
-    let preflight_started = std::time::Instant::now();
     // The render half of the packet's leases, and the guest's own ref, which is
     // the slot half of the name: the generation is the model's business and no
     // MTLB is keyed by it. Compute leases are held back because the compute
@@ -966,16 +955,6 @@ pub fn preflight_submission<M: HostMemory + HostOps>(
         &refs,
         &dispatches,
     );
-    // Timed unconditionally: the phase is the drain's own accounting of where
-    // an exec call's time went, and a rail that preflights nothing has to show
-    // as the zero it costs rather than as an absent column the leftover
-    // `Header` silently absorbs.
-    let preflight_ns = preflight_started.elapsed().as_nanos() as u64;
-    *measured_ns += preflight_ns;
-    crate::runtime::drain::note_exec_phase(
-        crate::runtime::drain::ExecPhase::Preflight,
-        preflight_ns,
-    );
     pending
 }
 
@@ -990,7 +969,6 @@ fn execute_submission<M: HostMemory + HostOps>(
     submission: &ExecSubmission,
     resolved: Option<&reims_vgpu_core::exec::ExecWork>,
     out: &mut ExecResult,
-    measured_ns: &mut u64,
 ) {
     let ExecSubmission {
         task_id,
@@ -1014,7 +992,6 @@ fn execute_submission<M: HostMemory + HostOps>(
 
     for stream in streams {
         let mut acc = StreamAccum::default();
-        let walk_started = std::time::Instant::now();
         walk_stream(
             state,
             host,
@@ -1024,14 +1001,7 @@ fn execute_submission<M: HostMemory + HostOps>(
             &mut acc,
             resolved.as_mut(),
         );
-        let walk_ns = walk_started.elapsed().as_nanos() as u64;
-        *measured_ns += walk_ns;
-        crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Walk, walk_ns);
-        let finish_started = std::time::Instant::now();
         finish_stream(state, host, task_id, out, &acc);
-        let finish_ns = finish_started.elapsed().as_nanos() as u64;
-        *measured_ns += finish_ns;
-        crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Finish, finish_ns);
     }
 }
 
@@ -1066,8 +1036,6 @@ pub fn execute_planned<M: HostMemory + HostOps>(
     inputs: RetainedInputs<'_>,
     mut out: ExecResult,
 ) -> ExecResult {
-    let started = std::time::Instant::now();
-    let mut measured_ns = 0u64;
     // Read, plan, execute. The plan step is separate because it is the only one
     // of the three that a caller may run at a moment of its own choosing: it is
     // pure CPU work over bytes the submission already holds, where the read
@@ -1079,12 +1047,7 @@ pub fn execute_planned<M: HostMemory + HostOps>(
         inputs.submission,
         Some(inputs.resolved),
         &mut out,
-        &mut measured_ns,
     );
-    note_exec_header(started, measured_ns);
-    if !out.deferred {
-        out.total_us = elapsed_us(started);
-    }
     out
 }
 
@@ -1104,35 +1067,9 @@ pub fn read_exec_submission<M: HostMemory + HostOps>(
     host: &M,
     payload: &[u8],
 ) -> (Option<ExecSubmission>, ExecResult) {
-    let started = std::time::Instant::now();
     let mut out = ExecResult::default();
-    let mut measured_ns = 0u64;
-    let submission = read_submission(state, host, payload, &mut out, &mut measured_ns);
-    note_exec_header(started, measured_ns);
+    let submission = read_submission(state, host, payload, &mut out);
     (submission, out)
-}
-
-/// Close the [`ExecPhase`] tiling of one exec half at one of its return
-/// points.
-///
-/// [`ExecPhase::Header`] is the **leftover**, not a span: it is the function's
-/// own elapsed time minus the four that measured themselves, so the five sum to
-/// the opcode's `op0x37_us` whatever path the call took. Deriving it rather than
-/// wrapping the header parse is what makes the tiling closed — a cost in a
-/// corner nobody thought to list still lands here instead of vanishing, which is
-/// the property that made the child-FIFO tiling answer on one boot.
-///
-/// `measured_ns` is **this call's** four spans summed, not the census's running
-/// totals: the census accumulates across every packet in the window, so
-/// subtracting it from one call's clock would be subtracting the whole second.
-/// The subtraction is saturating anyway, because an underflow would print as a
-/// colossal `header_us` rather than as the zero it means.
-fn note_exec_header(exec_started: std::time::Instant, measured_ns: u64) {
-    let total = exec_started.elapsed().as_nanos() as u64;
-    crate::runtime::drain::note_exec_phase(
-        crate::runtime::drain::ExecPhase::Header,
-        total.saturating_sub(measured_ns),
-    );
 }
 
 /// Apply every record of one submission's resource table.
@@ -1240,10 +1177,6 @@ impl crate::observe::Decline for ResourceTableDecline {
     fn fields(&self) -> Vec<(&'static str, String)> {
         Vec::new()
     }
-}
-
-fn elapsed_us(started: std::time::Instant) -> u64 {
-    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 /// The two inputs an admitted packet was retained with.
