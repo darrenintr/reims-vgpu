@@ -5400,83 +5400,24 @@ fn apply_map_family<H: HostMemory + HostOps>(
         length,
     }) = notice
     {
-        // Audit the interval against what this task already has live: a range
-        // mapped twice or unmapped without a map is a disagreement the guest's
-        // own teardown assertion will eventually find.
-        //
-        // Both fields are the values the guest's own `allocate`/`deallocate`
-        // receive: its length getter forwards to the same call this packet's
-        // length field is built from, and the address is one getter used by
-        // both. So these intervals are the page-table ranges and not merely
-        // consistent with themselves. Observation only; nothing reads the
-        // verdict. See `runtime::map_audit`.
-        // The notice, in the model that owns the address space it is about.
-        // `Lifecycle` holds nothing keyed by a guest address — deliberately, so
-        // that no resolution it hands out can go stale behind its back — so it
-        // performs nothing here and states the obligation instead: every
-        // resolution held over this interval was computed against pages the
-        // guest has since moved. The audit and the retirements below are this
-        // device discharging exactly that, and the direction they discharge it
-        // in is the model's `Remap::established` rather than a second reading of
-        // the opcode.
-        let remapped = state
-            .apply_lifetime(
-                &if matches!(family, MapFamily::MapMemory2) {
-                    reims_vgpu_core::lifecycle::LifecycleOp::MapMemory {
-                        task: reims_vgpu_core::identity::TaskId(task_id),
-                        span: reims_vgpu_core::access::GuestSpan { base: gva, length },
-                    }
-                } else {
-                    reims_vgpu_core::lifecycle::LifecycleOp::UnmapMemory {
-                        task: reims_vgpu_core::identity::TaskId(task_id),
-                        span: reims_vgpu_core::access::GuestSpan { base: gva, length },
-                    }
-                },
-                family.slug(),
-            )
-            .and_then(|acted| acted.remapped.into_iter().next());
-        {
-            let page_size = 1u64 << state.page_shift;
-            // The model's answer where there is one. A refusal is reported by
-            // the door and the audit still runs off the packet's own opcode:
-            // this device's caches alias pages whether or not the model kept a
-            // task for them, and an invalidation it skipped would leave a host
-            // view over memory the guest has taken back.
-            let established = remapped.map_or_else(
-                || matches!(family, MapFamily::MapMemory2),
-                |r| r.established,
-            );
-            let intervals = state.map_audit.entry(task_id).or_default();
-            let verdict = if established {
-                intervals.map(gva, length, page_size)
+        // Publish the guest-VA lifetime transition to the ordering model.
+        // Cache/view retirement below remains the device-side invalidation.
+        let _ = state.apply_lifetime(
+            &if matches!(family, MapFamily::MapMemory2) {
+                reims_vgpu_core::lifecycle::LifecycleOp::MapMemory {
+                    task: reims_vgpu_core::identity::TaskId(task_id),
+                    span: reims_vgpu_core::access::GuestSpan { base: gva, length },
+                }
             } else {
-                intervals.unmap(gva, length)
-            };
-            // Counted on every verdict, including `Consistent`. The fail line
-            // below is emitted only on a finding and deduped on top of that, so
-            // without this the audit's silence would be indistinguishable from
-            // the audit never having run — which is what "clean on a dozen
-            // panicking boots" actually rested on. The census is the only
-            // never-fired signal there is.
-            note_store_route(verdict.slug());
-            if verdict.is_finding()
-                && crate::observe::first_sight(
-                    verdict.slug(),
-                    u64::from(task_id) << 32 | u64::from(channel_id),
-                )
-            {
-                let live = intervals.live_count();
-                crate::observe::fail(format!(
-                    "map_audit op={name} reason={} task={task_id} gva={gva:#x} len={length:#x} \
-                     live={live} detail={verdict:?} (the guest applies this exact interval to its \
-                     own page table; a disagreement here is one its teardown will assert on)",
-                    verdict.slug()
-                ));
-            }
-        }
-        // The other half of the same question, and the one the interval audit
-        // reading clean moves the weight onto: has this device *written* into a
-        // page that holds the guest's page-table entries? The descent below is
+                reims_vgpu_core::lifecycle::LifecycleOp::UnmapMemory {
+                    task: reims_vgpu_core::identity::TaskId(task_id),
+                    span: reims_vgpu_core::access::GuestSpan { base: gva, length },
+                }
+            },
+            family.slug(),
+        );
+        // Has this device *written* into a page that holds the guest's
+        // page-table entries? The descent below is
         // the only work done for it — the write census it asks is already kept
         // for the sampled cache. See `runtime::node_guard`.
         observe_page_table_nodes(state, host, task_id, gva);
