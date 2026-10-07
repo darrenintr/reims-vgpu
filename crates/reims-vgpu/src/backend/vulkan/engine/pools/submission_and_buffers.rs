@@ -69,6 +69,21 @@ const POOL_SLOT_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
         | vk::BufferUsageFlags::STORAGE_BUFFER.as_raw(),
 );
 
+/// Staging buckets whose first allocation is too expensive to leave on a draw's
+/// critical path on a discrete host.
+///
+/// These are structural size classes, not application or device-name special
+/// cases. A driven workload that rapidly introduces large sampled surfaces can
+/// need two full-frame-ish uploads before the first one retires. Creating those
+/// buffers lazily also creates and maps their backing upload slabs while the
+/// engine lock is held, turning allocator latency directly into a dropped frame.
+///
+/// Two 8 MiB slots share one 16 MiB upload slab; the 16 MiB slot occupies a
+/// second block. The 64 KiB slot primes the small class. Total warm backing is
+/// therefore about 34 MiB, and all slots enter the ordinary free lists: there is
+/// no separate lifetime or reuse rule for warmed memory.
+const DISCRETE_STAGING_PREWARM: [u64; 4] = [64 << 10, 8 << 20, 8 << 20, 16 << 20];
+
 /// Whether the identity-only lookup runs, given what the environment said.
 ///
 /// Split from the read below so the one thing left to get wrong is testable
@@ -671,6 +686,40 @@ impl ResourcePools {
         )
     }
 
+    /// Populate the normal staging free list without putting a buffer in flight.
+    ///
+    /// This deliberately uses `acquire_staging` rather than duplicating its
+    /// buffer/memory policy. The acquired slot is live only in the pool's CPU
+    /// bookkeeping; no command buffer has seen it, so it can move straight back
+    /// to the free list without a fence.
+    unsafe fn prewarm_staging_slot(
+        &mut self,
+        ctx: &DeviceContext,
+        size: u64,
+        counters: &EngineCounters,
+    ) -> Result<(), DrawError> {
+        let slot = unsafe { self.acquire_staging(ctx, size, counters)? };
+        let Some(index) = self
+            .staging_live
+            .iter()
+            .rposition(|live| live.buffer == slot.buffer)
+        else {
+            crate::observe::fail(format!(
+                "staging_prewarm status=bookkeeping_miss bytes={size} bucket={}",
+                slot.size
+            ));
+            return Ok(());
+        };
+        let slot = self.staging_live.swap_remove(index);
+        let bucket = slot.size;
+        self.staging_free.entry(bucket).or_default().push(slot);
+        crate::observe::off(format!(
+            "staging_prewarm status=ready bytes={size} bucket={bucket} free={}",
+            self.staging_free.get(&bucket).map_or(0, Vec::len)
+        ));
+        Ok(())
+    }
+
     pub(crate) unsafe fn ensure_init(
         &mut self,
         ctx: &DeviceContext,
@@ -744,6 +793,29 @@ impl ResourcePools {
         self.cur = 0;
         self.in_flight = 0;
         self.initialized = true;
+
+        // Discrete hosts pay real allocation + mapping latency for upload
+        // memory. Move the first small/large slab allocations to device-pool
+        // initialization instead of letting an arbitrary guest draw become the
+        // allocator's synchronization point. Unified hosts do not take this arm:
+        // retaining tens of MiB there consumes the same memory the guest uses,
+        // and their allocation cost is a different measurement.
+        if matches!(
+            ctx.caps.memory.topology,
+            crate::backend::vulkan::caps::memory_topology::MemoryTopology::Discrete
+        ) {
+            for size in DISCRETE_STAGING_PREWARM {
+                if let Err(error) = unsafe { self.prewarm_staging_slot(ctx, size, counters) } {
+                    // Prewarming is a performance hint only. The ordinary miss
+                    // path remains correct and will retry lazily, so a host that
+                    // cannot spare the warm memory must still initialize.
+                    crate::observe::fail(format!(
+                        "staging_prewarm status=failed bytes={size} error={error}"
+                    ));
+                    break;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3773,6 +3845,63 @@ impl ResourcePools {
     /// otherwise move the slot into the submitted entry's cleanup.
     pub(crate) fn lease_readback(&mut self) -> Option<ReadbackLease> {
         let slot = self.readback_live.take()?;
+        match self.register_readback_lease(slot) {
+            Ok(lease) => Some(lease),
+            Err(slot) => {
+                self.readback_live = Some(slot);
+                None
+            }
+        }
+    }
+
+    /// Lease a readback slot after its submission has retired.
+    ///
+    /// Compute storage-image readbacks are acquired through
+    /// `acquire_readback_extra` and sealed into the submission. By the time
+    /// the dispatch's fence is retired those slots have moved into
+    /// `readback_free`; copying them into a `Vec` only to immediately scatter
+    /// the bytes into guest memory adds another full-frame host pass. This
+    /// removes the exact slot from the free pool and lends its persistent
+    /// mapping to that scatter instead.
+    ///
+    /// The engine lock is held while this search runs, so a free slot cannot be
+    /// acquired by another command between retirement and removal.
+    pub(crate) fn lease_retired_readback(
+        &mut self,
+        buffer: vk::Buffer,
+        slot_size: u64,
+    ) -> Option<ReadbackLease> {
+        // Free readbacks are bucketed by their allocation size, and the handle
+        // we retained carries that exact size. Search only that bucket instead
+        // of walking every bucket in the pool.
+        let bucket = Self::bucket(slot_size);
+        let index = self
+            .readback_free
+            .get(&bucket)?
+            .iter()
+            .position(|slot| slot.buffer == buffer)?;
+        let slot = self.readback_free.get_mut(&bucket)?.swap_remove(index);
+        if self
+            .readback_free
+            .get(&bucket)
+            .is_some_and(|list| list.is_empty())
+        {
+            self.readback_free.remove(&bucket);
+        }
+        match self.register_readback_lease(slot) {
+            Ok(lease) => Some(lease),
+            Err(slot) => {
+                self.readback_free.entry(bucket).or_default().push(slot);
+                None
+            }
+        }
+    }
+
+    /// Turn a pool-owned slot into a mapping lease.
+    ///
+    /// Shared by the live render-target path and the retired compute-readback
+    /// path so the capability gate and teardown accounting cannot diverge.
+    fn register_readback_lease(&mut self, slot: BufferSlot) -> Result<ReadbackLease, BufferSlot> {
         // Two refusals, and both send the caller to the copying path rather
         // than to a failure.
         //
@@ -3788,8 +3917,7 @@ impl ResourcePools {
         // of a scattered walk, so where the cached type was unavailable the
         // copy is genuinely the faster shape and the lease declines.
         if slot.mapped == 0 || !slot.cached {
-            self.readback_live = Some(slot);
-            return None;
+            return Err(slot);
         }
         let token = NEXT_READBACK_LEASE_TOKEN.fetch_add(1, Ordering::Relaxed);
         // Before the slot leaves the pool: the counter is what a teardown reads
@@ -3802,7 +3930,7 @@ impl ResourcePools {
             slot_size: slot.size,
         };
         self.readback_leased.push(LeasedReadback { token, slot });
-        Some(lease)
+        Ok(lease)
     }
 
     /// Take back every lease whose holder has finished and return its slot to

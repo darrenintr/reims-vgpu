@@ -7,6 +7,32 @@
 
 use super::selected_within;
 
+#[test]
+fn packed_write_rect_preserves_guest_row_padding_across_run_boundaries() {
+    let rect = super::RectStride::new(8, 4, 3).expect("valid rectangle");
+    let src = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    let mut host = [0xeeu8; 20];
+    let mut copy = super::RunCopy::write_rect(&src, rect).expect("packed source fits");
+
+    // Split in row-0 padding to model two physical guest-page runs.
+    unsafe {
+        copy.apply(host.as_mut_ptr() as usize, 0, 0, 7);
+        copy.apply(host.as_mut_ptr() as usize, 7, 7, 13);
+    }
+
+    assert_eq!(&host[0..4], &src[0..4]);
+    assert_eq!(&host[8..12], &src[4..8]);
+    assert_eq!(&host[16..20], &src[8..12]);
+    assert_eq!(&host[4..8], &[0xee; 4]);
+    assert_eq!(&host[12..16], &[0xee; 4]);
+}
+
+#[test]
+fn packed_write_rect_rejects_a_short_source() {
+    let rect = super::RectStride::new(8, 4, 3).expect("valid rectangle");
+    assert!(super::RunCopy::write_rect(&[0u8; 11], rect).is_none());
+}
+
 fn sel(ranges: Option<&[(u64, u64)]>, lo: u64, hi: u64) -> Vec<(u64, u64)> {
     selected_within(ranges, lo, hi).collect()
 }

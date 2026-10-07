@@ -384,7 +384,12 @@ pub(crate) unsafe fn execute_compute_inner(
     // slot is still in flight; the wait lands in retire_wait_us.
     let (cb, fence) = pools.begin_entry(ctx, counters)?;
 
-    let mut layout_bindings = Vec::new();
+    let mut layout_bindings = Vec::with_capacity(
+        req.storage_buffers.len()
+            + req.sampled_images.len()
+            + req.samplers.len()
+            + req.storage_images.len(),
+    );
     for b in &req.storage_buffers {
         layout_bindings.push(BindingSig {
             binding: b.binding,
@@ -481,7 +486,10 @@ pub(crate) unsafe fn execute_compute_inner(
     // interior size plus whichever boundary sizes its grid produced. The cache
     // is content-keyed on that size, so a steady dispatch shape pays no create
     // after its first launch. `get_or_create_compute_pipeline` counts each hit.
-    let mut dispatch_steps: Vec<DispatchStep> = Vec::new();
+    let mut dispatch_steps: Vec<DispatchStep> = Vec::with_capacity(match &req.dispatch {
+        ComputeDispatch::Workgroups(_) => 1,
+        ComputeDispatch::Regions { regions, .. } => regions.len(),
+    });
     match &req.dispatch {
         ComputeDispatch::Workgroups(grid) => {
             let cpipe_key = ComputePipelineKey {
@@ -508,7 +516,6 @@ pub(crate) unsafe fn execute_compute_inner(
             regions,
             ..
         } => {
-            dispatch_steps.reserve(regions.len());
             for region in regions {
                 let cpipe_key = ComputePipelineKey {
                     spirv: spirv_digest,
@@ -533,7 +540,7 @@ pub(crate) unsafe fn execute_compute_inner(
     }
 
     // Storage buffers: host-visible staging used as SSBOs (same as draw path).
-    let mut storage_slots = Vec::new();
+    let mut storage_slots = Vec::with_capacity(req.storage_buffers.len());
     for resource in &req.storage_buffers {
         let slot = pools.acquire_staging(ctx, resource.bytes.len() as u64, counters)?;
         pools.write_staging(ctx, &slot, &resource.bytes)?;
@@ -548,7 +555,7 @@ pub(crate) unsafe fn execute_compute_inner(
     // Sampled images: device-local + staging seed upload — or a device-local
     // copy from a resident storage image (copy-on-sample: the transient never
     // aliases the live resident, so the same dispatch may storage-write it).
-    let mut sampled_slots = Vec::new();
+    let mut sampled_slots = Vec::with_capacity(req.sampled_images.len());
     for resource in &req.sampled_images {
         // Ahead of the pooled transient, because this source does not want one.
         // A multisample image cannot be filled by an upload or a copy, so
@@ -720,14 +727,14 @@ pub(crate) unsafe fn execute_compute_inner(
         });
     }
 
-    let mut sampler_handles = Vec::new();
+    let mut sampler_handles = Vec::with_capacity(req.samplers.len());
     for sampler in &req.samplers {
         let handle = caches.get_or_create_sampler(ctx, &sampler.state_key(), counters, pools)?;
         sampler_handles.push((sampler.binding, handle));
     }
 
     // Storage images: device-local + staging seed upload + readback buffer.
-    let mut simg_slots = Vec::new();
+    let mut simg_slots = Vec::with_capacity(req.storage_images.len());
     for resource in &req.storage_images {
         let key = StorageImageKey {
             width: resource.width,
@@ -853,7 +860,9 @@ pub(crate) unsafe fn execute_compute_inner(
         })
         .collect();
     let dst_set = dset.unwrap_or_default();
-    let mut descriptor_writes = Vec::new();
+    let mut descriptor_writes = Vec::with_capacity(
+        storage_slots.len() + sampled_slots.len() + sampler_handles.len() + simg_slots.len(),
+    );
     for (i, (binding, _, _, _)) in storage_slots.iter().enumerate() {
         descriptor_writes.push(
             vk::WriteDescriptorSet::default()
@@ -1284,16 +1293,25 @@ pub(crate) unsafe fn execute_compute_inner(
         );
     }
 
-    // Storage images → readback buffers
-    for prepared in &simg_slots {
-        let img = &prepared.slot;
-        let barrier = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-            .old_layout(vk::ImageLayout::GENERAL)
-            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .image(img.image)
-            .subresource_range(super::color_subresource_range())];
+    // Storage images → readback buffers / guest-page copies.
+    //
+    // Every storage image leaves compute in the same access/layout state and
+    // enters the same transfer-read state. Emit one dependency carrying all of
+    // them instead of one vkCmdPipelineBarrier per binding; the copies remain
+    // per destination below.
+    if !simg_slots.is_empty() {
+        let barriers: Vec<_> = simg_slots
+            .iter()
+            .map(|prepared| {
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .image(prepared.slot.image)
+                    .subresource_range(super::color_subresource_range())
+            })
+            .collect();
         ctx.device.cmd_pipeline_barrier(
             cb,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1301,8 +1319,11 @@ pub(crate) unsafe fn execute_compute_inner(
             vk::DependencyFlags::empty(),
             &[],
             &[],
-            &barrier,
+            &barriers,
         );
+    }
+    for prepared in &simg_slots {
+        let img = &prepared.slot;
         match &prepared.dst {
             ComputeImageDst::Readback(slot) => {
                 // The pooled readback is always tightly packed from texel zero.
@@ -1484,18 +1505,35 @@ pub(crate) unsafe fn execute_compute_inner(
     for prepared in &simg_slots {
         match &prepared.dst {
             ComputeImageDst::Readback(readback) => {
-                let out = crate::backend::vulkan::engine::pools::read_back_slot(
+                let leased = crate::backend::vulkan::engine::pools::lease_read_back_slot(
                     ctx,
+                    pools,
                     readback,
                     prepared.len as u64,
-                    VkOp::ComputeExecMapImageReadback,
                     VkOp::ComputeExecInvalidateImageReadback,
                 )?;
                 counters.note_readback(
                     prepared.len as u64,
                     super::counters::ReadbackSource::ComputeImage,
                 );
-                images.push(super::types::ComputeImageResult::Bytes(out));
+                if let Some(lease) = leased {
+                    images.push(super::types::ComputeImageResult::Leased(
+                        super::types::ComputeReadbackLease::new(
+                            lease.token,
+                            lease.ptr,
+                            prepared.len,
+                        ),
+                    ));
+                } else {
+                    let out = crate::backend::vulkan::engine::pools::read_back_slot(
+                        ctx,
+                        readback,
+                        prepared.len as u64,
+                        VkOp::ComputeExecMapImageReadback,
+                        VkOp::ComputeExecInvalidateImageReadback,
+                    )?;
+                    images.push(super::types::ComputeImageResult::Bytes(out));
+                }
             }
             // Nothing was read, so nothing is charged to the readback census —
             // that is the saving this arm exists for, and a bump here would

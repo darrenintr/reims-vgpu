@@ -2940,6 +2940,22 @@ fn writeback_texture<R: RailStage, M: HostMemory + HostOps>(
     task_id: u32,
     tex: &StagedTexture<R>,
 ) -> Result<(), ComputeStatus> {
+    writeback_texture_bytes(state, host, task_id, tex, &tex.bytes)
+}
+
+/// Write a staged texture's output from an arbitrary tight-row byte slice.
+///
+/// The ordinary path delegates here with `tex.bytes`; Vulkan's cached
+/// readback-lease path passes the persistently mapped readback slot directly,
+/// avoiding a full-frame `Vec` copy before this function scatters the bytes
+/// into guest memory.
+fn writeback_texture_bytes<R: RailStage, M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    tex: &StagedTexture<R>,
+    bytes: &[u8],
+) -> Result<(), ComputeStatus> {
     // Which destination namespace a compute storage output lands in, and — on
     // the linear arm — whether its guest rows are dense. Both are properties of
     // the guest's own window rather than of this device, and neither is
@@ -2996,7 +3012,7 @@ fn writeback_texture<R: RailStage, M: HostMemory + HostOps>(
         } => {
             let tight = (*width as usize) * (*bpp as usize);
             let required = tight.saturating_mul(*height as usize);
-            if tight > *row_stride as usize || tex.bytes.len() < required {
+            if tight > *row_stride as usize || bytes.len() < required {
                 crate::observe::fail(format!(
                     "compute_writeback_tex fail reason=linear_layout bind={} gva={gva:#x} dims={}x{} bpp={} row_stride={} tight={} bytes={} required={required}",
                     tex.binding,
@@ -3005,7 +3021,7 @@ fn writeback_texture<R: RailStage, M: HostMemory + HostOps>(
                     bpp,
                     row_stride,
                     tight,
-                    tex.bytes.len()
+                    bytes.len()
                 ));
                 return Err(ComputeStatus::GuestIo("compute_wb_tex_linear_layout"));
             }
@@ -3018,7 +3034,7 @@ fn writeback_texture<R: RailStage, M: HostMemory + HostOps>(
                 height: *height,
                 row_stride: *row_stride,
             };
-            if !crate::runtime::surface_cache::store_linear_texture(state, &window, &tex.bytes) {
+            if !crate::runtime::surface_cache::store_linear_texture(state, &window, bytes) {
                 crate::observe::fail(format!(
                     "compute_writeback_tex fail reason=linear_cache_store task={task_id} ref={texture_ref} bind={} gva={gva:#x} fmt={pixel_format:#x} dims={}x{} bpp={} row_stride={} bytes={}",
                     tex.binding,
@@ -3026,13 +3042,11 @@ fn writeback_texture<R: RailStage, M: HostMemory + HostOps>(
                     height,
                     bpp,
                     row_stride,
-                    tex.bytes.len()
+                    bytes.len()
                 ));
                 return Err(ComputeStatus::GuestIo("compute_wb_tex_linear_cache_store"));
             }
-            crate::runtime::surface_cache::mirror_linear_color_cache(
-                state, host, &window, &tex.bytes,
-            );
+            crate::runtime::surface_cache::mirror_linear_color_cache(state, host, &window, bytes);
             // Kept although the span is no longer needed here: the overflow is
             // a real refusal with a name, and `write_linear_guest_within` would only
             // return a bare `false` for it.
@@ -3060,7 +3074,7 @@ fn writeback_texture<R: RailStage, M: HostMemory + HostOps>(
                 *row_stride,
                 tight,
                 *height,
-                &tex.bytes,
+                bytes,
                 &format!("bind={}", tex.binding),
                 (!pages.membership().is_empty()).then_some(pages.membership()),
             ) {
@@ -3125,7 +3139,7 @@ fn writeback_texture<R: RailStage, M: HostMemory + HostOps>(
                 *width,
                 *height,
                 bpp,
-                &tex.bytes,
+                bytes,
                 tight,
             ) {
                 crate::observe::fail(format!(
@@ -3136,7 +3150,7 @@ fn writeback_texture<R: RailStage, M: HostMemory + HostOps>(
                     width,
                     height,
                     bpp,
-                    tex.bytes.len()
+                    bytes.len()
                 ));
                 return Err(ComputeStatus::GuestIo(
                     "compute_wb_tex_mapper_ref_texture_write",
