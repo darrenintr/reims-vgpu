@@ -1127,62 +1127,6 @@ impl RegsOp {
     }
 }
 
-/// One of the per-tranche sweeps that run after `publish_us` is banked.
-///
-/// They are the whole of `gap_post_us`, which is **~21 ms of every driven second**
-/// on the x86/Vulkan iGPU — the only device-side item left in the drain worker's
-/// missing third once `gap_lock_us` (0.02 %) and the interrupt hop (6 % of the
-/// idle, ~10 µs a pulse) were measured and excluded.
-///
-/// Every one of them documents itself as returning immediately when there is
-/// nothing to do, and collectively they cost this, so which one it is cannot be
-/// reasoned out from those docs. Hence a split rather than a guess.
-#[derive(Clone, Copy)]
-pub enum PostSweep {
-    /// `surface_cache::note_cache_levels` — self-gated to a one-second cadence.
-    CacheLevels,
-    /// `released_pages::sweep` + `note_levels`, timed as one because they are
-    /// the two halves of the same question and neither has a caller elsewhere.
-    ReleasedPages,
-    /// `bound_buffers::note_registry_levels`, Vulkan only.
-    BindLevels,
-    /// `DeviceState::pipeline_occupancy_census` — self-gated to a one-second
-    /// cadence, and quiet until the guest declares a pipeline.
-    PipelineTable,
-}
-
-impl PostSweep {
-    /// How many sweeps there are. The census array is sized from this, so a new
-    /// variant that forgets to bump it fails to build [`Self::ALL`] rather than
-    /// overflowing an array at report time.
-    pub(crate) const COUNT: usize = 5;
-
-    const ALL: [PostSweep; Self::COUNT] = [
-        PostSweep::CacheLevels,
-        PostSweep::ReleasedPages,
-        PostSweep::BindLevels,
-        PostSweep::PipelineTable,
-    ];
-
-    const fn index(self) -> usize {
-        match self {
-            PostSweep::CacheLevels => 0,
-            PostSweep::ReleasedPages => 1,
-            PostSweep::BindLevels => 2,
-            PostSweep::PipelineTable => 3,
-        }
-    }
-
-    const fn label(self) -> &'static str {
-        match self {
-            PostSweep::CacheLevels => "cachelv",
-            PostSweep::ReleasedPages => "relpg",
-            PostSweep::BindLevels => "bindlv",
-            PostSweep::PipelineTable => "pipetbl",
-        }
-    }
-}
-
 impl FlushRail {
     const ALL: [FlushRail; 4] = [
         FlushRail::Render,
@@ -1608,11 +1552,6 @@ pub(crate) struct DrainDutyCensus {
     gap_lock_us: std::sync::atomic::AtomicU64,
     gap_skip_us: std::sync::atomic::AtomicU64,
     gap_post_us: std::sync::atomic::AtomicU64,
-    /// The per-sweep division of [`Self::gap_post_us`], indexed by
-    /// [`PostSweep::index`]. Emitted beside the total it divides, so
-    /// `sum(post_*_us) == gap_post_us` is checkable on the line — a sweep that
-    /// gains a call site and no timer shows up as a shortfall there.
-    post_sweep_ns: [std::sync::atomic::AtomicU64; PostSweep::COUNT],
     /// `observe::elapsed_us()` when this worker last returned from a drain
     /// entry point, skipped or not. Zero before the first, which is the one
     /// entry whose `idle` cannot be measured and is dropped rather than
@@ -1841,14 +1780,6 @@ impl DrainDutyCensus {
         self.irq_wait_us.fetch_add(waited, Relaxed);
         self.irq_waits.fetch_add(1, Relaxed);
         self.irq_wait_max_us.fetch_max(waited, Relaxed);
-    }
-
-    /// Attribute `ns` of this entry's `gap_post_us` to one sweep.
-    ///
-    /// Nanoseconds because a single sweep call is a few hundred of them; the
-    /// report divides back to microseconds like every other span on the line.
-    pub(crate) fn note_post_sweep(&self, sweep: PostSweep, ns: u64) {
-        self.post_sweep_ns[sweep.index()].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Bank the device-lock wait of an entry that went on to run a tranche.
@@ -2243,13 +2174,6 @@ impl DrainDutyCensus {
         let gap_lock = self.gap_lock_us.swap(0, Relaxed);
         let gap_skip = self.gap_skip_us.swap(0, Relaxed);
         let gap_post = self.gap_post_us.swap(0, Relaxed);
-        // Emitted beside the total it divides, so `sum(post_*_us) == gap_post_us`
-        // is checkable on the line itself.
-        let mut post_split = String::new();
-        for sweep in PostSweep::ALL {
-            let us = self.post_sweep_ns[sweep.index()].swap(0, Relaxed) / 1000;
-            post_split.push_str(&format!(" post_{}_us={us}", sweep.label()));
-        }
         // Beside the gap they are a candidate cause of, not on a line of their
         // own: the question is only ever "is `gap_idle_us` this?".
         let irq_wait = self.irq_wait_us.swap(0, Relaxed);
@@ -2261,7 +2185,7 @@ impl DrainDutyCensus {
             "drain_duty win_ms={win_ms} tranches={tranches} skipped={skipped} busy_us={busy} \
              duty={duty:.3} drain_us={drain} publish_us={publish} max_tranche_us={max} \
              gap_idle_us={gap_idle} gap_lock_us={gap_lock} gap_skip_us={gap_skip} \
-             gap_post_us={gap_post}{post_split} \
+             gap_post_us={gap_post} \
              irq_wait_us={irq_wait} irq_waits={irq_waits} irq_wait_max_us={irq_wait_max} \
              draw_us={draw} draws={draws} compute_us={compute} computes={computes} \
              flush_us={flush} flushes={flushes} max_flush_us={max_flush} \
@@ -3074,18 +2998,6 @@ pub fn note_drain_lock_wait(us: u64) {
     DRAIN_DUTY.note_gap_lock(us);
 }
 
-/// Time one post-tranche sweep and attribute it, returning what it returned.
-///
-/// A wrapper rather than a `started`/`note` pair at each call site: they sit in
-/// one straight run of statements, and a pair spelled once per sweep is one
-/// chance per sweep to time the wrong one.
-pub fn post_sweep<T>(sweep: PostSweep, run: impl FnOnce() -> T) -> T {
-    let started = std::time::Instant::now();
-    let out = run();
-    DRAIN_DUTY.note_post_sweep(sweep, started.elapsed().as_nanos() as u64);
-    out
-}
-
 /// A prompt `HostAction` has just been pushed onto an empty prompt queue.
 ///
 /// Process-global, like every counter here: this device is instantiated once per
@@ -3344,7 +3256,7 @@ fn take_store_routes() -> Option<String> {
 
 #[cfg(test)]
 mod drain_gap_tests {
-    use super::{DrainDutyCensus, PostSweep, DRAIN_DUTY_REPORT_MS};
+    use super::{DrainDutyCensus, DRAIN_DUTY_REPORT_MS};
 
     /// The four gap buckets plus `busy_us` account for the whole window.
     ///
@@ -3361,9 +3273,8 @@ mod drain_gap_tests {
         // divide the whole process lifetime into one tranche — so the window
         // under test has to be opened before anything is accumulated into it.
         assert!(c.note(0, 0, 1).is_none(), "the first call arms the window");
-        // Six entries on a fixed stride, each: 40 idle, 10 lock, 30 drain, 5 publish, 80 post — 80
-        // so the sweep split divides it whole for any `PostSweep::COUNT` up to five, and the
-        // shortfall check below reads truncation as nothing. Times are microseconds on the crate clock. The first entry's idle
+        // Six entries on a fixed stride, each: 40 idle, 10 lock, 30 drain, 5 publish, 80 post.
+        // Times are microseconds on the crate clock. The first entry's idle
         // is the one span that cannot be measured — there is no previous exit to measure it from —
         // so it lies before `t0` and is not part of what has to tile.
         let (idle, lock, drain, publish, post) = (40u64, 10u64, 30u64, 5u64, 80u64);
@@ -3376,12 +3287,6 @@ mod drain_gap_tests {
             c.note_gap_lock(lock);
             let busy_end = entry + lock + drain + publish;
             assert!(c.note(drain, publish, 1).is_none(), "the window is not due");
-            // The sweeps that make up `post`, in nanoseconds. They tile it
-            // exactly here, which is what the shortfall check below is for: on a
-            // real tranche the wrapper's own `Instant` reads sit outside them.
-            for sweep in PostSweep::ALL {
-                c.note_post_sweep(sweep, post * 1_000 / PostSweep::COUNT as u64);
-            }
             c.note_gap_exit(busy_end + post, busy_end, false);
         }
         // One skipped entry on the same stride: no lock, no tranche, the whole
@@ -3408,17 +3313,6 @@ mod drain_gap_tests {
         assert_eq!(field("gap_idle_us"), idle * entries);
         assert_eq!(field("gap_lock_us"), lock * entries);
         assert_eq!(field("gap_post_us"), post * entries);
-        // The split has to add up to the total it divides, so a sweep that gains
-        // a call site and no timer reads as a shortfall rather than as noise.
-        // From `PostSweep::ALL` rather than a transcription of it: a new sweep
-        // that this list forgot would leave its own time out of the split and
-        // read as the shortfall this assertion is *for*, which is a test
-        // failing about the wrong thing.
-        let post_split: u64 = PostSweep::ALL
-            .into_iter()
-            .map(|s| field(&format!("post_{}_us", s.label())))
-            .sum();
-        assert_eq!(post_split, post * entries);
         assert_eq!(field("gap_skip_us"), skip_us);
         assert_eq!(field("busy_us"), (drain + publish) * entries);
         // The whole point: nothing the worker did between `t0` and its last
