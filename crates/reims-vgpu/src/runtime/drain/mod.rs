@@ -1894,10 +1894,7 @@ fn decode_packet(
     available: u32,
     ring_capacity: u32,
 ) -> Result<Packet, PacketError> {
-    let started = std::time::Instant::now();
-    let out = decode_packet_inner(bytes, head, available, ring_capacity);
-    census::note_drain_decode(started.elapsed().as_nanos() as u64);
-    out
+    decode_packet_inner(bytes, head, available, ring_capacity)
 }
 
 fn decode_packet_inner(
@@ -2964,10 +2961,7 @@ fn read_ring_bytes<M: HostMemory>(
     absolute: u32,
     len: u32,
 ) -> Result<Vec<u8>, MemError> {
-    let started = std::time::Instant::now();
-    let out = read_ring_bytes_inner(mem, base_gpa, ring_size, absolute, len);
-    census::note_drain_ring(started.elapsed().as_nanos() as u64);
-    out
+    read_ring_bytes_inner(mem, base_gpa, ring_size, absolute, len)
 }
 
 fn read_ring_bytes_inner<M: HostMemory>(
@@ -4232,10 +4226,7 @@ fn read_child_ring_bytes<M: HostMemory>(
     len: u32,
     page_shift: u32,
 ) -> Result<Vec<u8>, MemError> {
-    let started = std::time::Instant::now();
-    let out = read_child_ring_bytes_inner(mem, page_gpas, ring_length, absolute, len, page_shift);
-    census::note_drain_ring(started.elapsed().as_nanos() as u64);
-    out
+    read_child_ring_bytes_inner(mem, page_gpas, ring_length, absolute, len, page_shift)
 }
 
 fn read_child_ring_bytes_inner<M: HostMemory>(
@@ -6423,7 +6414,6 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     let Some(regs_off) = child_reg_block_offset(channel_id) else {
         return;
     };
-    let setup_started = std::time::Instant::now();
     let regs_gpa = state.pfn_gpa(state.gfx.root_page) + regs_off;
 
     let mut head = match crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_HEAD) {
@@ -6473,7 +6463,6 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
         return;
     };
     let page_gpas = state.child_rings[channel_id as usize].page_gpas.clone();
-    census::note_drain_setup(setup_started.elapsed().as_nanos() as u64);
 
     // Nested drain_other must skip this channel (no re-enter head).
     // Use a bit mask so nested drains skip the full stack, not only the leaf.
@@ -6483,12 +6472,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     state.draining_mask |= bit;
 
     loop {
-        let regs_started = std::time::Instant::now();
         let tail_read = crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL);
-        census::note_drain_regs(
-            census::RegsOp::TailRead,
-            regs_started.elapsed().as_nanos() as u64,
-        );
         let tail = match tail_read {
             Ok(v) => v,
             Err(_) => {
@@ -6537,16 +6521,11 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 // run yet holds an ordering position instead of a consumer
                 // pointer, and the packets behind it are not behind anything.
                 head = packet.next_head;
-                let head_started = std::time::Instant::now();
                 let head_write = gpa_map::write_u32(
                     host,
                     regs_gpa + CHILD_REG_HEAD,
                     head,
                     state.page_size() as usize,
-                );
-                census::note_drain_regs(
-                    census::RegsOp::HeadWrite,
-                    head_started.elapsed().as_nanos() as u64,
                 );
                 if head_write.is_err() {
                     // The consumer pointer never advanced: the next drain
