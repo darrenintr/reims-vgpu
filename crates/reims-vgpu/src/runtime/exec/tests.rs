@@ -7747,8 +7747,7 @@ fn a_submission_executes_the_streams_it_was_read_with_and_not_guest_memory_again
     );
 
     let mut out = ExecResult::default();
-    let mut measured_ns = 0u64;
-    let submission = read_submission(&state, &host, &payload, &mut out, &mut measured_ns)
+    let submission = read_submission(&state, &host, &payload, &mut out)
         .expect("the packet names a live task and one command buffer");
     assert_eq!(
         submission.streams.len(),
@@ -7793,7 +7792,6 @@ fn a_submission_executes_the_streams_it_was_read_with_and_not_guest_memory_again
         &submission,
         None,
         &mut out,
-        &mut measured_ns,
     );
     assert_eq!(
         state.fence_generation(1, FENCE_DOMAIN_EVENT, event_ref),
@@ -7864,13 +7862,13 @@ fn a_pipeline_whose_inputs_cannot_load_is_not_a_pending_translation() {
     assert_eq!(resolved.render_pipeline_leases().len(), 1);
 
     assert!(
-        super::preflight_submission(&state, &host, &submission, &resolved, &mut measured_ns)
+        super::preflight_submission(&state, &host, &submission, &resolved)
             .is_empty(),
         "no object list, so pipeline 41 has no AIR to await"
     );
     // And it is a function of its inputs: asked again, the same answer.
     assert!(
-        super::preflight_submission(&state, &host, &submission, &resolved, &mut measured_ns)
+        super::preflight_submission(&state, &host, &submission, &resolved)
             .is_empty()
     );
 }
