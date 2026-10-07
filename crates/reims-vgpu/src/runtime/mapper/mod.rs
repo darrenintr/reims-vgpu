@@ -1714,8 +1714,9 @@ pub(crate) fn mapping_guest_write_verdict<M: HostOps>(
     // It is the structural explanation for `t11_gw_ref_no_stamp` running far
     // ahead of `t11_gw_ref_moved` — the refusals are this device's own startup
     // cost, repeated, not guest writes. What it costs is measured: the window
-    // is counted in harvests, harvests are driven by guest doorbells, and a
-    // draw that lands in it pays a whole-frame seed read plus a whole-frame
+    // is counted in harvests, a harvest was driven only by guest doorbells
+    // (the shim now also schedules one on the main loop for an unarmed set),
+    // and a draw that lands in it pays a whole-frame seed read plus a whole-frame
     // staging upload. On a near-idle desktop `chain_phase` reads 12-65 ms per
     // draw with `seed_us` and the engine's `stage_us` holding it, against
     // 0.2 ms per draw driven, which is the hitch class goals 5 and 6 name.
@@ -2703,63 +2704,6 @@ pub(crate) fn read_guest_owned_bytes<H: HostMemory + HostOps>(
         RunCopy::Read(buf),
         None,
         "mapping_read_guest_owned",
-    )
-}
-
-/// Write packed rows into a strided mapping rectangle without materialising its padding.
-///
-/// `src` contains `row_bytes * row_count` texel bytes back to back. The guest
-/// mapping places those rows `row_stride` bytes apart. [`RunCopy::WriteRect`]
-/// translates between the two while walking the fragmented page list once, so
-/// callers do not need a whole-frame strided staging buffer merely to insert
-/// padding that the texture contract says must not be written.
-///
-/// `only` is in mapping-linear coordinates, exactly like
-/// [`write_mapping_bytes_only`]. It can therefore preserve guest-owned spans
-/// while [`RunCopy`] still translates span offsets into packed source offsets.
-pub(crate) fn write_mapping_rect_only<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut H,
-    mapping_id: u32,
-    off: u64,
-    rect: RectStride,
-    src: &[u8],
-    only: Option<&[(u64, u64)]>,
-    vouched: &PagesVouched,
-) -> bool {
-    if src.len() < rect.packed() {
-        crate::observe::fail(format!(
-            "mapping_write_rect fail reason=rect_src_short mid={mapping_id} off={off:#x} packed={} src={}",
-            rect.packed(),
-            src.len()
-        ));
-        return false;
-    }
-    crate::runtime::writeback_debt::settle_for_mapping(
-        state,
-        host,
-        mapping_id,
-        crate::runtime::render_writeback::SettleSite::MappingBytesWrite,
-    );
-    let span = rect.span() as u64;
-    state.invalidate_storage_residency_window(mapping_id, off, off.saturating_add(span));
-    if !vouched.covers(state, mapping_id) {
-        crate::observe::fail(format!(
-            "mapping_write_rect fail reason=vouch_stale mid={mapping_id} off={off:#x} len={span:#x}"
-        ));
-        return false;
-    }
-    let Some(copy) = RunCopy::write_rect(src, rect) else {
-        return false;
-    };
-    copy_mapping_runs(
-        state,
-        host,
-        mapping_id,
-        off,
-        copy,
-        only,
-        "mapping_write_rect",
     )
 }
 

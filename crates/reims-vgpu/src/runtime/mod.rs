@@ -45,6 +45,7 @@ pub mod exec;
 pub mod fence_exec;
 /// One census second of guest-run gathers, by window: why the hypervisor half
 /// had no answer, and what it cost. Measurement, not policy.
+pub mod frame_interval;
 pub mod gather_storm;
 /// Is the hypervisor's guest-write generation a sound cache key for the
 /// zero-copy sampled gathers? Measurement, not policy.

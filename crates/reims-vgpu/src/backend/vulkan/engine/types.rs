@@ -342,8 +342,16 @@ pub struct PipelineObjectIdentity {
     life: std::sync::Arc<PipelineObjectLife>,
 }
 
+/// What the identity's shared lifetime token remembers about the object.
+///
+/// The declaration instant and a first-use latch exist for one census question:
+/// how long before its first draw did the guest declare this pipeline? See
+/// [`super::pipe_census`]. Neither is read to decide a draw.
 #[derive(Debug)]
-pub(crate) struct PipelineObjectLife;
+pub(crate) struct PipelineObjectLife {
+    declared_at: std::time::Instant,
+    used: std::sync::atomic::AtomicBool,
+}
 
 impl PipelineObjectIdentity {
     pub(crate) fn new() -> Self {
@@ -358,8 +366,22 @@ impl PipelineObjectIdentity {
         Self {
             id: std::num::NonZeroU64::new(raw)
                 .expect("pipeline identity allocator never publishes zero"),
-            life: std::sync::Arc::new(PipelineObjectLife),
+            life: std::sync::Arc::new(PipelineObjectLife {
+                declared_at: std::time::Instant::now(),
+                used: std::sync::atomic::AtomicBool::new(false),
+            }),
         }
+    }
+
+    /// Microseconds from declaration to now, the first time this is asked, and
+    /// `None` on every later call. A load first, so the common draw costs a read
+    /// rather than a read-modify-write.
+    pub(crate) fn first_use_lead_us(&self) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        if self.life.used.load(Ordering::Relaxed) || self.life.used.swap(true, Ordering::Relaxed) {
+            return None;
+        }
+        Some(self.life.declared_at.elapsed().as_micros() as u64)
     }
 
     pub(crate) fn id(&self) -> std::num::NonZeroU64 {
@@ -1571,48 +1593,6 @@ impl std::fmt::Debug for ComputeImageDestination {
     }
 }
 
-/// A cached mapped readback slot borrowed from the engine until the caller has
-/// scattered its bytes into guest memory.
-///
-/// This is intentionally an owning guard rather than a borrowed slice: the
-/// engine lock is released before the runtime writes guest pages, while the
-/// readback pool must not recycle the slot underneath that write. Dropping the
-/// guard returns its token through the pool's lock-free return channel.
-pub struct ComputeReadbackLease {
-    token: u64,
-    ptr: usize,
-    len: usize,
-}
-
-impl ComputeReadbackLease {
-    pub(crate) fn new(token: u64, ptr: usize, len: usize) -> Self {
-        Self { token, ptr, len }
-    }
-
-    /// The tight storage-image rows produced by the dispatch.
-    pub fn bytes(&self) -> &[u8] {
-        // SAFETY: construction is restricted to the engine after the producing
-        // submission's fence has retired. The pool removes this exact slot from
-        // circulation for the lifetime of the token, and teardown waits for
-        // every outstanding token before freeing the persistent mapping.
-        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
-    }
-}
-
-impl std::fmt::Debug for ComputeReadbackLease {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ComputeReadbackLease")
-            .field("len", &self.len)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for ComputeReadbackLease {
-    fn drop(&mut self) {
-        super::pools::return_readback_lease(self.token);
-    }
-}
-
 /// What one storage image's dispatch produced, paired with the destination that
 /// was asked for.
 #[derive(Debug)]
@@ -1620,9 +1600,6 @@ pub enum ComputeImageResult {
     /// Readback pixels, for [`ComputeImageDestination::Host`]. Tight rows: the
     /// caller re-pitches them into the guest's window.
     Bytes(Vec<u8>),
-    /// The same host-readback result borrowed directly from a cached persistent
-    /// mapping instead of copied into a temporary `Vec`.
-    Leased(ComputeReadbackLease),
     /// The copy into the guest's own pages is on the queue, for
     /// [`ComputeImageDestination::GuestPages`]. There are no bytes to hand back
     /// because none were read.
@@ -1645,7 +1622,6 @@ impl ComputeImageResult {
     pub fn bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Bytes(bytes) => Some(bytes),
-            Self::Leased(lease) => Some(lease.bytes()),
             Self::Landed { .. } => None,
         }
     }
@@ -2922,5 +2898,33 @@ mod tests {
             generation: 7,
             format: translate::pixel::SCANOUT_FORMAT,
         }));
+    }
+}
+
+#[cfg(test)]
+mod pipeline_object_lead_tests {
+    use super::PipelineObjectIdentity;
+
+    /// Only the first draw of a declared pipeline has a declaration-to-use lead.
+    /// Every later draw, and every clone of the identity the engine index keeps,
+    /// reads `None`: the latch lives in the shared lifetime token.
+    #[test]
+    fn the_first_use_has_a_lead_and_no_later_one_does() {
+        let identity = PipelineObjectIdentity::new();
+        let clone = identity.clone();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let lead = clone.first_use_lead_us().expect("first use");
+        assert!(lead >= 2_000, "lead {lead} us predates the declaration");
+        assert_eq!(identity.first_use_lead_us(), None);
+        assert_eq!(clone.first_use_lead_us(), None);
+    }
+
+    #[test]
+    fn two_declarations_latch_independently() {
+        let a = PipelineObjectIdentity::new();
+        let b = PipelineObjectIdentity::new();
+        assert!(a.first_use_lead_us().is_some());
+        assert!(b.first_use_lead_us().is_some());
+        assert!(a.first_use_lead_us().is_none());
     }
 }

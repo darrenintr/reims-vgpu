@@ -45,8 +45,12 @@
 //!
 //! `unarmed_same_tranche` against `unarmed` says whether the repeats were inside
 //! one drain tranche. That is the nearest thing the Rust side can name to "no
-//! harvest between them", because harvests are driven by the doorbells a tranche
-//! drains; it is not a count of harvests, which the shim does not expose.
+//! harvest between them", because harvests run at the doorbells a tranche drains
+//! and, for an unarmed set, on the main loop; it is not a count of harvests,
+//! which the shim does not expose. With the main-loop arming harvest,
+//! `gather_storm_ready` (`us_max`, `tranches_max`, `binds_max`) is the direct
+//! reading of how long a window waits, and `unarmed_arming` should fall toward
+//! the binds one main-loop turn can fit.
 //!
 //! `fold_same` / `fold_moved` exist only under
 //! [`crate::config::GATHER_STORM_FOLD`]: they say whether the bytes an unarmed
