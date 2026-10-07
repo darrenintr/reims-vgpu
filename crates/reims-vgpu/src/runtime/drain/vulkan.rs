@@ -141,11 +141,18 @@ pub fn order_completion_stamp<H: HostMemory + HostOps>(
     value: u32,
     site: SettleSite,
 ) -> crate::backend::StampOrdering {
+    use crate::runtime::drain::stall::{note_stall_since, note_stamp_route, Stall, StampRoute};
     let order = stamp_word_order_on_fifo(state, host, index, value);
+    note_stamp_route(match order {
+        StampOrder::CpuReady => StampRoute::CpuReady,
+        StampOrder::Queued => StampRoute::Queued,
+        StampOrder::Declined => StampRoute::Declined,
+    });
     if order == StampOrder::Queued {
         return crate::backend::StampOrdering::Queued;
     }
     if order.needs_blocking_fallback() {
+        let settle_started = std::time::Instant::now();
         // The asynchronous route was required but could not carry the
         // completion, so it must let an older word for this slot land first.
         engine::quiesce_completion_stamps(index);
@@ -154,6 +161,7 @@ pub fn order_completion_stamp<H: HostMemory + HostOps>(
         // afterward belongs *after* this stamp.
         settle_guest_writes(site);
         engine::quiesce_guest_reads();
+        note_stall_since(Stall::StampSettle, settle_started);
     }
     crate::backend::StampOrdering::Settled
 }

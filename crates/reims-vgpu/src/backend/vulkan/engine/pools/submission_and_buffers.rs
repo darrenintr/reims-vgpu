@@ -1330,6 +1330,10 @@ impl ResourcePools {
             crate::runtime::drain::TrancheCost::RingWait,
             wait_started,
         );
+        crate::runtime::drain::stall::note_stall_since(
+            crate::runtime::drain::stall::Stall::RingWait,
+            wait_started,
+        );
         waited.map_err(|e| {
             crate::observe::fail(format!("vk_engine_fence_wedged slot={index} result={e:?}"));
             Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesRetire)
@@ -1980,6 +1984,10 @@ impl ResourcePools {
         let waited = ctx.device.wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS);
         crate::runtime::drain::note_tranche_since(
             crate::runtime::drain::TrancheCost::EntryWait,
+            wait_started,
+        );
+        crate::runtime::drain::stall::note_stall_since(
+            crate::runtime::drain::stall::Stall::EntryWait,
             wait_started,
         );
         waited.map_err(|e| Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesEntry))

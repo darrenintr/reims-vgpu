@@ -9,6 +9,7 @@
 //! use them to assert which functional arm ran, while production should not pay
 //! for that observation.
 
+pub mod stall;
 mod tranche;
 pub use tranche::{
     admission_scope, note_hazard_scan, note_tranche_cost, note_tranche_count, note_tranche_since,
