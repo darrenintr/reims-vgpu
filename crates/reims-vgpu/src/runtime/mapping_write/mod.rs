@@ -850,15 +850,10 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     // not that path's problem. See `pixel_format::Rgba8ToRow`.
     let store_rail = pixel_format::Rgba8ToRow::for_format(format);
 
-    use crate::runtime::drain::{
-        note_surface_write_path, note_surface_write_phase, SurfaceWritePhase,
-    };
     let frame_bytes = (mh as u64).saturating_mul(tight as u64);
 
     // Fast path: one packed view, poke rows in place.
     if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
-        note_surface_write_path(true, frame_bytes);
-        let land_started = std::time::Instant::now();
         // SAFETY: contig covers span_end; revalidated in ensure_contig_view.
         let base = unsafe { (ptr as *mut u8).add(base_off as usize) };
         for y in 0..mh {
@@ -907,12 +902,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
                 }
             }
         }
-        note_surface_write_phase(
-            SurfaceWritePhase::Land,
-            land_started.elapsed().as_micros() as u64,
-        );
     } else {
-        note_surface_write_path(false, frame_bytes);
         // Fragmented destination. If the source is already tight BGRA8, let
         // the mapper translate packed source rows directly into the guest's
         // wider row pitch. The old path materialised the entire padded frame
@@ -973,7 +963,6 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
                 }
                 Some(runs)
             };
-            let land_started = std::time::Instant::now();
             if !mapper::write_mapping_rect_only(
                 state,
                 host,
@@ -992,12 +981,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
                     },
                 );
             }
-            note_surface_write_phase(
-                SurfaceWritePhase::Land,
-                land_started.elapsed().as_micros() as u64,
-            );
         } else {
-            let stage_started = std::time::Instant::now();
             // Conversion or a source with its own padding keeps the established
             // staged path; only the byte-identical tight-row case is widened.
             let staged: std::borrow::Cow<'_, [u8]> =
@@ -1051,10 +1035,6 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
                         }
                         frame[dst_off..dst_off + tight].copy_from_slice(&row_bytes[..tight]);
                     }
-                    note_surface_write_phase(
-                        SurfaceWritePhase::Stage,
-                        stage_started.elapsed().as_micros() as u64,
-                    );
                     std::borrow::Cow::Owned(frame)
                 };
             let frame: &[u8] = staged.as_ref();
@@ -1070,7 +1050,6 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
                     }
                 }
             }
-            let land_started = std::time::Instant::now();
             if !mapper::write_mapping_bytes_only(
                 state,
                 host,
@@ -1088,10 +1067,6 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
                     },
                 );
             }
-            note_surface_write_phase(
-                SurfaceWritePhase::Land,
-                land_started.elapsed().as_micros() as u64,
-            );
         }
     }
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
@@ -1142,7 +1117,6 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
         crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
         return true;
     }
-    let cache_started = std::time::Instant::now();
     let tight_frame = (mw as usize)
         .saturating_mul(mh as usize)
         .saturating_mul(RGBA8_BPP as usize);
@@ -1165,10 +1139,6 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             ),
         },
     }
-    note_surface_write_phase(
-        SurfaceWritePhase::Cache,
-        cache_started.elapsed().as_micros() as u64,
-    );
     // This write just made the host copy and the guest pages agree, so it is the
     // moment the copy's currency can be pinned. Nothing else arms this mapping:
     // the backing sampled ladder's first census read `gw_no_stamp` 14 092 against
@@ -1447,7 +1417,6 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     // because `cache_rows_are_native` converts nothing, so a format with no arm
     // is not that path's problem.
     let store_rail = pixel_format::Rgba8ToRow::for_format(format);
-    let span_rows = crate::runtime::chain_phase::CostSpan::new("surface_changed_rows_us");
     // The three things inside `surface_changed_rows_us`, which was 90 % of the
     // Metal rail's `store_us` and had nothing dividing it. Accumulated in
     // locals and emitted once per flush rather than through
@@ -1456,11 +1425,9 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     // ~0.15 us at the rates `pixel_format::Rgba8ToRow` reaches, so every part
     // but the landing write would report as free; and a per-row commit would be
     // `mh` atomic map lookups a flush where three suffice.
-    let (mut convert_ns, mut diff_ns, mut land_ns) = (0u64, 0u64, 0u64);
     for y in 0..mh as usize {
         let src_off = y * rgba_stride as usize;
         let src_row = &rgba[src_off..src_off + rgba_stride as usize];
-        let row_started = std::time::Instant::now();
         if !cache_rows_are_native
             && !store_rail.is_some_and(|rail| rail.convert(src_row, mw, &mut native))
         {
@@ -1494,10 +1461,7 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
         } else {
             None
         };
-        convert_ns += row_started.elapsed().as_nanos() as u64;
-        let diff_started = std::time::Instant::now();
         let row_unchanged = seed_row.is_some_and(|srow| srow == native);
-        diff_ns += diff_started.elapsed().as_nanos() as u64;
         if row_unchanged {
             continue;
         }
@@ -1510,11 +1474,8 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
                 // this bar and they have opposite fixes.
                 let mut runs = ChangedRuns::new(&native[..tight], &seed[..tight]);
                 loop {
-                    let scan_started = std::time::Instant::now();
                     let run = runs.next();
-                    diff_ns += scan_started.elapsed().as_nanos() as u64;
                     let Some(run) = run else { break };
-                    let land_started = std::time::Instant::now();
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             native.as_ptr().add(run.start),
@@ -1522,23 +1483,17 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
                             run.len(),
                         );
                     }
-                    land_ns += land_started.elapsed().as_nanos() as u64;
                 }
             } else {
-                let land_started = std::time::Instant::now();
                 unsafe {
                     std::ptr::copy_nonoverlapping(native.as_ptr(), dst, tight);
                 }
-                land_ns += land_started.elapsed().as_nanos() as u64;
             }
         } else if let Some(seed) = seed_row {
             let mut runs = ChangedRuns::new(&native[..tight], &seed[..tight]);
             loop {
-                let scan_started = std::time::Instant::now();
                 let run = runs.next();
-                diff_ns += scan_started.elapsed().as_nanos() as u64;
                 let Some(run) = run else { break };
-                let land_started = std::time::Instant::now();
                 let landed = mapper::write_mapping_bytes(
                     state,
                     host,
@@ -1547,7 +1502,6 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
                     &native[run.clone()],
                     &vouched,
                 );
-                land_ns += land_started.elapsed().as_nanos() as u64;
                 if !landed {
                     return refuse(
                         mapping_id,
@@ -1559,10 +1513,8 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
                 }
             }
         } else {
-            let land_started = std::time::Instant::now();
             let landed =
                 mapper::write_mapping_bytes(state, host, mapping_id, row_moff, native, &vouched);
-            land_ns += land_started.elapsed().as_nanos() as u64;
             if !landed {
                 return refuse(
                     mapping_id,
@@ -1574,13 +1526,6 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
             }
         }
     }
-    drop(span_rows);
-    // Three counters a flush, not `mh` of them. Nanoseconds, so a part that is
-    // sub-microsecond per row is not reported as free; divide by 1000 against
-    // `surface_changed_rows_us` by hand.
-    crate::runtime::drain::note_store_route_n("surface_row_convert_ns", convert_ns);
-    crate::runtime::drain::note_store_route_n("surface_row_diff_ns", diff_ns);
-    crate::runtime::drain::note_store_route_n("surface_row_land_ns", land_ns);
     // The denominators. A microsecond total answers "how long"; it cannot
     // answer "per what", and the three parts above have different per-whats.
     crate::runtime::drain::note_store_route("surface_row_flushes");
@@ -2109,16 +2054,11 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     // `flush_intersecting` returns immediately when nothing is armed, so this
     // costs a map-empty check per read. It must also precede `contig_for_span`:
     // the flush writes through the mapping and can retire the cached view.
-    let settle_started = std::time::Instant::now();
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
         host,
         mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingRectRead,
-    );
-    crate::runtime::drain::note_store_route_us(
-        "rectrd_settle_us",
-        settle_started.elapsed().as_micros() as u64,
     );
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
@@ -2168,14 +2108,8 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     // packed arm's memcpy) and `rectrd_window_us` (the fragmented arm, which
     // materialises the whole sample window however small the rect) runs. With
     // `rectrd_settle_us` above them, the four sum to the call.
-    let contig_started = std::time::Instant::now();
     let contig = contig_for_span(state, host, mapping_id, span_end);
-    crate::runtime::drain::note_store_route_us(
-        "rectrd_contig_us",
-        contig_started.elapsed().as_micros() as u64,
-    );
     if let Some((ptr, _)) = contig {
-        let copy_started = std::time::Instant::now();
         // SAFETY: contig covers span_end, and read_end ≤ span_end (checked).
         let base = unsafe { (ptr as *const u8).add(base_off as usize) };
         if x_off == 0 && rb == bpr && dst_stride as usize == rb {
@@ -2197,14 +2131,9 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
                 }
             }
         }
-        crate::runtime::drain::note_store_route_us(
-            "rectrd_copy_us",
-            copy_started.elapsed().as_micros() as u64,
-        );
         crate::runtime::drain::note_store_route("rectrd_contig_n");
     } else {
         crate::runtime::drain::note_store_route("rectrd_frag_n");
-        let window_started = std::time::Instant::now();
         // A packed destination is the rectangle the run walk speaks natively:
         // the rows are `bpr` apart in the mapping and back to back in `dst`, so
         // one walk over the rectangle's own span lands every row where it goes.
@@ -2229,10 +2158,6 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
             } else {
                 "rectrd_rect_refused"
             });
-            crate::runtime::drain::note_store_route_us(
-                "rectrd_window_us",
-                window_started.elapsed().as_micros() as u64,
-            );
             return ok;
         }
         crate::runtime::drain::note_store_route("rectrd_window_padded_dst");
@@ -2259,10 +2184,6 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
             };
             dst[dst_off..dst_off + rb].copy_from_slice(row);
         }
-        crate::runtime::drain::note_store_route_us(
-            "rectrd_window_us",
-            window_started.elapsed().as_micros() as u64,
-        );
     }
     true
 }
@@ -2458,32 +2379,17 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     // Charged in the same partition as the read side above: settle, vouch, and
     // view revalidation are per *call*, and this rail's remaining cost is per
     // call rather than per byte. See `rectrd_contig_us`.
-    let settle_started = std::time::Instant::now();
     crate::runtime::writeback_debt::settle_for_mapping(
         state,
         host,
         mapping_id,
         crate::runtime::render_writeback::SettleSite::MappingRectWrite,
     );
-    crate::runtime::drain::note_store_route_us(
-        "rectwr_settle_us",
-        settle_started.elapsed().as_micros() as u64,
-    );
-    let vouch_started = std::time::Instant::now();
     let vouched = vouch_for_write(state, host, mapping_id, "rect_raw");
-    crate::runtime::drain::note_store_route_us(
-        "rectwr_vouch_us",
-        vouch_started.elapsed().as_micros() as u64,
-    );
     let Some(vouched) = vouched else {
         return false;
     };
-    let contig_started = std::time::Instant::now();
     let contig = contig_for_write(state, host, mapping_id, span_end, &vouched);
-    crate::runtime::drain::note_store_route_us(
-        "rectwr_contig_us",
-        contig_started.elapsed().as_micros() as u64,
-    );
     if let Some((ptr, _)) = contig {
         crate::runtime::drain::note_store_route("rectwr_contig_n");
         // SAFETY: contig covers span_end, and write_end ≤ span_end (checked).
