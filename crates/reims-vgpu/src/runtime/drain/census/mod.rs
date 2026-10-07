@@ -2853,7 +2853,6 @@ pub fn note_drain_tranche(
         // other order invites treating the rail's phases as the whole draw,
         // which is the misreading this line exists to correct. Not asked of the
         // rail — the timer is runtime-side and either rail is measured by it.
-        emit_chain_phase();
         rail.emit_census(state, CensusSite::Levels);
     }
 }
@@ -2871,114 +2870,6 @@ fn emit_alias_pressure(host: &dyn crate::runtime::host::HostOps) {
         now.created,
         now.destroyed,
         now.live_pages,
-    ));
-}
-
-/// The split of `drain_duty`'s `draw_us` that actually covers it, over the same
-/// window.
-///
-/// `draw_phase` divides the engine and `chain_phase` divides everything around
-/// it, so this line is emitted immediately after that one and the two are read
-/// together: `chain_phase`'s `engine_us` must equal `draw_phase`'s phases
-/// summed, and `chain_phase`'s eight must equal `drain_duty`'s `draw_us`.
-/// Whatever `draw_phase` does not account for is the other seven bars here, and
-/// on the boot that motivated this line that was 82% of the draw.
-///
-/// Silent when no chain ran, so an idle desktop costs nothing.
-///
-/// The split of `chain_phase`'s `binds_us`, over the same window.
-///
-/// Emitted immediately after it, in the same relationship `draw_phase` has to
-/// `engine_us`: divide the three against the column above. They are not claimed
-/// to sum to it — see [`crate::runtime::bind_phase`] for why a computed
-/// remainder was left out.
-fn emit_bind_phase() {
-    let Some(w) = crate::runtime::bind_phase::take_window() else {
-        return;
-    };
-    crate::observe::off(format!(
-        "bind_phase binds={} vertex_us={} fragment_us={} attrs_us={} \
-         acc_unused={} acc_deref={} acc_undecl={} acc_n={} acc_unused_staged={} neutral={}",
-        w.binds,
-        w.vertex_us,
-        w.fragment_us,
-        w.attrs_us,
-        w.access_unused,
-        w.access_dereferenced,
-        w.access_undeclared,
-        // The three classes partition the buffer binds resolved in the window,
-        // so this is their sum and not a separately-counted total: a reader who
-        // divides gets an identity that holds or a bug that shows.
-        w.access_total(),
-        // These two partition `acc_unused` in turn, so the second identity on
-        // the line is `acc_unused_staged + neutral == acc_unused`.
-        w.access_unused_staged,
-        w.neutral_served,
-    ));
-}
-
-fn emit_chain_phase() {
-    let Some(w) = crate::runtime::chain_phase::take_window() else {
-        return;
-    };
-    crate::observe::off(format!(
-        "chain_phase chains={} prep_us={} pipeline_us={} pl_gen_us={} pl_desc_us={} \
-         pl_mtlb_us={} pl_air_us={} pl_xlate_us={} binds_us={} sampled_us={} \
-         seed_us={} assemble_us={} engine_us={} store_us={} \
-         prep_pages_us={} asm_target_us={} asm_depth_us={} asm_trail_us={} max_us={}",
-        w.chains,
-        w.prep_us,
-        w.pipeline_us,
-        w.pipeline_gen_us,
-        w.pipeline_desc_us,
-        w.pipeline_mtlb_us,
-        w.pipeline_air_us,
-        w.pipeline_xlate_us,
-        w.binds_us,
-        w.sampled_us,
-        w.seed_us,
-        w.assemble_us,
-        w.engine_us,
-        w.store_us,
-        w.prep_pages_us,
-        w.assemble_target_us,
-        w.assemble_depth_us,
-        w.assemble_trail_us,
-        w.max_us,
-    ));
-    // Under `chain_phase`, dividing its largest column the same way
-    // `draw_phase` divides its `engine_us`.
-    emit_bind_phase();
-    emit_sampled_phase();
-}
-
-/// The split of `chain_phase`'s `sampled_us`, over the same window.
-///
-/// Emitted immediately after `bind_phase`, in the same relationship both have to
-/// the column above them. `sampled_us` is what was left once `binds_us` had
-/// `bind_phase` and `engine_us` had `draw_phase`. The five are not claimed to
-/// sum to it — see [`crate::runtime::sampled_phase`] for what they deliberately
-/// leave out and why a computed remainder is worse than none.
-fn emit_sampled_phase() {
-    let Some(w) = crate::runtime::sampled_phase::take_window() else {
-        return;
-    };
-    // The `sampled_field_*` columns are the field witness, nested inside
-    // `resolve_us` rather than beside it; see `sampled_phase`'s doc.
-    crate::observe::off(format!(
-        "sampled_phase sampled={} lookup_us={} alias_us={} resolve_us={} samplers_us={} \
-         reflect_us={} sampled_field_witness_us={} sampled_field_witness_n={} \
-         sampled_field_read_gpa_n={} sampled_field_large_surface_n={}",
-        w.sampled,
-        w.lookup_us,
-        w.alias_us,
-        w.resolve_us,
-        w.samplers_us,
-        w.reflect_us,
-        w.field_witness_us,
-        w.field_witness_n,
-        w.field_read_gpa_n,
-        w.field_large_surface_n,
     ));
 }
 
