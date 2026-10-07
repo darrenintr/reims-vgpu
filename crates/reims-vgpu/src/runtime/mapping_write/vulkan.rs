@@ -570,17 +570,10 @@ pub(crate) fn licence_mapper_ref_texture_surface<M: HostMemory + HostOps>(
     // mapping through the guest's page table — the check that licenses writing
     // to them at all — and until the host copies were removed that cost was
     // hidden inside a millisecond of memcpy.
-    use crate::runtime::drain::{note_readback_phase, ReadbackPhase};
-    let vouch_started = std::time::Instant::now();
     let vouched = vouch_for_write(state, host, mapping_id, "gpu_writeback");
-    note_readback_phase(
-        ReadbackPhase::Vouch,
-        vouch_started.elapsed().as_micros() as u64,
-    );
     if vouched.is_none() {
         return Err(GpuWritebackDecline::PagesNotOurs);
     }
-    let resolve_started = std::time::Instant::now();
     let page_size = state.page_size();
     let page_shift = state.page_shift;
     let Some(m) = state.mappings.get(&mapping_id) else {
@@ -647,10 +640,6 @@ pub(crate) fn licence_mapper_ref_texture_surface<M: HostMemory + HostOps>(
     // rows and has no pointer whose coverage it is restating.
     mapper::note_mapping_write_footprint(state, mapping_id, base_off, span_end - base_off);
     state.note_host_wrote_mapping(mapping_id);
-    note_readback_phase(
-        ReadbackPhase::Resolve,
-        resolve_started.elapsed().as_micros() as u64,
-    );
     Ok(MapperRefTextureSurfaceLicence {
         target,
         gpas,
