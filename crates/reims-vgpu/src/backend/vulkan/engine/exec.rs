@@ -3147,14 +3147,11 @@ pub(crate) unsafe fn execute_draw_inner(
                     },
                 ));
             }
-            if !req.skip_readback
-                || req.target_rgba8.is_some()
-                || req.target_guest_seed.is_some()
-                || req.load_guest_target_backing
-            {
+            if let Some(transfer) = super::reason::MultisampleLinearTransfer::first_asked(req) {
                 return Err(DrawError::Unsupported(
                     super::reason::DrawReason::MultisampleLinearTransferUnsupported {
                         sample_count: raster_sample_count,
+                        transfer,
                     },
                 ));
             }
