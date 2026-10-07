@@ -110,6 +110,65 @@ struct ReportedBackingFail {
     /// included. The whole point of the pair: see
     /// [`backing_outstanding_census`].
     attempts: u32,
+    /// Whether [`ReportedBackingFail::retry_refused`] has already said this
+    /// refusal outlived [`BACKING_UNRECOVERED_AFTER_MS`]. Once per latch entry,
+    /// like the first line.
+    unrecovered_reported: bool,
+}
+
+/// How long a refusal must stay unrecovered, while it is still being retried,
+/// before the latch reports it as lost work and not a retry in progress.
+///
+/// An observation threshold, not policy: nothing waits on it and nothing is
+/// refused because of it. It sits far above every recovery measured so far
+/// (1-21 ms on a driven x86/PCI boot; see [`clear_backing_fail`]) and far below
+/// a human-visible stale surface.
+const BACKING_UNRECOVERED_AFTER_MS: u64 = 1000;
+
+impl ReportedBackingFail {
+    /// Record one more refused attempt at `at_ms`. Returns `true` exactly once
+    /// per latch entry: the first time a refusal is retried and refused again
+    /// at least [`BACKING_UNRECOVERED_AFTER_MS`] after it was first raised.
+    ///
+    /// # Why this line exists
+    ///
+    /// A refusal here is two different events that open with the same line. A
+    /// transient one, where the guest had not filled the PTE yet, is followed
+    /// within milliseconds by `backing_recovered` on the same `gva=`. A real
+    /// loss is a surface retried every frame and refused every frame, and the
+    /// only thing that ever said so was [`backing_outstanding_census`], whose
+    /// once-a-second caller went with the runtime census (`7370e53c`). Since
+    /// then a loss has looked like a `backing_fail` with no later
+    /// `backing_recovered`, which is also what an abandoned surface looks like.
+    ///
+    /// So the latch says it, on the fail channel, at the moment it becomes
+    /// true. It costs nothing on a backing that resolves: this runs only on a
+    /// repeat refusal, already under the latch's lock.
+    fn retry_refused(&mut self, gva: Option<u64>, at_ms: u64) -> bool {
+        self.gva = gva;
+        self.last_at_ms = at_ms;
+        self.attempts = self.attempts.saturating_add(1);
+        if self.unrecovered_reported
+            || at_ms.saturating_sub(self.first_at_ms) < BACKING_UNRECOVERED_AFTER_MS
+        {
+            return false;
+        }
+        self.unrecovered_reported = true;
+        true
+    }
+}
+
+/// The line [`ReportedBackingFail::retry_refused`] asks for. Pure, so the
+/// composition is testable without the process-global latch.
+fn backing_unrecovered_detail(surface_id: u32, reason: &str, held: &ReportedBackingFail) -> String {
+    format!(
+        "backing_unrecovered sid={surface_id} reason={reason} gva={} age_ms={} attempts={} \
+         (refused again on retry; this surface has not been backed since its \
+         backing_fail line, so its presents are stale)",
+        gva_text(held.gva),
+        held.last_at_ms.saturating_sub(held.first_at_ms),
+        held.attempts,
+    )
 }
 
 type BackingFailLatch = std::collections::HashMap<(u32, &'static str), ReportedBackingFail>;
@@ -132,9 +191,9 @@ fn note_backing_fail(surface_id: u32, reason: &'static str, gva: Option<u64>, de
             // and one line per frame would flood. It is counted instead, which
             // is what makes the silence readable.
             let held = slot.get_mut();
-            held.gva = gva;
-            held.last_at_ms = at_ms;
-            held.attempts = held.attempts.saturating_add(1);
+            if held.retry_refused(gva, at_ms) {
+                crate::observe::fail(backing_unrecovered_detail(surface_id, reason, held));
+            }
         }
         std::collections::hash_map::Entry::Vacant(slot) => {
             slot.insert(ReportedBackingFail {
@@ -142,6 +201,7 @@ fn note_backing_fail(surface_id: u32, reason: &'static str, gva: Option<u64>, de
                 first_at_ms: at_ms,
                 last_at_ms: at_ms,
                 attempts: 1,
+                unrecovered_reported: false,
             });
             crate::observe::fail(detail);
         }

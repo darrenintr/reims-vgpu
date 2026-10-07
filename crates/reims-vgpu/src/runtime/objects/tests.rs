@@ -1301,6 +1301,46 @@ fn a_retried_backing_refusal_counts_its_attempts_and_an_abandoned_one_does_not()
     );
 }
 
+/// A refusal that is still being retried and refused a second after it was
+/// raised says so, once.
+///
+/// Pinned at the latch entry with synthetic timestamps rather than through the
+/// process clock: a retry inside the window is the transient population
+/// (recoveries measured at 1-21 ms) and must stay quiet, the first retry past
+/// it is the loss and gets one line, and every later retry is the per-present
+/// flood the latch exists to stop.
+#[test]
+fn a_backing_refusal_retried_past_a_second_is_reported_unrecovered_once() {
+    let gva = Some(0x4188000u64);
+    let mut held = ReportedBackingFail {
+        gva,
+        first_at_ms: 5_000,
+        last_at_ms: 5_000,
+        attempts: 1,
+        unrecovered_reported: false,
+    };
+    assert!(
+        !held.retry_refused(gva, 5_021),
+        "a retry inside the window is a recovery still possible"
+    );
+    assert!(!held.retry_refused(gva, 5_000 + BACKING_UNRECOVERED_AFTER_MS - 1));
+    assert!(
+        held.retry_refused(gva, 5_000 + BACKING_UNRECOVERED_AFTER_MS),
+        "the first retry refused a full window later is the loss"
+    );
+    assert!(
+        !held.retry_refused(gva, 9_000),
+        "once per latch entry, or the per-present path floods"
+    );
+    assert_eq!(held.attempts, 5);
+    assert_eq!(
+        backing_unrecovered_detail(25, "translate", &held),
+        "backing_unrecovered sid=25 reason=translate gva=0x4188000 age_ms=4000 attempts=5 \
+         (refused again on retry; this surface has not been backed since its \
+         backing_fail line, so its presents are stale)"
+    );
+}
+
 #[test]
 fn a_backing_refusal_the_next_attach_resolves_is_reported_as_recovered() {
     fn log_mark() -> usize {
