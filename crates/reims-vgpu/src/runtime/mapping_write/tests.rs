@@ -1473,13 +1473,9 @@ fn a_rect_past_the_sample_window_is_named_on_both_read_arms() {
 
 /// compute_full_tight_scratch: an exact-pitch fragmented compute plane
 /// reads and writes directly through the caller's tight buffer. The
-/// always-on proxy proves this class is selected on a live dispatch.
-///
-/// The read half is the rectangle walk and the write half still has its own
-/// full-plane-tight arm, so the two proxies differ: a counter for the read, the
-/// `full_tight_direct` line for the write. The read's separate special case was
-/// retired because the rectangle subsumes it — a tight full plane is a
-/// rectangle whose rows happen to touch, and it moves as one piece.
+/// The read half is the rectangle walk. Its separate full-plane-tight special
+/// case was retired because the rectangle subsumes it — a tight full plane is
+/// a rectangle whose rows happen to touch, and it moves as one piece.
 #[test]
 fn fragmented_full_tight_rect_uses_direct_mapping_window() {
     use crate::model::PAGE_SHIFT_X86;
@@ -1555,11 +1551,6 @@ fn fragmented_full_tight_rect_uses_direct_mapping_window() {
         &mut state, &mut host, mid, 0, &mut check,
     ));
     assert_eq!(check, tight);
-
-    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
-    assert!(log.contains(&format!(
-        "OFF mapping_write full_tight_direct mid={mid} bytes={span}"
-    )));
 }
 
 /// A published descriptor that resolves no plane is not the same state as no

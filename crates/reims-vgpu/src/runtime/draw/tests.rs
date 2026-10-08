@@ -952,6 +952,82 @@ fn a_pipeline_that_cannot_load_names_the_rung_and_an_unbound_ref_stays_quiet() {
     );
 }
 
+/// A pipeline ref whose slot holds another type is still refused, and the line
+/// says what the model holds for that slot.
+///
+/// The live population is `wrong_type ot=5`: a draw's pipeline slot holding a
+/// ref-texture. The refusal is right either way. The `model=` field is what
+/// tells a recycled slot (`pipeline_<state>`) from a ref that never named a
+/// pipeline here (`unnamed`, `named_other`). Each arm is driven from the
+/// owner's own state, not from a hand-written line.
+#[test]
+fn a_pipeline_slot_holding_another_type_says_what_the_model_holds_for_it() {
+    use crate::protocol::endian::st32;
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::runtime::decode::resource::OBJECT_LIST_ENTRY_LEN;
+    use crate::runtime::objects::OBJECT_TYPE_REF_TEXTURE;
+
+    const TASK: u32 = 1;
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    // One-level map, GVA page 0 -> data pfn 4: the object list at GVA 0 and
+    // each entry's descriptor bytes behind it.
+    let dir_gpa = 2u64 << PAGE_SHIFT_ARM64E;
+    let root_gpa = 3u64 << PAGE_SHIFT_ARM64E;
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    host.map_range(data_gpa, 0x400, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    let _ = host.write_gpa(root_gpa, &4u32.to_le_bytes());
+    state.define_task(TASK, 0x1000, 2);
+    assert!(state.set_object_list(TASK, 0, 8));
+    let put_entry = |host: &mut FakeHost, ref_: u32, object_type: u8| {
+        let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(&mut entry, u32::from(object_type) | (0x10 << 8));
+        entry[4..12].copy_from_slice(&(0x100u64 + u64::from(ref_) * 0x10).to_le_bytes());
+        let _ = host.write_gpa(
+            data_gpa + u64::from(ref_) * OBJECT_LIST_ENTRY_LEN as u64,
+            &entry,
+        );
+    };
+    let refused_line = |state: &DeviceState, host: &FakeHost, ref_: u32| {
+        let cap = crate::observe::FailCapture::start();
+        assert!(load_render_pipeline(state, host, TASK, ref_).is_none());
+        cap.one("draw_load_pipeline")
+    };
+
+    // Never named: a slot this device has only ever seen as a ref-texture.
+    put_entry(&mut host, 2, OBJECT_TYPE_REF_TEXTURE);
+    assert_eq!(
+        refused_line(&state, &host, 2),
+        "draw_load_pipeline fail reason=wrong_type task=1 pipe_ref=2 ot=5 model=unnamed"
+    );
+
+    // Named as what it is, which is not a pipeline.
+    crate::runtime::objects::name_resource(&state, &host, TASK, 2).expect("named");
+    assert_eq!(
+        refused_line(&state, &host, 2),
+        "draw_load_pipeline fail reason=wrong_type task=1 pipe_ref=2 ot=5 model=named_other"
+    );
+
+    // Recycled: the slot held a serializer object the model declared as a
+    // pipeline, and the guest's list now puts a ref-texture there with no
+    // delete in between.
+    put_entry(&mut host, 3, OBJECT_TYPE_SERIALIZER_OBJECT);
+    let name = crate::runtime::objects::name_resource(&state, &host, TASK, 3).expect("named");
+    assert!(state.declare_pipeline(name));
+    put_entry(&mut host, 3, OBJECT_TYPE_REF_TEXTURE);
+    assert_eq!(
+        refused_line(&state, &host, 3),
+        "draw_load_pipeline fail reason=wrong_type task=1 pipe_ref=3 ot=5 \
+         model=pipeline_declared"
+    );
+}
+
 #[test]
 fn index_load_failures_report_the_specific_reason() {
     // The Vulkan indexed-draw path collapsed eleven distinct load failures into
@@ -3619,30 +3695,38 @@ fn view_swizzle_remaps_rgba8_pixels() {
     // Every CPU remap must report itself: this is the path the Vulkan
     // pathway replaced with a component mapping, and an unreported
     // invocation is a texture that silently lost its zero-copy crossing.
+    let capture = crate::observe::FailCapture::start();
     crate::runtime::census::view_swizzle_census::reset_for_tests();
+    let texture_ref = u32::MAX - 1;
     // Reims VGPU selectors: 0=zero 1=one 2=R 3=G 4=B 5=A → BGRA order + forced alpha one.
     let plan = pixel_format::swizzle_plan(&[4, 3, 2, 1]).unwrap();
     let mut rgba = vec![10u8, 20, 30, 40, 50, 60, 70, 80];
-    apply_view_swizzle_rgba8(&mut rgba, Some(&plan), 1).unwrap();
+    apply_view_swizzle_rgba8(&mut rgba, Some(&plan), texture_ref).unwrap();
     assert_eq!(&rgba[0..4], &[30, 20, 10, 255]);
     assert_eq!(&rgba[4..8], &[70, 60, 50, 255]);
     // Identity is a no-op.
     let id = pixel_format::swizzle_identity();
     let before = rgba.clone();
-    apply_view_swizzle_rgba8(&mut rgba, Some(&id), 1).unwrap();
+    apply_view_swizzle_rgba8(&mut rgba, Some(&id), texture_ref).unwrap();
     assert_eq!(rgba, before);
     // No plan leaves buffer untouched.
-    apply_view_swizzle_rgba8(&mut rgba, None, 1).unwrap();
+    apply_view_swizzle_rgba8(&mut rgba, None, texture_ref).unwrap();
     assert_eq!(rgba, before);
     // Odd length fails visibly.
     let mut bad = vec![1u8, 2, 3];
-    assert!(apply_view_swizzle_rgba8(&mut bad, Some(&plan), 1).is_none());
+    assert!(apply_view_swizzle_rgba8(&mut bad, Some(&plan), texture_ref).is_none());
     // One non-identity remap ran and said so; the identity and None calls did
     // not, and neither did the length-rejected one. Read off the always-on sink
     // rather than a counter: the line is what a boot actually has to show.
-    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    let lines = capture.lines();
     assert_eq!(
-        log.match_indices("view_swizzle_cpu_remap").count(),
+        lines
+            .iter()
+            .filter(|line| {
+                line.contains("view_swizzle_cpu_remap")
+                    && line.contains(&format!("ref={texture_ref}"))
+            })
+            .count(),
         1,
         "exactly one CPU remap must be reported"
     );

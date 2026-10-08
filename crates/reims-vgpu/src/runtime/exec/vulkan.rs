@@ -31,9 +31,7 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
     pipelines: &[u32],
     pending: &mut Vec<u32>,
 ) {
-    use crate::runtime::drain::{note_preflight_part, note_preflight_pipe, PreflightPart};
     for &pipeline_ref in pipelines {
-        note_preflight_pipe();
         // The draw path's own memo already knows whether these two shaders are
         // translated, and answers for ~0.6 us against the 4.3 us of guest
         // resolves below. `translations_ready` states why that is not a weaker
@@ -47,12 +45,10 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
         ) {
             continue;
         }
-        let air_started = std::time::Instant::now();
         // The MTLB containers, not owned copies of the AIR inside them: the two
         // `ensure_cached_async` calls below borrow, digest and drop, so copying
         // first would allocate twice per pipeline ref for bytes nothing keeps.
         let pair = draw::vulkan::load_render_mtlb_pair(state, host, task_id, pipeline_ref);
-        note_preflight_part(PreflightPart::Air, air_started.elapsed().as_nanos() as u64);
         let Ok((v_mtlb, f_mtlb)) = pair else {
             // Normal execution emits the precise pipeline/MTLB failure. A
             // missing plan input is deterministic, not asynchronous work.
@@ -77,7 +73,6 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
             crate::runtime::drain::note_store_route("preflight_air_unextractable");
             continue;
         };
-        let cache_started = std::time::Instant::now();
         // `|` and not `||`: both stages must be *started*, so they translate in
         // parallel and the packet is retried once rather than once per stage.
         let translated = crate::runtime::m2v_cache::ensure_cached_async(
@@ -88,10 +83,6 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
             f_air,
             metal2vulkan::passes::Stage::Fragment,
             pipeline_ref,
-        );
-        note_preflight_part(
-            PreflightPart::Cache,
-            cache_started.elapsed().as_nanos() as u64,
         );
         if !translated {
             if !pending.contains(&pipeline_ref) {
@@ -200,10 +191,7 @@ pub(crate) fn preflight_compute_translations<M: HostMemory + HostOps>(
     dispatches: &[(u32, [u32; 3])],
     pending: &mut Vec<u32>,
 ) {
-    use crate::runtime::drain::{note_preflight_part, note_preflight_pipe, PreflightPart};
     for &(pipeline_ref, local_size) in dispatches {
-        note_preflight_pipe();
-        let air_started = std::time::Instant::now();
         let loaded = compute_exec::load_compute_pipeline(state, host, task_id, pipeline_ref)
             .and_then(|pipeline| {
                 crate::runtime::mtlb::load_mtlb(
@@ -214,20 +202,14 @@ pub(crate) fn preflight_compute_translations<M: HostMemory + HostOps>(
                     crate::runtime::mtlb::AirLoadRail::Compute,
                 )
             });
-        note_preflight_part(PreflightPart::Air, air_started.elapsed().as_nanos() as u64);
         let Some(mtlb) = loaded else {
             continue;
         };
         let Ok(air) = crate::runtime::mtlb::extract_air(&mtlb) else {
             continue;
         };
-        let cache_started = std::time::Instant::now();
         let cached =
             crate::runtime::m2v_cache::ensure_cached_kernel_async(air, local_size, pipeline_ref);
-        note_preflight_part(
-            PreflightPart::Cache,
-            cache_started.elapsed().as_nanos() as u64,
-        );
         if !cached {
             if !pending.contains(&pipeline_ref) {
                 pending.push(pipeline_ref);

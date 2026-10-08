@@ -719,6 +719,46 @@ fn a_compute_refusal_names_its_check_and_ok_names_nothing() {
     }
 }
 
+/// A dispatch whose kernel will not translate keeps its reason and names the
+/// step that refused on the same line.
+///
+/// `compute_record reason=compute_vk_translate` used to be the whole record
+/// line. The translation cache's own slug went out only on a separate
+/// `compute_linux_m2v` line latched once per pipeline. Two different steps are
+/// driven here and must render two different `step=` values under the one
+/// reason.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_kernel_that_will_not_translate_names_the_step_on_its_record_line() {
+    use crate::observe::Emit;
+    use crate::runtime::m2v_cache::M2vCacheDecline;
+
+    let render = |decline: &M2vCacheDecline| {
+        Emit::refusal(
+            "compute_record",
+            &kernel_translate_refusal(decline, "ready"),
+        )
+        .expect("a translate failure is a refusal")
+        .field("pipe", 7)
+        .render()
+    };
+    assert_eq!(
+        render(&M2vCacheDecline::KernelTranslate {
+            detail: "x".to_string()
+        }),
+        "compute_record reason=compute_vk_translate class=execute \
+         step=m2v_kernel_translate model_pipeline=ready recovery=metal_failed pipe=7"
+    );
+    assert_eq!(
+        render(&M2vCacheDecline::KernelLocalSizeMismatch {
+            requested: [8, 8, 1],
+            reflected: Some([32, 1, 1]),
+        }),
+        "compute_record reason=compute_vk_translate class=execute \
+         step=m2v_kernel_local_size_mismatch model_pipeline=ready recovery=metal_failed pipe=7"
+    );
+}
+
 /// Two different buffer-staging checks, two different slugs — the property
 /// that a shared `MissingBuffer` could not express.
 ///
@@ -2660,11 +2700,39 @@ fn a_resident_answer_is_a_seed_or_a_sample_and_never_both() {
         Some((key, 12))
     );
 
+    // A render target is the third answer and neither of the other two: a
+    // binding served from it is not seeded from a compute resident and does
+    // not name one.
+    #[derive(Debug, PartialEq)]
+    struct OneTarget;
+    impl crate::runtime::resident_target::RailTarget for OneTarget {
+        fn same_target(&self, other: &dyn crate::runtime::resident_target::RailTarget) -> bool {
+            other.as_any().downcast_ref::<Self>().is_some()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+    let target = ResidentServe::Target(crate::runtime::resident_target::ResidentTarget::new(
+        OneTarget,
+    ));
+    assert!(target.seed_generation().is_none());
+    assert!(target.sample_source().is_none());
+    assert!(target.render_target().is_some());
+    assert!(ResidentServe::Seed(11).render_target().is_none());
+    assert!(ResidentServe::Sample(key, 12).render_target().is_none());
+
     // And "no resident" answers neither, which is what makes `serve.is_none()`
     // the one gate the rails use to decide they must read the guest window.
     let none: Option<ResidentServe> = None;
-    assert!(none.and_then(ResidentServe::seed_generation).is_none());
-    assert!(none.and_then(ResidentServe::sample_source).is_none());
+    assert!(none
+        .as_ref()
+        .and_then(ResidentServe::seed_generation)
+        .is_none());
+    assert!(none
+        .as_ref()
+        .and_then(ResidentServe::sample_source)
+        .is_none());
 }
 
 /// A stage-input the decoder had to truncate must refuse its pipeline, not
@@ -3554,4 +3622,74 @@ fn a_nil_entry_clears_the_slot_on_the_wire_path_too() {
     );
     assert_eq!(acc.textures.len(), 1);
     assert_eq!(acc.textures[0].index, 0);
+}
+
+/// A render target serves a sampled binding only for the whole surface it was
+/// rendered as, and only while the registry can vouch for its pixels.
+///
+/// Every refusal here sends the binding to the guest read, which is correct
+/// and only slower; a wrong *serve* would hand the kernel a different frame
+/// with nothing below it to notice. So the cases asserted are the ones that
+/// must refuse: no mapping, a sub-window, a different extent, a pyramid, and a
+/// surface no target has stored into.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_render_target_serves_only_a_whole_stored_surface() {
+    use crate::runtime::compute_exec::SampledSurfaceWindow;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let host = FakeHost::new();
+    let whole = SampledSurfaceWindow {
+        mapping_id: 41,
+        surface_offset: 0,
+        width: 64,
+        height: 32,
+        pixel_format: 0x50,
+        mip_levels: 1,
+    };
+    assert!(
+        render_target_serve(&state, &host, &whole).is_none(),
+        "no mapping"
+    );
+    state.mappings.insert(
+        41,
+        crate::model::MappingEntry {
+            mapped: true,
+            has_geom: true,
+            width: 64,
+            height: 32,
+            format: 0x50,
+            ..Default::default()
+        },
+    );
+    for (window, what) in [
+        (
+            SampledSurfaceWindow {
+                surface_offset: 256,
+                ..whole
+            },
+            "a window that does not start at the surface",
+        ),
+        (
+            SampledSurfaceWindow { width: 32, ..whole },
+            "a narrower view",
+        ),
+        (
+            SampledSurfaceWindow {
+                mip_levels: 2,
+                ..whole
+            },
+            "a pyramid",
+        ),
+    ] {
+        assert!(
+            render_target_serve(&state, &host, &window).is_none(),
+            "{what} must read the guest"
+        );
+    }
+    // The whole surface, but nothing in the registry has stored into it, so no
+    // resident carries the mapping's content epoch.
+    assert!(
+        render_target_serve(&state, &host, &whole).is_none(),
+        "an unstored surface must read the guest"
+    );
 }

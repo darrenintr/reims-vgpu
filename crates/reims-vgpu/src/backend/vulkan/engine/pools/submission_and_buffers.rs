@@ -255,6 +255,38 @@ impl ResourcePools {
         unsafe { self.host_ram_imports.bind(ctx, guest_ref) }
     }
 
+    /// Admit every unique guest-RAM parent an operation needs before it
+    /// records any GPU work.
+    ///
+    /// The budget check runs over the complete set first, so the common refusal
+    /// mutates nothing. Driver-specific import failures can arrive only while
+    /// warming the admitted parents; already-created parents remain reusable,
+    /// but the caller still falls back before recording its copy.
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must own every Vulkan import in this pool.
+    pub(crate) unsafe fn prepare_guest_ram_refs<'a>(
+        &mut self,
+        ctx: &DeviceContext,
+        refs: impl IntoIterator<Item = &'a crate::runtime::guest_ram::GuestRef>,
+    ) -> Result<(), host_ram::HostRamDecline> {
+        let refs: Vec<_> = refs.into_iter().collect();
+        self.host_ram_imports
+            .preflight_refs(refs.iter().copied())?;
+
+        let mut seen = std::collections::HashSet::new();
+        for guest_ref in refs {
+            let import = guest_ref.import();
+            if seen.insert(import.id()) {
+                unsafe {
+                    self.host_ram_imports.warm(ctx, import)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Import a RAMBlock ahead of any reference into it.
     ///
     /// # Safety
@@ -561,23 +593,6 @@ impl ResourcePools {
     fn evict_sampled_entry(&mut self, index: usize, route: SampledVictimRoute) -> SampledSlot {
         let evicted = self.sampled_cache.remove(index);
         self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_sub(evicted.content_len);
-        if let (Some(identity), SampledFingerprint::Gathered) =
-            (evicted.identity, evicted.fingerprint)
-        {
-            // What the departure cost, for the `gather_storm_evict` line: an
-            // entry a newer generation of its window had replaced, or one that
-            // never answered a lookup, was dead weight and its eviction freed a
-            // slot for free. Only an entry that was current and had been useful
-            // is a gather the cap caused.
-            crate::runtime::gather_storm::note_image_evicted(
-                crate::runtime::gather_storm::EvictedImage {
-                    content_key: identity.key,
-                    bytes: evicted.content_len as u64,
-                    hits: evicted.hits,
-                    superseded: evicted.superseded,
-                },
-            );
-        }
         if let Some(identity) = evicted.identity {
             self.sampled_victims.push_front(SampledVictim {
                 key: evicted.slot.key(),
@@ -773,8 +788,6 @@ impl ResourcePools {
                         cmd_buf,
                         fence,
                         pending: None,
-                        span: super::gpu_span::SlotSpan::Idle,
-                        readback_span_armed: false,
                     });
                 }
                 Err(e) => {
@@ -1305,7 +1318,6 @@ impl ResourcePools {
         &mut self,
         ctx: &DeviceContext,
         cb: vk::CommandBuffer,
-        kind: gpu_span::Kind,
         reset_op: VkOp,
         begin_op: VkOp,
     ) -> Result<(), DrawError> {
@@ -1319,219 +1331,7 @@ impl ResourcePools {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )
             .map_err(|e| DrawError::VkCall(VkCall::new(begin_op, e)))?;
-        unsafe { self.gpu_span_arm(ctx, cb, kind) };
         Ok(())
-    }
-
-    /// Reset the current slot's timestamp pair and write the top one, so the
-    /// submission about to be recorded reports its own GPU execution time.
-    ///
-    /// Private, and reached only through [`Self::begin_slot_recording`]: a caller
-    /// that could arm without beginning could also begin without arming, which is
-    /// the failure this pairing exists to prevent. A batch joiner reaches neither
-    /// — it appends to a CB already armed, and arming again would move the top
-    /// stamp forward past work the batch has already recorded, reading as a fast
-    /// submission rather than as a broken one.
-    ///
-    /// Both `vkCmdResetQueryPool` and the write must be outside a render pass
-    /// instance, which the caller satisfies by sitting immediately after
-    /// `vkBeginCommandBuffer`.
-    ///
-    /// # Safety
-    ///
-    /// `cb` must be the current slot's command buffer, recording, and outside any
-    /// render pass.
-    unsafe fn gpu_span_arm(
-        &mut self,
-        ctx: &DeviceContext,
-        cb: vk::CommandBuffer,
-        kind: gpu_span::Kind,
-    ) {
-        let Some(probe) = ctx.draw_spans.as_ref() else {
-            return;
-        };
-        let slot = self.cur;
-        // A slot armed twice without a read between means the ring reused it
-        // without retiring it, which would also mean its cleanup was never
-        // drained. Report rather than silently overwrite: the sample is lost
-        // either way and only the counter says so.
-        if self.slots[slot].span != gpu_span::SlotSpan::Idle {
-            gpu_span::note_unread();
-        }
-        let base = DrawSpanProbe::base(slot);
-        ctx.device
-            .cmd_reset_query_pool(cb, probe.pool, base, DrawSpanProbe::PER_SLOT);
-        ctx.device
-            .cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, base);
-        self.slots[slot].span = gpu_span::SlotSpan::Armed(kind);
-        gpu_span::note_armed();
-    }
-
-    /// Write the bottom timestamp of the slot's command buffer, immediately
-    /// before it ends.
-    ///
-    /// `slot` is passed rather than read from `self.cur` because the batch flush
-    /// path seals the slot the batch was opened on, and a caller that guessed
-    /// would attribute one submission's span to another slot's queries.
-    ///
-    /// # Safety
-    ///
-    /// `cb` must be `slot`'s command buffer, still recording, and outside any
-    /// render pass.
-    unsafe fn gpu_span_seal(&mut self, ctx: &DeviceContext, cb: vk::CommandBuffer, slot: usize) {
-        let Some(probe) = ctx.draw_spans.as_ref() else {
-            return;
-        };
-        let gpu_span::SlotSpan::Armed(kind) = self.slots[slot].span else {
-            return;
-        };
-        ctx.device.cmd_write_timestamp(
-            cb,
-            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            probe.pool,
-            DrawSpanProbe::base(slot) + 1,
-        );
-        self.slots[slot].span = gpu_span::SlotSpan::Sealed(kind);
-        gpu_span::note_sealed();
-    }
-
-    /// [`Self::gpu_span_seal`] for the slot the caller is about to submit on its
-    /// own, which is always the current one.
-    ///
-    /// # Safety
-    ///
-    /// As [`Self::gpu_span_seal`].
-    pub(crate) unsafe fn gpu_span_seal_current(
-        &mut self,
-        ctx: &DeviceContext,
-        cb: vk::CommandBuffer,
-    ) {
-        unsafe { self.gpu_span_seal(ctx, cb, self.cur) };
-    }
-
-    /// Reset this slot's readback timestamp region and write its start stamp.
-    ///
-    /// The reset must be recorded into the same command buffer that writes the
-    /// stamps: a query's results are undefined until it is reset, and resetting
-    /// on the host needs `hostQueryReset`, a Vulkan 1.2 feature this device does
-    /// not ask for.
-    ///
-    /// The region belongs to the current ring slot rather than being shared —
-    /// see [`TimestampProbe`], which used to be shared between the
-    /// readback (which waits its fence) and the guest-page writeback (which does
-    /// not), so two writebacks in flight reset each other's queries.
-    ///
-    /// # Safety
-    ///
-    /// `cb` must be the current slot's command buffer, recording, and outside
-    /// any render pass.
-    pub(crate) unsafe fn readback_span_arm(&mut self, ctx: &DeviceContext, cb: vk::CommandBuffer) {
-        let Some(probe) = ctx.timestamps.as_ref() else {
-            return;
-        };
-        let slot = self.cur;
-        let base = TimestampProbe::base(slot);
-        ctx.device
-            .cmd_reset_query_pool(cb, probe.pool, base, TimestampProbe::PER_SLOT);
-        ctx.device
-            .cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, base);
-        self.slots[slot].readback_span_armed = true;
-    }
-
-    /// Write one of the two later stamps of the current slot's readback region.
-    ///
-    /// `mark` is 1 for the point after the barrier — where the draws ahead are
-    /// known done — and 2 for the end of the copy. Silently does nothing if the
-    /// slot was never armed, so a caller that stamps without a start cannot
-    /// publish a delta against a query holding another submission's ticks.
-    ///
-    /// # Safety
-    ///
-    /// As [`Self::readback_span_arm`].
-    pub(crate) unsafe fn readback_span_mark(
-        &mut self,
-        ctx: &DeviceContext,
-        cb: vk::CommandBuffer,
-        stage: vk::PipelineStageFlags,
-        mark: u32,
-    ) {
-        debug_assert!(mark < TimestampProbe::PER_SLOT);
-        let Some(probe) = ctx.timestamps.as_ref() else {
-            return;
-        };
-        if !self.slots[self.cur].readback_span_armed {
-            return;
-        }
-        ctx.device.cmd_write_timestamp(
-            cb,
-            stage,
-            probe.pool,
-            TimestampProbe::base(self.cur) + mark,
-        );
-    }
-
-    /// Read a retiring slot's readback region and charge the two spans it holds.
-    ///
-    /// Called only with the slot's fence already signalled, which is what makes
-    /// the three queries available — so `vkGetQueryPoolResults` is asked without
-    /// `WAIT` and cannot block. This replaces a read that ran *before* the next
-    /// copy was recorded and argued that the previous copy's results were still
-    /// there because its reset had not executed yet. That argument assumed
-    /// submissions complete in submission order, which Vulkan does not grant.
-    unsafe fn readback_span_read(&mut self, ctx: &DeviceContext, slot: usize) {
-        let Some(probe) = ctx.timestamps.as_ref() else {
-            return;
-        };
-        if !std::mem::replace(&mut self.slots[slot].readback_span_armed, false) {
-            return;
-        }
-        let mut ticks = [0u64; TimestampProbe::PER_SLOT as usize];
-        if ctx
-            .device
-            .get_query_pool_results(
-                probe.pool,
-                TimestampProbe::base(slot),
-                &mut ticks,
-                vk::QueryResultFlags::TYPE_64,
-            )
-            .is_ok()
-        {
-            let us =
-                |from: usize, to: usize| probe.scale.elapsed_ns(ticks[from], ticks[to]) / 1_000;
-            crate::runtime::drain::note_readback_gpu_us(us(0, 1), us(1, 2));
-        }
-    }
-
-    /// Read a retiring slot's timestamp pair and charge the delta.
-    ///
-    /// Only ever called with the slot's fence already signaled, which is what
-    /// makes both queries available — so `vkGetQueryPoolResults` is asked without
-    /// `WAIT` and a `NOT_READY` is a real defect in that ordering rather than
-    /// something to spin on. It is dropped rather than retried: a lost sample is
-    /// visible as `armed - read` and retrying inside the retire path would put an
-    /// unbounded wait on the drain worker to fix an instrument.
-    unsafe fn gpu_span_read(&mut self, ctx: &DeviceContext, slot: usize) {
-        let Some(probe) = ctx.draw_spans.as_ref() else {
-            return;
-        };
-        let gpu_span::SlotSpan::Sealed(kind) =
-            std::mem::replace(&mut self.slots[slot].span, gpu_span::SlotSpan::Idle)
-        else {
-            return;
-        };
-        let mut ticks = [0u64; DrawSpanProbe::PER_SLOT as usize];
-        if ctx
-            .device
-            .get_query_pool_results(
-                probe.pool,
-                DrawSpanProbe::base(slot),
-                &mut ticks,
-                vk::QueryResultFlags::TYPE_64,
-            )
-            .is_ok()
-        {
-            gpu_span::note_busy_ns(kind, probe.scale.elapsed_ns(ticks[0], ticks[1]));
-        }
     }
 
     /// Retire one slot: wait its fence, reset it, and drain the cleanup it
@@ -1562,41 +1362,19 @@ impl ResourcePools {
             crate::runtime::drain::TrancheCost::RingWait,
             wait_started,
         );
+        crate::runtime::drain::stall::note_stall_since(
+            crate::runtime::drain::stall::Stall::RingWait,
+            wait_started,
+        );
         waited.map_err(|e| {
-            // The wait that every macos-11 freeze lands in. Until now the
-            // failure said only that *a* wait timed out; this names the
-            // submission it timed out on, which is the question two
-            // sessions of switch-bisecting could not reach. Emitted before
-            // the error is mapped, because `wait_error` may turn it into a
-            // device loss and the teardown that follows clears the ring.
-            let held = match crate::runtime::gpu_hang_trail::submission(index) {
-                Some(note) => format!("{note}"),
-                None => "none (this slot's work was never recorded)".to_string(),
-            };
-            crate::observe::fail(format!(
-                "vk_engine_fence_wedged slot={index} result={e:?} held={held}"
-            ));
-            if let Some(rest) = crate::runtime::gpu_hang_trail::outstanding() {
-                crate::observe::fail(format!("vk_engine_fence_wedged_queue {rest}"));
-            }
+            crate::observe::fail(format!("vk_engine_fence_wedged slot={index} result={e:?}"));
             Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesRetire)
         })?;
         ctx.device
             .reset_fences(&[fence])
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsResetFencesRetire, e)))?;
-        // After the wait and before anything else: the fence signalling is
-        // precisely what makes this slot's two queries available, and the read is
-        // the only thing that returns the slot's span state to `Idle` so the next
-        // arming of it is not reported as a lost sample.
-        unsafe { self.gpu_span_read(ctx, index) };
-        // The same argument, for the other probe: this slot's three readback
-        // queries are readable exactly now and never before.
-        unsafe { self.readback_span_read(ctx, index) };
         let pending = self.slots[index].pending.take().expect("checked above");
         self.in_flight = self.in_flight.saturating_sub(1);
-        // Its fence has signalled, so this submission is no longer a candidate
-        // for a wedge. Paired with the `note_submit` in `finish_entry_async`.
-        crate::runtime::gpu_hang_trail::note_retired(index);
         self.drain_cleanup(&ctx.device, pending);
         self.release_graveyard(&ctx.device, 1 << index);
         Ok(())
@@ -1786,11 +1564,6 @@ impl ResourcePools {
         );
         self.slots[self.cur].pending = Some(cleanup);
         self.in_flight += 1;
-        // The submission is now outstanding, and this is the one point both
-        // submit paths reach — a batch flush and a lone draw's own submit. The
-        // trail's per-slot record is cleared again in `retire_slot`, so a slot
-        // holding one is a submission whose fence has not signalled.
-        crate::runtime::gpu_hang_trail::note_submit(self.cur);
         self.admit_recorded_sampled(device, admissions);
     }
 
@@ -2157,13 +1930,6 @@ impl ResourcePools {
         counters
             .batch_flush_draws
             .fetch_add(batch.draws, Ordering::Relaxed);
-        // `self.cur` is still the slot the batch was opened on: `begin_entry`
-        // flushes the open batch *before* it advances, and every other flush
-        // caller reaches here without claiming a slot of its own. Sealing against
-        // any other index would charge this submission's GPU span to a slot whose
-        // queries a different command buffer wrote.
-        let slot = self.cur;
-        unsafe { self.gpu_span_seal(ctx, batch.cb, slot) };
         counters.batch_flush_close_us.fetch_add(
             close_started.elapsed().as_micros() as u64,
             Ordering::Relaxed,
@@ -2250,6 +2016,10 @@ impl ResourcePools {
         let waited = ctx.device.wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS);
         crate::runtime::drain::note_tranche_since(
             crate::runtime::drain::TrancheCost::EntryWait,
+            wait_started,
+        );
+        crate::runtime::drain::stall::note_stall_since(
+            crate::runtime::drain::stall::Stall::EntryWait,
             wait_started,
         );
         waited.map_err(|e| Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesEntry))
@@ -6539,8 +6309,6 @@ mod recycle_tests {
                 unpin_residents: Vec::new(),
                 unpin_compute_residents: Vec::new(),
             }),
-            span: super::gpu_span::SlotSpan::Idle,
-            readback_span_armed: false,
         }
     }
 
@@ -6549,8 +6317,6 @@ mod recycle_tests {
             cmd_buf: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
             pending: None,
-            span: super::gpu_span::SlotSpan::Idle,
-            readback_span_armed: false,
         }
     }
 

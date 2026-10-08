@@ -505,6 +505,15 @@ impl Backend for VulkanBackend {
         compute_exec::vulkan::resident_serve(key, mirror_generation, is_storage, pixel_format)
     }
 
+    fn render_target_serve<M: HostMemory + HostOps>(
+        &self,
+        state: &DeviceState,
+        host: &M,
+        window: &compute_exec::SampledSurfaceWindow,
+    ) -> Option<ResidentServe> {
+        compute_exec::vulkan::render_target_serve(state, host, window)
+    }
+
     /// This rail's targets are engine `TargetIdentity`s; a handle it did not
     /// issue names no image it can read, and the frame is lost rather than
     /// written from the wrong one.

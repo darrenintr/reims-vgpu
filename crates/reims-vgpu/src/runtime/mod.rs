@@ -3,8 +3,6 @@
 //! Drain FIFOs, parse wire (using [`crate::contract`]), resolve memory, plan
 //! ops, update [`crate::model`] state. No GPU API calls here.
 
-/// The split of [`chain_phase`]'s largest column, `binds_us`.
-pub mod bind_phase;
 /// Product-path blit fill/copy execution against guest GVA.
 pub mod blit_exec;
 /// Draw-time buffer binds, resolved once per reference and held until the
@@ -20,7 +18,6 @@ pub mod buffer_write_gen;
 pub mod census;
 /// Where a draw chain's wall clock goes on the runtime side of the engine
 /// boundary, which is 82% of it.
-pub mod chain_phase;
 /// The byte runs in which a newly rendered row differs from the guest's.
 pub mod changed_runs;
 /// Product-path compute bind/dispatch (pipeline + buffers + direct dispatch).
@@ -43,18 +40,11 @@ pub mod drain;
 pub mod exec;
 /// Product-path event + encoder fence sync (event/blit/compute/render domains).
 pub mod fence_exec;
-/// One census second of guest-run gathers, by window: why the hypervisor half
-/// had no answer, and what it cost. Measurement, not policy.
-pub mod frame_interval;
-pub mod gather_storm;
 /// Is the hypervisor's guest-write generation a sound cache key for the
 /// zero-copy sampled gathers? Measurement, not policy.
 pub mod gather_witness;
 /// Guest-physical control-plane writes via HostOps map_pages.
 pub mod gpa_map;
-/// The last few pieces of work handed to the GPU, so a host GPU hang can name
-/// what it was running instead of only that a fence stopped signalling.
-pub mod gpu_hang_trail;
 /// The bound on every GPU reference to guest RAM — one import per RAMBlock,
 /// and the only type that can name a byte inside one.
 ///
@@ -100,7 +90,6 @@ pub mod input;
 /// Process-global metal2vulkan SPIR-V cache (AIR content hash → SPIR-V).
 pub mod m2v_cache;
 /// IOSurface mapper capture + page-table resolve.
-pub mod map_audit;
 pub mod mapper;
 /// Write host BGRA into guest mapping pages (render writeback).
 pub mod mapping_write;
@@ -109,7 +98,6 @@ pub mod mipmap;
 pub mod mmio;
 /// MTLB container → wrapped-AIR carve for metal2vulkan.
 pub mod mtlb;
-pub mod node_guard;
 /// Object-list lookup and mapper-ref-texture registration.
 pub mod objects;
 /// The bytes an admitted packet is executed from, held while the model decides
@@ -118,8 +106,6 @@ pub mod parked;
 pub mod plan;
 /// Whether a range's page-table entries are in the state the guest's own next
 /// edit of them requires — the direction that is ordered is the map.
-pub mod range_coverage;
-pub mod released_pages;
 /// Transfer a host-resident render frame into guest pages when synchronization
 /// or a guest-memory reader makes the bytes observable.
 pub mod render_pass;
@@ -129,8 +115,6 @@ pub mod render_writeback;
 pub mod resident_target;
 /// The guest's per-resource validity quad, from both of its producers.
 pub mod resource_validity;
-/// The split of [`chain_phase`]'s largest *undivided* column, `sampled_us`.
-pub mod sampled_phase;
 /// Guest surface → host BGRA8 for the QEMU console.
 pub mod scanout;
 /// SPIR-V set-0 binding relocation for metal2vulkan + internal Vulkan engine (Linux).

@@ -17,7 +17,6 @@ use super::draw_validation::DrawValidationDecline;
 use super::pools::{
     BatchFit, BatchTarget, BufferSlot, CbBind, ResourcePools, SampledKey, SampledSlot, TargetKey,
 };
-use super::stage_phase;
 use super::types::{
     BufferContent, ColorWriteMask, DrawError, DrawOutput, DrawRequest, ResidentReclaim,
     SampledSource, ScissorResource, SeedOrder, TargetIdentity, VertexStepFunction,
@@ -469,7 +468,6 @@ unsafe fn plan_buffer_gather_dispatches(
             .max()
             .unwrap_or(0);
         for (source, copies) in &gather.sources {
-            let _p = super::gather_phase::Span::open(super::gather_phase::Part::Plan);
             let runs: Vec<ScatterRun> = copies
                 .iter()
                 .map(|c| ScatterRun {
@@ -509,13 +507,11 @@ unsafe fn plan_buffer_gather_dispatches(
     // and the write were being paid eighteen times over for bytes that fit in a
     // single slot.
     let (runs_slot, places) = {
-        let _s = super::gather_phase::Span::open(super::gather_phase::Part::Stage);
         let words: Vec<&[u32]> = planned.iter().map(|(_, _, _, t)| &t.words[..]).collect();
         unsafe { super::stage_run_tables(ctx, pools, counters, &words) }?
     };
     let mut out = Vec::with_capacity(planned.len());
     for ((source, dst, dst_have, table), place) in planned.iter().zip(&places) {
-        let _d = super::gather_phase::Span::open(super::gather_phase::Part::Dset);
         let set =
             unsafe { pools.alloc_scatter_descriptor_set(&ctx.device, pipeline.dsl, counters) }?;
         unsafe {
@@ -680,13 +676,8 @@ unsafe fn stage_buffer_content(
     let mut gather_owed = false;
     let bound = match content {
         BufferContent::Bytes(b) => {
-            let slot = {
-                let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-                pools.acquire_staging(ctx, b.len() as u64, counters)?
-            };
-            let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, b.len() as u64);
+            let slot = { pools.acquire_staging(ctx, b.len() as u64, counters)? };
             pools.write_staging(ctx, &slot, b)?;
-            drop(_s);
             BoundBuffer::from(slot)
         }
         BufferContent::GuestRuns(src) => {
@@ -731,11 +722,7 @@ unsafe fn stage_buffer_content(
                 // CPU gathers the runs into the mapped staging span, with no
                 // intermediate `cpu_bytes()` heap Vec (this is the
                 // deferred-submit hot path, ~4.8 binds/draw under compositing).
-                let slot = {
-                    let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-                    pools.acquire_staging(ctx, src.total_len, counters)?
-                };
-                let _s = stage_phase::Span::moving(stage_phase::Part::Runs, src.total_len);
+                let slot = { pools.acquire_staging(ctx, src.total_len, counters)? };
                 pools.write_staging_from_runs(
                     ctx,
                     &slot,
@@ -743,7 +730,6 @@ unsafe fn stage_buffer_content(
                     src.source_offset,
                     src.total_len,
                 )?;
-                drop(_s);
                 if snapshot_volatile {
                     counters
                         .buffer_snapshot_binds
@@ -885,7 +871,6 @@ unsafe fn gather_guest_buffer_window(
     // claim bytes the GPU never moved. A driven `REIMS_VGPU_GUEST_IMPORT=off`
     // boot read `gather_n=288196` beside `buffer_guest_gathers=0` before this
     // moved.
-    let _span = stage_phase::Span::moving(stage_phase::Part::Gather, src.total_len);
     // Plan before acquiring, so a window that turns out not to be gatherable
     // does not take a destination slot out of the pool to abandon it.
     let mut sources: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
@@ -2692,7 +2677,6 @@ pub(crate) unsafe fn execute_draw_inner(
 ) -> Result<DrawOutput, DrawError> {
     // Charges this draw's wall clock to one phase at a time; commits from
     // `Drop`, so the `?` returns below keep their time.
-    let mut phase = super::draw_phase::DrawTimer::start();
     validate_v1(req)?;
     let force_loss = owner.force_device_lost;
     if force_loss {
@@ -2925,7 +2909,6 @@ pub(crate) unsafe fn execute_draw_inner(
     // below is the only part of `Prep` that can block on the GPU. Charged apart
     // so a boot can tell "the CPU is ahead of the ring" from "preparing a draw
     // got slower", which `prep_us` alone cannot.
-    phase.enter(super::draw_phase::Phase::Slot);
     // `joins` is `refusal().is_none()`, and each of the other three `BatchFit`
     // arms has its own rung, so a join *is* a `BatchFit::Open` and the pair
     // cannot be any other combination.
@@ -2938,7 +2921,6 @@ pub(crate) unsafe fn execute_draw_inner(
         // been submitted, so nothing may free one out from under it.
         _ => pools.begin_entry(ctx, counters)?,
     };
-    phase.enter(super::draw_phase::Phase::Pipeline);
 
     // Build the layout's bindings from storage / sampled / sampler descriptors,
     // into the command buffer's own scratch. It was a draw-local `Vec`, sized up
@@ -3102,13 +3084,11 @@ pub(crate) unsafe fn execute_draw_inner(
     // an image is not in is undefined behaviour rather than a stale read — so
     // "the guest asked to load" and "there is something to load" are two
     // questions and only the second one is about this device.
-    phase.enter(super::draw_phase::Phase::PipelineDepth);
     let depth_attachment = req
         .depth
         .as_ref()
         .map(|_| acquire_depth_view(ctx, pools, req, counters))
         .transpose()?;
-    phase.enter(super::draw_phase::Phase::Pipeline);
     if let Some(d) = &req.depth {
         let load = depth_attachment
             .as_ref()
@@ -3167,14 +3147,11 @@ pub(crate) unsafe fn execute_draw_inner(
                     },
                 ));
             }
-            if !req.skip_readback
-                || req.target_rgba8.is_some()
-                || req.target_guest_seed.is_some()
-                || req.load_guest_target_backing
-            {
+            if let Some(transfer) = super::reason::MultisampleLinearTransfer::first_asked(req) {
                 return Err(DrawError::Unsupported(
                     super::reason::DrawReason::MultisampleLinearTransferUnsupported {
                         sample_count: raster_sample_count,
+                        transfer,
                     },
                 ));
             }
@@ -3197,17 +3174,13 @@ pub(crate) unsafe fn execute_draw_inner(
         step_rate: a.step_rate,
     }));
     let attr_keys = caches.intern_attrs(pools.attr_keys());
-
-    phase.enter(super::draw_phase::Phase::PipelineShader);
     let (vert_digest, vert_module) =
         caches.get_or_create_shader_memoized(ctx, &req.vert_spirv, counters, pools)?;
     let (frag_digest, frag_module) =
         caches.get_or_create_shader_memoized(ctx, &req.frag_spirv, counters, pools)?;
-    phase.enter(super::draw_phase::Phase::PipelineLayoutPass);
     let layout = caches.get_or_create_layout(ctx, pools.layout_bindings(), None, counters)?;
     let (dsl, pipeline_layout) = (layout.dsl, layout.pipeline_layout);
     let render_pass = caches.get_or_create_pass(ctx, pass_key, counters, pools)?;
-    phase.enter(super::draw_phase::Phase::Pipeline);
     // How many viewport slots this draw rasterizes into, checked against the
     // host before it is baked into a pipeline. Refused rather than clamped:
     // clamping would silently drop the viewports past the host's limit, which
@@ -3383,7 +3356,6 @@ pub(crate) unsafe fn execute_draw_inner(
     };
     // One cache, consulted once. `get_or_create_pipeline` already counts the hit
     // and already checks the negative entry for a key that failed to compile.
-    phase.enter(super::draw_phase::Phase::PipelineCompile);
     let pipeline = caches.get_or_create_pipeline(
         ctx,
         &pipeline_key,
@@ -3399,14 +3371,11 @@ pub(crate) unsafe fn execute_draw_inner(
     )?;
 
     // Samplers
-    phase.enter(super::draw_phase::Phase::PipelineSampler);
     let mut sampler_handles = Vec::new();
     for s in &req.samplers {
         let h = caches.get_or_create_sampler(ctx, &s.state_key(), counters, pools)?;
         sampler_handles.push((s.binding, h));
     }
-
-    phase.enter(super::draw_phase::Phase::Stage);
     // Vertex buffers (with Constant step shift), deduplicated by content:
     // several attributes on one interleaved stream share one staging slot.
     let no_vertex_fetch = draw_has_no_invocations(req);
@@ -3416,8 +3385,6 @@ pub(crate) unsafe fn execute_draw_inner(
     // without reaching the gather again, so a window bound twice anywhere in
     // this command buffer is copied once.
     let mut guest_gathers: Vec<PendingGuestGather> = Vec::new();
-    phase.enter(super::draw_phase::Phase::StageRoles);
-    phase.enter(super::draw_phase::Phase::StageVertex);
     pools.begin_vertex_binds();
     for resource in &req.vertex_attributes {
         let needs_shift = !no_vertex_fetch
@@ -3450,18 +3417,12 @@ pub(crate) unsafe fn execute_draw_inner(
                 })
             })?;
             let shifted = {
-                let _s = stage_phase::Span::moving(stage_phase::Part::Shift, len as u64);
                 let mut shifted = vec![0u8; len];
                 shifted[prefix..].copy_from_slice(bytes);
                 shifted
             };
-            let slot = {
-                let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-                pools.acquire_staging(ctx, shifted.len() as u64, counters)?
-            };
-            let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, shifted.len() as u64);
+            let slot = { pools.acquire_staging(ctx, shifted.len() as u64, counters)? };
             pools.write_staging(ctx, &slot, &shifted)?;
-            drop(_s);
             BoundBuffer::from(slot)
         } else {
             stage_buffer_content(
@@ -3483,7 +3444,6 @@ pub(crate) unsafe fn execute_draw_inner(
     // Index data follows the same retained resource path as vertex/storage
     // data. A direct import binds the guest's pages; a scattered window is
     // gathered once by this command buffer; only incapable hosts CPU-stage it.
-    phase.enter(super::draw_phase::Phase::StageIndex);
     let index_slot = match &req.indexed {
         Some(indexed) => Some(stage_buffer_content(
             ctx,
@@ -3504,7 +3464,6 @@ pub(crate) unsafe fn execute_draw_inner(
     // stage-in buffer doubling as a storage bind reuses the same slot — every
     // pooled slot carries `POOL_SLOT_USAGE`, so there is no usage for that
     // reuse to be wrong about).
-    phase.enter(super::draw_phase::Phase::StageStorage);
     pools.begin_storage_binds();
     for resource in &req.storage_buffers {
         let slot = stage_buffer_content(
@@ -3531,7 +3490,6 @@ pub(crate) unsafe fn execute_draw_inner(
     // below restates the seed as the attachment's texels first; the four-byte
     // arm is unchanged, which is every attachment this device had until render
     // targets began following the guest's declared format.
-    phase.enter(super::draw_phase::Phase::StageSeed);
     let seed_wide = seed_bytes.and_then(|rgba8| {
         let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format)?;
         // Four-byte *colour*, not four bytes. A seed is eight-bit RGBA, and a
@@ -3569,21 +3527,14 @@ pub(crate) unsafe fn execute_draw_inner(
                 },
             ));
         }
-        let slot = {
-            let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-            pools.acquire_staging(ctx, wide.len() as u64, counters)?
-        };
+        let slot = { pools.acquire_staging(ctx, wide.len() as u64, counters)? };
         {
-            let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, wide.len() as u64);
             pools.write_staging(ctx, &slot, &wide)?;
         }
         counters.note_seed_upload(wide.len() as u64);
         Some(slot)
     } else if let Some(rgba8) = seed_bytes {
-        let slot = {
-            let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-            pools.acquire_staging(ctx, rgba8.len() as u64, counters)?
-        };
+        let slot = { pools.acquire_staging(ctx, rgba8.len() as u64, counters)? };
         // Vulkan buffer→image copies do not perform format conversion, so the
         // staged bytes must already be in the attachment's physical order —
         // otherwise partial draws preserve an exact R/B-exchanged seed outside
@@ -3591,10 +3542,8 @@ pub(crate) unsafe fn execute_draw_inner(
         // seed states its own order. Exchange exactly when they disagree, inside
         // the copy that has to happen anyway.
         if matches!(req.target_seed_order, SeedOrder::Bgra8) != output_bgra {
-            let _s = stage_phase::Span::moving(stage_phase::Part::Swap, rgba8.len() as u64);
             pools.write_staging_swap_rb(ctx, &slot, rgba8)?;
         } else {
-            let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, rgba8.len() as u64);
             pools.write_staging(ctx, &slot, rgba8)?;
         }
         counters.note_seed_upload(rgba8.len() as u64);
@@ -3615,7 +3564,6 @@ pub(crate) unsafe fn execute_draw_inner(
     // with and without an input reference are NOT framebuffer-compatible),
     // and the fetch-carrying `render_pass` is used only for the ad-hoc
     // framebuffer + pipeline, exactly like MRT/depth.
-    phase.enter(super::draw_phase::Phase::StagePass);
     // Whether this draw's pass shape differs from the colour-only one the target
     // slot's cached framebuffer was built against. One predicate, because the
     // two answers it feeds have to agree: which pass the slot is ensured under,
@@ -3632,7 +3580,6 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         (render_pass, pass_key.framebuffer_compatibility())
     };
-    phase.enter(super::draw_phase::Phase::Acquire);
     // (identity, image, tracked-layout-before-this-draw) per secondary — used
     // to barrier prior sampled reads and to mark ready afterward.
     let mut mrt_secondaries: Vec<(
@@ -3835,15 +3782,8 @@ pub(crate) unsafe fn execute_draw_inner(
                     Some(source)
                 }
                 None => {
-                    let slot = {
-                        let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-                        pools.acquire_staging(ctx, seed.source.total_len, counters)?
-                    };
+                    let slot = { pools.acquire_staging(ctx, seed.source.total_len, counters)? };
                     {
-                        let _s = stage_phase::Span::moving(
-                            stage_phase::Part::Runs,
-                            seed.source.total_len,
-                        );
                         pools.write_staging_from_runs(
                             ctx,
                             &slot,
@@ -3911,7 +3851,6 @@ pub(crate) unsafe fn execute_draw_inner(
 
     // Resolve sampled images only after ensuring the render target so registry
     // capacity eviction cannot destroy an image already selected for this draw.
-    phase.enter(super::draw_phase::Phase::AcquireSampled);
     let mut sampled = Vec::new();
     let mut attachment_snapshots: std::collections::HashMap<
         (super::types::TargetIdentity, SampledKey),
@@ -4179,7 +4118,6 @@ pub(crate) unsafe fn execute_draw_inner(
                 // re-entered per texture, which is correct — `enter`
                 // accumulates, so a draw binding several gathers charges each
                 // half of each bind to its own bar.
-                phase.enter(super::draw_phase::Phase::SampledUpload);
                 // First ask whether the bytes have to move at all. The RAMBlock
                 // import is a buffer the copy can name, so where this device
                 // can make one this arm moves nothing on the CPU and the
@@ -4228,12 +4166,9 @@ pub(crate) unsafe fn execute_draw_inner(
                     gathered_len: src.total_len as usize,
                 });
                 // Back to the deciding half for the next texture in the loop.
-                phase.enter(super::draw_phase::Phase::AcquireSampled);
             }
         }
     }
-
-    phase.enter(super::draw_phase::Phase::AcquireReadback);
     // Sized by the attachment's own texel, not by a constant four. The copy at
     // the end of this command buffer names an image extent and no buffer row
     // length, so the GPU writes `width * height *
@@ -4259,14 +4194,11 @@ pub(crate) unsafe fn execute_draw_inner(
             ))
         }
     };
-    phase.note_target(req.width, req.height, if do_readback { rb_size } else { 0 });
     let readback = if do_readback {
         Some(pools.acquire_readback(ctx, rb_size, counters)?)
     } else {
         None
     };
-
-    phase.enter(super::draw_phase::Phase::Descriptors);
     // Push descriptors are the Vulkan spelling closest to Metal encoder
     // binding state: the writes become commands in this command buffer, with no
     // separately allocated object. The layout cache made the same decision.
@@ -4319,25 +4251,13 @@ pub(crate) unsafe fn execute_draw_inner(
             .descriptor_set_updates
             .fetch_add(1, Ordering::Relaxed);
     }
-
-    phase.enter(super::draw_phase::Phase::RecordBegin);
     // The ring slot's CB retired at begin_entry and its fence is unsignaled —
     // no pre-record wait remains (pre_record_wait_us stays 0 on this path).
     // A batch joiner's CB is already recording (opened by the batch opener);
     // its commands append after the previous draw's end_render_pass.
     if !joins {
-        unsafe {
-            pools.begin_slot_recording(
-                ctx,
-                cb,
-                super::gpu_span::Kind::Draw,
-                VkOp::ExecResetCb,
-                VkOp::ExecBeginCb,
-            )?
-        };
+        unsafe { pools.begin_slot_recording(ctx, cb, VkOp::ExecResetCb, VkOp::ExecBeginCb)? };
     }
-
-    phase.enter(super::draw_phase::Phase::RecordBarrier);
     // What this draw records that a render pass instance cannot contain, on the
     // two ladders [`PassObstacles`] keeps.
     //
@@ -4828,7 +4748,6 @@ pub(crate) unsafe fn execute_draw_inner(
                 // a handle that never changes.
                 unsafe { pipeline.bind(&ctx.device, cb) };
                 for g in &groups {
-                    let _r = super::gather_phase::Span::open(super::gather_phase::Part::Record);
                     unsafe { pipeline.dispatch(&ctx.device, cb, g.set, g.run_count) };
                 }
                 counters
@@ -5049,7 +4968,6 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     let clear = clear_values(req)?;
-    phase.enter(super::draw_phase::Phase::RecordPass);
     let rp_begin = vk::RenderPassBeginInfo::default()
         .render_pass(render_pass)
         .framebuffer(target_fb)
@@ -5217,7 +5135,6 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
         );
     }
-    phase.enter(super::draw_phase::Phase::RecordState);
     // Only if this command buffer is not already carrying it — the three
     // `dynstate_*` skips below hang off this one call, because a pipeline change
     // is what invalidates them. See `super::pools::CbGraphicsState`.
@@ -5367,7 +5284,6 @@ pub(crate) unsafe fn execute_draw_inner(
             .descriptor_set_binds
             .fetch_add(1, Ordering::Relaxed);
     }
-    phase.enter(super::draw_phase::Phase::RecordDraw);
     unsafe { pools.bind_vertex_buffers(&ctx.device, cb, counters) };
     match (&req.indexed, &index_slot) {
         (Some(indexed), Some(ibuf)) => {
@@ -5394,7 +5310,6 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     // Back to the remainder: the query end, the pass-close decision and
     // everything after it are the part of recording no sub-phase names.
-    phase.enter(super::draw_phase::Phase::Record);
     if let Some((pool, _)) = occlusion {
         ctx.device.cmd_end_query(cb, pool, 0);
     }
@@ -5582,12 +5497,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // in recording state for same-target successors and is submitted by
     // pools.batch_flush (next begin_entry / retire / explicit flush).
     let defer_submit = batch_eligible;
-    phase.enter(super::draw_phase::Phase::Submit);
     if !defer_submit {
-        // Last command before the CB ends, so the stamp bounds every draw and
-        // copy this submission recorded. A deferred draw is sealed by
-        // `batch_flush` instead, on the same slot.
-        unsafe { pools.gpu_span_seal_current(ctx, cb) };
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecEndCb, e)))?;
@@ -5620,7 +5530,6 @@ pub(crate) unsafe fn execute_draw_inner(
     // Submission ends here. Everything below is CPU-side publication and
     // retention work, and needs its own bar: charging it to `submit_us` makes
     // a slow registry or Store-footprint update look like driver queue cost.
-    phase.enter(super::draw_phase::Phase::PostTarget);
     // CPU-side bookkeeping: the retained target's content is queue-ordered
     // (mark ready), resident sampled layouts advance to the recorded
     // post-draw layout, and the sampled images this CB fills are named for the
@@ -5666,7 +5575,6 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.registry_mark_ready_at(identity, pass_key.color_final_layout(0));
         }
     }
-    phase.enter(super::draw_phase::Phase::PostStore);
     let guest_store_footprint = match (
         req.target_identity.as_ref(),
         guest_store_footprint_to_record(
@@ -5683,7 +5591,6 @@ pub(crate) unsafe fn execute_draw_inner(
         _ => None,
     };
     let guest_store_recorded = guest_store_footprint.is_some();
-    phase.enter(super::draw_phase::Phase::PostTarget);
     // MRT secondary attachments settle at COLOR_ATTACHMENT_OPTIMAL (the pass
     // final layout) and become sampleable residents; the consumer's
     // resident-sample barrier then transitions COLOR_ATTACHMENT→SHADER_READ,
@@ -5724,7 +5631,6 @@ pub(crate) unsafe fn execute_draw_inner(
     if let Some(identity) = depth_attachment.as_ref().and_then(|d| d.identity.as_ref()) {
         pools.registry_mark_depth_ready(identity);
     }
-    phase.enter(super::draw_phase::Phase::PostSampled);
     let mut sampled_retains: Vec<super::pools::SampledRetain> = Vec::new();
     for prepared in &sampled {
         match prepared {
@@ -5795,7 +5701,6 @@ pub(crate) unsafe fn execute_draw_inner(
     // GPU. The cache admission happens inside `batch_append` rather than at the
     // flush precisely so the *next* draw of this batch can find these windows;
     // see its doc.
-    phase.enter(super::draw_phase::Phase::PostPark);
     if defer_submit {
         let target = batch_target.expect("batch_eligible requires target identity");
         pools.batch_append(
@@ -5891,7 +5796,6 @@ pub(crate) unsafe fn execute_draw_inner(
         // for queried draws only, which on every workload measured so far is
         // none of them.
         if occlusion.is_some() {
-            phase.enter(super::draw_phase::Phase::Wait);
             pools.wait_entry_fence(ctx, counters, fence)?;
             return Ok(DrawOutput {
                 pixels: Vec::new(),
@@ -5923,10 +5827,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // `finish_us` tail). The cleanup is already parked with `finish_entry_async`
     // above, so the slot stays pending and the ring retires it later with no
     // extra wait (its fence is already signaled).
-    phase.enter(super::draw_phase::Phase::Wait);
     pools.wait_entry_fence(ctx, counters, fence)?;
-
-    phase.enter(super::draw_phase::Phase::Readback);
     let out = super::pools::read_back_slot(
         ctx,
         rb,

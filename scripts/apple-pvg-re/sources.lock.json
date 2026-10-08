@@ -1,0 +1,201 @@
+{
+  "schema": 1,
+  "generated": "2026-10-07",
+  "sources": [
+    {
+      "id": "libapplegfx-vulkan",
+      "repo": "https://github.com/MattJackson/libapplegfx-vulkan.git",
+      "commit": "7574eac0d7396a9f49366f007c7fbeb44245826c",
+      "class": "clean-room-source",
+      "license": "MIT",
+      "paths": [
+        "src",
+        "include",
+        "docs",
+        "README.md",
+        "CHANGELOG.md",
+        "CLAUDE.md",
+        "LICENSE"
+      ],
+      "use": "Primary independent Apple PVG protocol/opcode/MMIO/task-memory implementation."
+    },
+    {
+      "id": "mos-qemu",
+      "repo": "https://github.com/MattJackson/mos-qemu.git",
+      "commit": "4ef449db9e5c7a2a171201fbba96def469efc950",
+      "class": "clean-room-source",
+      "license": "GPL-2.0-or-later",
+      "paths": [
+        "hw/display/apple-gfx-pci-linux.c",
+        "hw/display/apple-gfx-common-linux.c",
+        "hw/display/apple-gfx-linux.h",
+        "hw/display/trace-events",
+        "upstream-pr/apple-gfx-pci-linux",
+        "README.md",
+        "CHANGELOG.md",
+        "LICENSE"
+      ],
+      "use": "Linux QEMU PGDevice/PGShellCallbacks transport, PCI/MMIO/MSI plumbing and RE annotations."
+    },
+    {
+      "id": "mos-patcher",
+      "repo": "https://github.com/MattJackson/mos-patcher.git",
+      "commit": "794092e121575e3f323203089b6207e649877500",
+      "class": "clean-room-source",
+      "license": "MIT",
+      "paths": [
+        "src",
+        "include",
+        "README.md",
+        "LICENSE"
+      ],
+      "use": "Kext symbol/vtable/inheritance observations involving AppleParavirtGPU and IOAcceleratorFamily2."
+    },
+    {
+      "id": "mos-docker",
+      "repo": "https://github.com/MattJackson/mos-docker.git",
+      "commit": "5e719a2b8a423b56285e47d9c5b7591c9bc02d6e",
+      "class": "evidence-source",
+      "license": "project-defined",
+      "paths": [
+        "tests",
+        "docs/archive",
+        "README.md"
+      ],
+      "use": "Guest attach/MMIO/Metal-no-op verification and failure fingerprints; evidence, not protocol truth."
+    },
+    {
+      "id": "tmc-apple-bindings",
+      "repo": "https://github.com/tmc/apple.git",
+      "commit": "872b4b8c75cb24617d606e0484c1db1e2948f01e",
+      "class": "api-surface",
+      "license": "MIT",
+      "paths": [
+        "paravirtualizedgraphics",
+        "LICENSE"
+      ],
+      "use": "Generated Go bindings for the public/private ParavirtualizedGraphics PGDevice API surface."
+    },
+    {
+      "id": "qemu-upstream-apple-gfx",
+      "repo": "https://github.com/qemu/qemu.git",
+      "commit": "3377670ee96b5a68361016680a95b9013709d4b7",
+      "class": "host-reference",
+      "license": "GPL-2.0-or-later",
+      "paths": [
+        "hw/display/apple-gfx.h",
+        "hw/display/apple-gfx.m",
+        "hw/display/apple-gfx-pci.m",
+        "hw/display/apple-gfx-mmio.m"
+      ],
+      "use": "Apple-framework-backed host transport reference; not an independent decoder."
+    },
+    {
+      "id": "objc2-paravirtualizedgraphics",
+      "repo": "https://github.com/madsmtm/objc2-generated.git",
+      "commit": "7f0fa2483f5f17e73442cb6da95132fe417224b8",
+      "class": "reference-only",
+      "license": "not-declared-in-generated-repo",
+      "paths": [
+        "ParavirtualizedGraphics"
+      ],
+      "use": "Generated Rust API surface. Keep local because provenance/licensing is not declared in this generated repository."
+    },
+    {
+      "id": "super-tart-vphone",
+      "repo": "https://github.com/wh1te4ever/super-tart-vphone.git",
+      "commit": "fcb64e4fc5953e12cb20ca496852b399820c8954",
+      "class": "reference-only",
+      "license": "Fair-Source-0.9-derived",
+      "paths": [
+        "README.md",
+        "GUIDE.md",
+        "Sources",
+        "Package.swift"
+      ],
+      "use": "PCC/vPhone GPU bring-up source. The removed Apple-derived compiler plugin must never be imported into Reims."
+    },
+    {
+      "id": "super-tart-vphone-writeup",
+      "repo": "https://github.com/wh1te4ever/super-tart-vphone-writeup.git",
+      "commit": "9c458e1564e166dca2685f2d6d928ea7f4dd1906",
+      "class": "reference-only",
+      "license": "not-declared",
+      "paths": [
+        "README.md",
+        "README_ko.md"
+      ],
+      "use": "AppleParavirtGPUMetalIOGPUFamily/PCC reverse-engineering narrative; evidence only."
+    },
+    {
+      "id": "virtualmaconipad",
+      "repo": "https://github.com/dr-data/virtualmaconipad.git",
+      "commit": "99b2c9293749ad7c61bebf008dc7f467d78e7348",
+      "class": "supporting-source",
+      "license": "MIT",
+      "paths": [
+        "README.md",
+        "VirtualMac",
+        "LICENSE"
+      ],
+      "use": "Reconstruction/loading work for Apple virtualization/private frameworks including ParavirtualizedGraphics."
+    },
+    {
+      "id": "vphone-cli",
+      "repo": "https://github.com/Lakr233/vphone-cli.git",
+      "commit": "aa20eb83d8b3581f3c3cc4d95aaa60290b906aca",
+      "class": "supporting-source",
+      "license": "MIT",
+      "paths": [
+        "research",
+        "Sources",
+        "README.md",
+        "LICENSE"
+      ],
+      "use": "Modern vPhone research including AppleParavirtGPUMetalIOGPUFamily deployment and binary-comparison notes."
+    },
+    {
+      "id": "asahi-macos-arm64-experiment",
+      "repo": "https://github.com/steelbrain/experiment-macOS-arm64-on-asahi-linux-arm64.git",
+      "commit": "657bb2423ec8d572b22a97dd33563dbba1680e6a",
+      "class": "evidence-source",
+      "license": "not-declared",
+      "paths": [
+        "README.md",
+        "JOURNAL.md",
+        "scripts",
+        "patches"
+      ],
+      "use": "AppleParavirtGPU/Reims arm64 guest bring-up evidence on Asahi/KVM."
+    },
+    {
+      "id": "ipsw-diffs",
+      "repo": "https://github.com/blacktop/ipsw-diffs.git",
+      "commit": "4955032da8337b596698dd854b7a58c88e5faa7d",
+      "class": "reference-only",
+      "license": "generated-Apple-derived-metadata",
+      "paths": [
+        "26_7_25G220_vs_26_7_25G224/DYLIBS/System/Library/Frameworks/ParavirtualizedGraphics.framework/Versions/A/ParavirtualizedGraphics.md"
+      ],
+      "use": "Version-to-version symbol/size deltas for Tahoe ParavirtualizedGraphics. Local reference only."
+    },
+    {
+      "id": "macosx-sdks-pvg-headers",
+      "repo": "https://github.com/phracker/MacOSX-SDKs.git",
+      "commit": "041600eda65c6a668f66cb7d56b7d1da3e8bcc93",
+      "class": "reference-only",
+      "license": "Apple-SDK-material",
+      "paths": [
+        "MacOSX11.3.sdk/System/Library/Frameworks/ParavirtualizedGraphics.framework/Versions/A/Headers"
+      ],
+      "use": "Historical PGDevice/PGDisplay headers. Apple SDK material: inspect locally, never vendor."
+    },
+    {
+      "id": "nick-botticelli-vma2-log",
+      "url": "https://gist.github.com/nick-botticelli/865db1e97d4c52a5dbd6e8c6e5639641",
+      "class": "url-only",
+      "license": "not-declared",
+      "use": "AppleParavirtGPU/IOGPU class-tree and boot-log observations."
+    }
+  ]
+}

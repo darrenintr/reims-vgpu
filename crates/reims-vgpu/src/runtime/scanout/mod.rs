@@ -1488,9 +1488,8 @@ impl SampledFieldWindow {
 /// [`note_sampled_surface_field`] over an explicitly named window, for a bind
 /// whose texels are not the mapping's own geometry.
 ///
-/// The window is a closure so the off arm does not resolve it either: the gate,
-/// the bind count and the timing are all here, and a caller cannot spend work
-/// on a witness that is not going to look.
+/// The window is a closure so the off arm does not resolve it either: a caller
+/// cannot spend work on a witness that is not going to look.
 pub fn note_sampled_surface_field_window<M: HostMemory>(
     state: &DeviceState,
     host: &M,
@@ -1499,11 +1498,9 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
     route: &str,
     window: impl FnOnce() -> Option<SampledFieldWindow>,
 ) {
-    crate::runtime::sampled_phase::note_field_witness();
     if !sampled_field_witness_enabled() {
         return;
     }
-    let _span = crate::runtime::sampled_phase::WitnessSpan::open();
     let Some(window) = window() else {
         return;
     };
@@ -1548,7 +1545,6 @@ fn sample_surface_field<M: HostMemory>(
     let mut report = String::new();
     let mut first_texel = String::new();
     let mut verdicts: Vec<u8> = Vec::with_capacity(FIELD_PATCHES.len());
-    let mut reads = 0u64;
     for (i, (fx, fy)) in FIELD_PATCHES.iter().enumerate() {
         let cx = (width as f32 * fx) as u32;
         let cy = (height as f32 * fy) as u32;
@@ -1567,7 +1563,6 @@ fn sample_surface_field<M: HostMemory>(
                     continue;
                 };
                 let mut texel = [0u8; 4];
-                reads += 1;
                 if host
                     .read_gpa(gpa + (off % page), &mut texel[..read])
                     .is_err()
@@ -1593,7 +1588,6 @@ fn sample_surface_field<M: HostMemory>(
         }
         report.push_str(&format!("{verdict}:{mean:.0}/{sd:.0}"));
     }
-    crate::runtime::sampled_phase::note_field_witness_sample(reads);
     if verdicts.is_empty() {
         return;
     }

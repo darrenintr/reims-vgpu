@@ -458,6 +458,31 @@ fn apply_delete_object<H: HostMemory + HostOps>(
                 } else {
                     "pipeline_retire_absent"
                 });
+                // **And the name ends with it.** The pipeline table's entry is a
+                // tombstone keyed by this name, so a name that outlived the
+                // delete is one the guest's *next* pipeline in this slot
+                // inherits: `name_resource` answers from the live name without
+                // re-reading the list, the table answers `Retired` for it, and
+                // `waits_for` reads `Retired` as nothing to wait on. The packet
+                // is released while the new pipeline's shaders are still
+                // translating and its first draw is dropped as
+                // `m2v_translation_pending_at_sync_boundary` with
+                // `model_pipeline=retired`. macOS 26's icon agent builds and
+                // deletes pipelines per icon, and lost the one draw each icon
+                // is made of — every app icon blank.
+                //
+                // The name only, under the same gate as the table entry above:
+                // the slot stops resolving, accepted work keeps what it
+                // resolved, and the next declaration in the slot mints a new
+                // generation the table has never seen. Not `delete_object` —
+                // the object table and the host copies are keyed by the same
+                // integer in the resource space, and
+                // `a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with`
+                // holds that no destroy record crosses into them.
+                note_store_route(match state.retire_object_name(task_id, name) {
+                    Some(_) => "pipeline_name_retired",
+                    None => "pipeline_name_retire_absent",
+                });
             } else {
                 note_store_route("pipeline_retire_unnamed");
             }
@@ -1894,10 +1919,7 @@ fn decode_packet(
     available: u32,
     ring_capacity: u32,
 ) -> Result<Packet, PacketError> {
-    let started = std::time::Instant::now();
-    let out = decode_packet_inner(bytes, head, available, ring_capacity);
-    census::note_drain_decode(started.elapsed().as_nanos() as u64);
-    out
+    decode_packet_inner(bytes, head, available, ring_capacity)
 }
 
 fn decode_packet_inner(
@@ -2283,14 +2305,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
     let translating = match (arrived.submission.as_ref(), built.payload.exec()) {
         (Some(submission), Some(resolved)) => {
             let _span = tranche_span(TrancheCost::AdmitPreflight);
-            let mut measured_ns = 0u64;
-            crate::runtime::exec::preflight_submission(
-                state,
-                host,
-                submission,
-                resolved,
-                &mut measured_ns,
-            )
+            crate::runtime::exec::preflight_submission(state, host, submission, resolved)
         }
         _ => Vec::new(),
     };
@@ -2623,16 +2638,8 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             note_store_route("parked_translations_already_ready");
             continue;
         }
-        let mut measured_ns = 0u64;
-        let preflight_started = std::time::Instant::now();
-        let pending = crate::runtime::exec::preflight_submission(
-            state,
-            &*host,
-            submission,
-            resolved,
-            &mut measured_ns,
-        );
-        census::note_tranche_since(census::TrancheCost::PumpPreflight, preflight_started);
+        let pending =
+            crate::runtime::exec::preflight_submission(state, &*host, submission, resolved);
         if !pending.is_empty() {
             // The pump's own withdrawal arm. A position can be parked on one
             // pipeline while another it binds is `Ready` from an earlier
@@ -2979,10 +2986,7 @@ fn read_ring_bytes<M: HostMemory>(
     absolute: u32,
     len: u32,
 ) -> Result<Vec<u8>, MemError> {
-    let started = std::time::Instant::now();
-    let out = read_ring_bytes_inner(mem, base_gpa, ring_size, absolute, len);
-    census::note_drain_ring(started.elapsed().as_nanos() as u64);
-    out
+    read_ring_bytes_inner(mem, base_gpa, ring_size, absolute, len)
 }
 
 fn read_ring_bytes_inner<M: HostMemory>(
@@ -4247,10 +4251,7 @@ fn read_child_ring_bytes<M: HostMemory>(
     len: u32,
     page_shift: u32,
 ) -> Result<Vec<u8>, MemError> {
-    let started = std::time::Instant::now();
-    let out = read_child_ring_bytes_inner(mem, page_gpas, ring_length, absolute, len, page_shift);
-    census::note_drain_ring(started.elapsed().as_nanos() as u64);
-    out
+    read_child_ring_bytes_inner(mem, page_gpas, ring_length, absolute, len, page_shift)
 }
 
 fn read_child_ring_bytes_inner<M: HostMemory>(
@@ -5160,192 +5161,6 @@ impl MapFamily {
     }
 }
 
-/// Record the page-table nodes `gva` descends through under `task_id`, and say
-/// whether this device wrote to any of them since it last saw them as nodes.
-///
-/// Stands here, on the map/unmap packet, for two reasons: the tree is being
-/// edited at exactly this moment, so the nodes read are the live ones; and the
-/// device is already holding the task and the address, so the whole cost is one
-/// descent of at most [`node_guard::MAX_TREE_NODES`] guest reads.
-///
-/// A finding is emitted on the fail channel because it is one — a host write
-/// into a page of page-table entries is the corruption class that ends a guest,
-/// and the zero-word shape of this device's clears is what the guest's own
-/// teardown assertion reads as a missing entry. Everything else is counted and
-/// silent.
-fn observe_page_table_nodes<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &H,
-    task_id: u32,
-    gva: u64,
-) {
-    use crate::runtime::node_guard::{self, NodeVerdict};
-
-    if !node_guard::enabled() {
-        return;
-    }
-    let Some(geometry) = reims_vgpu_paging::resolve::geometry_for_page_shift(state.page_shift)
-    else {
-        return;
-    };
-    let Some(entry) = state.tasks.get(task_id) else {
-        return;
-    };
-    let task = reims_vgpu_paging::resolve::Task {
-        active: entry.active,
-        directory_pfn: entry.directory_pfn,
-    };
-    let mut nodes = [0u64; node_guard::MAX_TREE_NODES];
-    let found = reims_vgpu_paging::resolve::task_node_gpas(
-        &crate::runtime::gva_mem::HostPhys(host),
-        geometry,
-        &task,
-        gva,
-        &mut nodes,
-    );
-    if found == 0 {
-        return;
-    }
-
-    let now_us = crate::observe::elapsed_us();
-    // The write census is read while the watch is mutated, so it is split off
-    // first: both live on `DeviceState` and only one of them is being written.
-    let DeviceState {
-        host_writes,
-        node_guard: watches,
-        ..
-    } = state;
-    let watch = watches.entry(task_id).or_default();
-    for &gpa in &nodes[..found] {
-        let verdict = watch.observe(host_writes, gpa, now_us);
-        note_store_route(verdict.route());
-        if let NodeVerdict::Wrote { gap_us } = verdict {
-            if crate::observe::first_sight("node_guard_wrote_node_page", gpa) {
-                crate::observe::fail(format!(
-                    "node_guard reason={} task={task_id} node_gpa={gpa:#x} gva={gva:#x} \
-                     gap_us={gap_us} watched={} refused={} (this device wrote into a guest page \
-                     holding page-table entries; a zero word landing there is what the guest's \
-                     own teardown reads as an entry it has already cleared, and it panics on one)",
-                    verdict.route(),
-                    watch.watched(),
-                    watch.refused(),
-                ));
-            }
-        }
-    }
-}
-
-/// Record the guest-physical pages of `[gva, gva+length)` as released, on an
-/// unmap, or as handed back, on a map.
-///
-/// Both directions matter and the map one is not an afterthought: a page the
-/// guest maps again is a page this device is entitled to write, so leaving it
-/// watched would report every recycled page as a defect. See
-/// [`crate::runtime::released_pages`].
-///
-/// The resolve runs against the live page table, which on an unmap means it has
-/// to happen before the packet is applied. A range that no longer translates
-/// resolves to fewer pages than it spans, and that is not an error here — those
-/// pages are already gone and there is nothing left to watch.
-fn note_released_or_remapped<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &H,
-    task_id: u32,
-    gva: u64,
-    length: u64,
-    family: MapFamily,
-) {
-    if !crate::runtime::node_guard::enabled() {
-        return;
-    }
-    let pages = crate::runtime::gva_mem::task_gva_page_gpa_set(
-        host,
-        &state.tasks,
-        task_id,
-        gva,
-        length,
-        state.page_shift,
-    );
-    if pages.is_empty() {
-        return;
-    }
-    let writes = &mut state.host_writes;
-    match family {
-        MapFamily::UnmapMemory => {
-            for gpa in pages {
-                writes.release_page(gpa);
-            }
-        }
-        _ => {
-            for gpa in pages {
-                writes.remap_page(gpa);
-            }
-        }
-    }
-}
-
-/// Say whether this range's entries are there, and on a map — the one direction
-/// the guest orders — treat their absence as the defect it is.
-///
-/// The guest finishes wiring a range before it submits the map for it, so a map
-/// whose range is not fully covered is a mapping its own tree does not hold. It
-/// submits an unmap *before* unwiring, so that direction is a race and is
-/// counted rather than judged; keeping it is what proves the walk works, since a
-/// broken walk would read absent on both sides. See
-/// [`crate::runtime::range_coverage`].
-fn observe_range_coverage<H: HostMemory + HostOps>(
-    state: &DeviceState,
-    host: &H,
-    task_id: u32,
-    gva: u64,
-    length: u64,
-    op: crate::runtime::range_coverage::Op,
-) {
-    use crate::runtime::range_coverage::{self, Coverage};
-
-    if !range_coverage::enabled() {
-        return;
-    }
-    let (spanned, scanned) = range_coverage::pages_of(length, state.page_shift);
-    if scanned == 0 {
-        return;
-    }
-    if scanned < spanned {
-        note_store_route(op.truncated_route());
-    }
-    let Some(geometry) = reims_vgpu_paging::resolve::geometry_for_page_shift(state.page_shift)
-    else {
-        return;
-    };
-    let Some(entry) = state.tasks.get(task_id) else {
-        return;
-    };
-    let task = reims_vgpu_paging::resolve::Task {
-        active: entry.active,
-        directory_pfn: entry.directory_pfn,
-    };
-    let counts = reims_vgpu_paging::resolve::range_coverage(
-        &crate::runtime::gva_mem::HostPhys(host),
-        geometry,
-        &task,
-        gva,
-        scanned,
-    );
-    let verdict = counts.as_ref().map_or(Coverage::Unwalkable, Coverage::of);
-    let route = verdict.route(op);
-    note_store_route(route);
-    if verdict.is_finding(op) && crate::observe::first_sight(route, u64::from(task_id)) {
-        let leaf = verdict.is_leaf_level().unwrap_or(false);
-        crate::observe::fail(format!(
-            "range_coverage reason={route} task={task_id} gva={gva:#x} len={length:#x} \
-             pages={spanned} scanned={scanned} leaf_level={leaf} detail={verdict:?} \
-             (the guest wires a range fully before publishing the map for it, so a page \
-             without an entry here is a page its own teardown will later assert on)"
-        ));
-    }
-}
-
-/// The shared body of the six lifecycle commands named by [`MapFamily`].
 fn apply_map_family<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -5400,138 +5215,22 @@ fn apply_map_family<H: HostMemory + HostOps>(
         length,
     }) = notice
     {
-        // Audit the interval against what this task already has live: a range
-        // mapped twice or unmapped without a map is a disagreement the guest's
-        // own teardown assertion will eventually find.
-        //
-        // Both fields are the values the guest's own `allocate`/`deallocate`
-        // receive: its length getter forwards to the same call this packet's
-        // length field is built from, and the address is one getter used by
-        // both. So these intervals are the page-table ranges and not merely
-        // consistent with themselves. Observation only; nothing reads the
-        // verdict. See `runtime::map_audit`.
-        // The notice, in the model that owns the address space it is about.
-        // `Lifecycle` holds nothing keyed by a guest address — deliberately, so
-        // that no resolution it hands out can go stale behind its back — so it
-        // performs nothing here and states the obligation instead: every
-        // resolution held over this interval was computed against pages the
-        // guest has since moved. The audit and the retirements below are this
-        // device discharging exactly that, and the direction they discharge it
-        // in is the model's `Remap::established` rather than a second reading of
-        // the opcode.
-        let remapped = state
-            .apply_lifetime(
-                &if matches!(family, MapFamily::MapMemory2) {
-                    reims_vgpu_core::lifecycle::LifecycleOp::MapMemory {
-                        task: reims_vgpu_core::identity::TaskId(task_id),
-                        span: reims_vgpu_core::access::GuestSpan { base: gva, length },
-                    }
-                } else {
-                    reims_vgpu_core::lifecycle::LifecycleOp::UnmapMemory {
-                        task: reims_vgpu_core::identity::TaskId(task_id),
-                        span: reims_vgpu_core::access::GuestSpan { base: gva, length },
-                    }
-                },
-                family.slug(),
-            )
-            .and_then(|acted| acted.remapped.into_iter().next());
-        {
-            let page_size = 1u64 << state.page_shift;
-            // The model's answer where there is one. A refusal is reported by
-            // the door and the audit still runs off the packet's own opcode:
-            // this device's caches alias pages whether or not the model kept a
-            // task for them, and an invalidation it skipped would leave a host
-            // view over memory the guest has taken back.
-            let established = remapped.map_or_else(
-                || matches!(family, MapFamily::MapMemory2),
-                |r| r.established,
-            );
-            let intervals = state.map_audit.entry(task_id).or_default();
-            let verdict = if established {
-                intervals.map(gva, length, page_size)
+        // Publish the guest-VA lifetime transition to the ordering model.
+        // Cache/view retirement below remains the device-side invalidation.
+        let _ = state.apply_lifetime(
+            &if matches!(family, MapFamily::MapMemory2) {
+                reims_vgpu_core::lifecycle::LifecycleOp::MapMemory {
+                    task: reims_vgpu_core::identity::TaskId(task_id),
+                    span: reims_vgpu_core::access::GuestSpan { base: gva, length },
+                }
             } else {
-                intervals.unmap(gva, length)
-            };
-            // Counted on every verdict, including `Consistent`. The fail line
-            // below is emitted only on a finding and deduped on top of that, so
-            // without this the audit's silence would be indistinguishable from
-            // the audit never having run — which is what "clean on a dozen
-            // panicking boots" actually rested on. The census is the only
-            // never-fired signal there is.
-            note_store_route(verdict.slug());
-            if verdict.is_finding()
-                && crate::observe::first_sight(
-                    verdict.slug(),
-                    u64::from(task_id) << 32 | u64::from(channel_id),
-                )
-            {
-                let live = intervals.live_count();
-                crate::observe::fail(format!(
-                    "map_audit op={name} reason={} task={task_id} gva={gva:#x} len={length:#x} \
-                     live={live} detail={verdict:?} (the guest applies this exact interval to its \
-                     own page table; a disagreement here is one its teardown will assert on)",
-                    verdict.slug()
-                ));
-            }
-        }
-        // The other half of the same question, and the one the interval audit
-        // reading clean moves the weight onto: has this device *written* into a
-        // page that holds the guest's page-table entries? The descent below is
-        // the only work done for it — the write census it asks is already kept
-        // for the sampled cache. See `runtime::node_guard`.
-        observe_page_table_nodes(state, host, task_id, gva);
-        // And the half `node_guard` structurally cannot see: a write landing on
-        // a page *before* it becomes a node. The page list has to be resolved
-        // here, ahead of the unmap being applied, because this is the last
-        // moment those addresses translate. See `runtime::released_pages`.
-        note_released_or_remapped(state, host, task_id, gva, length, family);
-        // And the question none of the three above asks, because none of them
-        // needs a host write to be true: are this range's entries in the state
-        // the guest's own next step requires? It asserts per page that an unmap
-        // finds one and a map does not. Both directions are read, and the one
-        // that cannot end a boot is what makes the other's reading evidence —
-        // see `runtime::range_coverage`.
-        observe_range_coverage(
-            state,
-            host,
-            task_id,
-            gva,
-            length,
-            if matches!(family, MapFamily::UnmapMemory) {
-                crate::runtime::range_coverage::Op::Unmap
-            } else {
-                crate::runtime::range_coverage::Op::Map
+                reims_vgpu_core::lifecycle::LifecycleOp::UnmapMemory {
+                    task: reims_vgpu_core::identity::TaskId(task_id),
+                    span: reims_vgpu_core::access::GuestSpan { base: gva, length },
+                }
             },
+            family.slug(),
         );
-        // Verbose-gated walk probe at map/unmap time. This runs a full
-        // guest page-table walk (`diagnose_gva_walk`) purely to build the
-        // log string, and fired ~9k times/boot on the drain path — a flood
-        // and a real per-map cost. Gate it (and the periodic census) behind
-        // `REIMS_VGPU_DRAW_LOG=1` so a normal boot pays neither; the functional
-        // view-retire below stays always-on. Wire has no PPNs — the probe
-        // asks whether the guest PT is already walkable under wire task_id.
-        crate::observe::when_verbose(|| {
-            let walk = crate::runtime::gva_mem::diagnose_gva_walk(
-                host,
-                &state.tasks,
-                task_id,
-                gva,
-                state.page_shift,
-            );
-            crate::observe::line(format!(
-                "map_probe op={name} ch={channel_id} task={task_id} gva={gva:#x} len={length:#x} page_shift={} {walk}",
-                state.page_shift
-            ));
-            // Periodic active-task census (every 32 map/unmap) for boot overview.
-            state.map_family_events = state.map_family_events.saturating_add(1);
-            if state.map_family_events == 1 || state.map_family_events.is_multiple_of(32) {
-                let census = crate::runtime::gva_mem::format_active_tasks(&state.tasks);
-                crate::observe::line(format!(
-                    "map_census n={} last_op={name} task={task_id} {census}",
-                    state.map_family_events
-                ));
-            }
-        });
         // RE (AppleParavirtMemoryMap): Unmap/Map only mutate the **task
         // page table** then notify — wire has no PPNs. Guest order is
         // deallocate/allocate **then** FIFO, so:
@@ -5887,7 +5586,7 @@ enum ChildPacketDisposition {
 /// `note_store_route` counter that is not conditioned on failure.
 fn exec_summary(channel_id: u32, result: &crate::runtime::exec::ExecResult, plen: usize) -> String {
     format!(
-        "exec_indirect2 ch={channel_id} task={} streams={} saw_draw={} clears={} draws_ok={} draws_fail={} rt_resolves={} guest_stores={} icb_ok={} icb_fail={} compute_ctrl_fail={} compute_icb_fail={} render_unbinds={}/{}/{} total_us={} plen={plen}",
+        "exec_indirect2 ch={channel_id} task={} streams={} saw_draw={} clears={} draws_ok={} draws_fail={} rt_resolves={} guest_stores={} icb_ok={} icb_fail={} compute_ctrl_fail={} compute_icb_fail={} render_unbinds={}/{}/{} plen={plen}",
         result.task_id,
         result.streams_loaded,
         result.saw_draw as u8,
@@ -5903,18 +5602,7 @@ fn exec_summary(channel_id: u32, result: &crate::runtime::exec::ExecResult, plen
         result.buffer_unbinds,
         result.texture_unbinds,
         result.sampler_unbinds,
-        result.total_us,
     )
-}
-
-/// A synchronous ExecIndirect2 holding `DeviceInner` for this long starves the
-/// guest's read-to-clear completion/status registers. This is a diagnostic
-/// proxy only; it never changes packet ordering or completion behavior.
-const SYNC_EXEC_STALL_US: u64 = 250_000;
-
-#[inline]
-fn sync_exec_stalled(total_us: u64) -> bool {
-    total_us >= SYNC_EXEC_STALL_US
 }
 
 /// Whether a child opcode is one of the reference host's retired slots.
@@ -6399,72 +6087,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         exec_summary(channel_id, &result, packet.payload.len())
                     });
                 }
-                if sync_exec_stalled(result.total_us) {
-                    crate::observe::fail(format!(
-                        "TRANSPORT reason=sync_exec_lock_hold ch={channel_id} task={} total_us={} draws={} rt_resolves={} guest_stores={} threshold_us={SYNC_EXEC_STALL_US}",
-                        result.task_id,
-                        result.total_us,
-                        result.metal_draws_ok.saturating_add(result.metal_draws_fail),
-                        result.render_attachment_resolves,
-                        result.render_guest_stores
-                    ));
-                    // What the engine was holding while this tranche waited.
-                    // This line is the only join anywhere between a stalled
-                    // submission and the pipeline objects in it, and a host GPU
-                    // hang is the case it exists for: the counts above say a
-                    // tranche took seconds, and nothing else says what it took
-                    // them on. Emitted beside the count rather than folded into
-                    // it because the two have different lengths and a reader
-                    // greps for one or the other.
-                    if let Some(trail) = crate::runtime::gpu_hang_trail::trail() {
-                        crate::observe::fail(format!(
-                            "TRANSPORT reason=sync_exec_lock_hold_trail ch={channel_id} {trail}"
-                        ));
-                    }
-                    // The trail above is what this device *recorded*; this is
-                    // what it is still *waiting on*. They are different
-                    // questions and the second is the one a stall asks: the
-                    // oldest outstanding submission is the one every later one
-                    // is queued behind, and a stall whose oldest carries
-                    // `draws=0` is a wedge that is not in a draw at all.
-                    //
-                    // `None` here is a reading rather than a gap — it says this
-                    // tranche is blocked on something the submission ring did
-                    // not submit.
-                    if let Some(outstanding) = crate::runtime::gpu_hang_trail::outstanding() {
-                        crate::observe::fail(format!(
-                            "TRANSPORT reason=sync_exec_lock_hold_outstanding ch={channel_id} \
-                             {outstanding}"
-                        ));
-                    }
-                    // The trail above is the last twelve draws, which at this
-                    // rail's rate is the last half millisecond — and a wedged
-                    // device goes on drawing about one draw per stall, so by the
-                    // second stall the trail is entirely post-wedge. The first
-                    // stall's is not, but even that one reaches only the
-                    // millisecond before the wait, while the wedge on the rail
-                    // this was built for begins in the ~300 ms after an
-                    // application's first window.
-                    //
-                    // Latched to the first stall of the boot, on purpose. It is a
-                    // per-process record, so every later stall would print the
-                    // same list one draw further on and the log would carry a
-                    // dozen near-identical copies of a line whose value is that
-                    // there is one of it.
-                    if crate::observe::first_sight("sync_exec_lock_hold_pipes", 0) {
-                        if let Some(firsts) =
-                            crate::runtime::gpu_hang_trail::recent_pipeline_firsts()
-                        {
-                            crate::observe::fail(format!(
-                                "TRANSPORT reason=sync_exec_lock_hold_pipes ch={channel_id} \
-                                 {firsts} (the pipelines this device drew for the first time \
-                                 most recently, oldest first, each with how many draws ago — \
-                                 a wedge in the second an application opens its first window \
-                                 has new pipelines in front of it and nothing else says which)"
-                            ));
-                        }
-                    }
-                }
             }
         }
         CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN => {
@@ -6816,7 +6438,6 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     let Some(regs_off) = child_reg_block_offset(channel_id) else {
         return;
     };
-    let setup_started = std::time::Instant::now();
     let regs_gpa = state.pfn_gpa(state.gfx.root_page) + regs_off;
 
     let mut head = match crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_HEAD) {
@@ -6866,7 +6487,6 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
         return;
     };
     let page_gpas = state.child_rings[channel_id as usize].page_gpas.clone();
-    census::note_drain_setup(setup_started.elapsed().as_nanos() as u64);
 
     // Nested drain_other must skip this channel (no re-enter head).
     // Use a bit mask so nested drains skip the full stack, not only the leaf.
@@ -6876,12 +6496,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     state.draining_mask |= bit;
 
     loop {
-        let regs_started = std::time::Instant::now();
         let tail_read = crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL);
-        census::note_drain_regs(
-            census::RegsOp::TailRead,
-            regs_started.elapsed().as_nanos() as u64,
-        );
         let tail = match tail_read {
             Ok(v) => v,
             Err(_) => {
@@ -6930,16 +6545,11 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 // run yet holds an ordering position instead of a consumer
                 // pointer, and the packets behind it are not behind anything.
                 head = packet.next_head;
-                let head_started = std::time::Instant::now();
                 let head_write = gpa_map::write_u32(
                     host,
                     regs_gpa + CHILD_REG_HEAD,
                     head,
                     state.page_size() as usize,
-                );
-                census::note_drain_regs(
-                    census::RegsOp::HeadWrite,
-                    head_started.elapsed().as_nanos() as u64,
                 );
                 if head_write.is_err() {
                     // The consumer pointer never advanced: the next drain

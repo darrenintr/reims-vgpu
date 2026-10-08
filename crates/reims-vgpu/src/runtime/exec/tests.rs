@@ -2062,6 +2062,7 @@ fn unimplemented_render_opcode_dedups_per_opcode_with_wire() {
 /// gave you the class and never the cause.
 #[test]
 fn a_dropped_draw_names_which_check_refused_not_just_its_class() {
+    let capture = crate::observe::FailCapture::start();
     let task = 81u32;
     // Distinct from every other pipeline in the suite: `fail_once` latches per
     // (reason, pipeline) for the whole process.
@@ -2073,7 +2074,7 @@ fn a_dropped_draw_names_which_check_refused_not_just_its_class() {
         1,
         3,
     );
-    let body = sink_body();
+    let body = capture.lines().join("\n");
     assert!(
         body.lines().any(|l| l
             .contains("draw_encode_fail reason=draw_mtl_zero_geom class=bad_args")
@@ -2102,24 +2103,38 @@ fn a_dropped_draw_names_which_check_refused_not_just_its_class() {
         2,
         3,
     );
-    let body = sink_body();
+    let body = capture.lines().join("\n");
     assert_eq!(
-        body.matches("reason=draw_mtl_zero_geom").count(),
+        body.lines()
+            .filter(|line| {
+                line.contains(&format!("pipe={pipe}")) && line.contains("reason=draw_mtl_zero_geom")
+            })
+            .count(),
         1,
         "a re-attempted refusal must log once:\n{body}"
     );
     assert!(
-        body.contains("reason=draw_mtl_core_failed"),
+        body.lines().any(|line| {
+            line.contains(&format!("pipe={pipe}")) && line.contains("reason=draw_mtl_core_failed")
+        }),
         "a second check on the same pipeline must not be latched away:\n{body}"
     );
 
     // Success never reaches the sink — `Emit::refusal` has no line to send for
     // `Ok`, so the carve-out is enforced by the type rather than by a `return`
     // a future arm could forget.
-    let before = sink_body().matches("draw_encode_fail").count();
+    let before = capture
+        .lines()
+        .iter()
+        .filter(|line| line.contains("draw_encode_fail"))
+        .count();
     note_draw_encode_fail(task, pipe, EncodeStatus::Ok, 0, 1);
     assert_eq!(
-        sink_body().matches("draw_encode_fail").count(),
+        capture
+            .lines()
+            .iter()
+            .filter(|line| line.contains("draw_encode_fail"))
+            .count(),
         before,
         "an Ok encode logged a failure line"
     );
@@ -7747,8 +7762,7 @@ fn a_submission_executes_the_streams_it_was_read_with_and_not_guest_memory_again
     );
 
     let mut out = ExecResult::default();
-    let mut measured_ns = 0u64;
-    let submission = read_submission(&state, &host, &payload, &mut out, &mut measured_ns)
+    let submission = read_submission(&state, &host, &payload, &mut out)
         .expect("the packet names a live task and one command buffer");
     assert_eq!(
         submission.streams.len(),
@@ -7787,14 +7801,7 @@ fn a_submission_executes_the_streams_it_was_read_with_and_not_guest_memory_again
         "the overwrite must have landed, or this test proves nothing"
     );
 
-    execute_submission(
-        &mut state,
-        &mut host,
-        &submission,
-        None,
-        &mut out,
-        &mut measured_ns,
-    );
+    execute_submission(&mut state, &mut host, &submission, None, &mut out);
     assert_eq!(
         state.fence_generation(1, FENCE_DOMAIN_EVENT, event_ref),
         Some(value),
@@ -7834,7 +7841,6 @@ fn a_pipeline_whose_inputs_cannot_load_is_not_a_pending_translation() {
     let state = DeviceState::new(crate::model::DeviceId(1), 12);
     let host = crate::runtime::host::FakeHost::new();
     let submission = super::ExecSubmission::stated(1, vec![stream]);
-    let mut measured_ns = 0u64;
     // The transaction the walk would have built for that record, stated here
     // because this test drives the rail directly rather than through admission.
     let mut builder = reims_vgpu_core::exec::ExecBuilder::new();
@@ -7864,15 +7870,11 @@ fn a_pipeline_whose_inputs_cannot_load_is_not_a_pending_translation() {
     assert_eq!(resolved.render_pipeline_leases().len(), 1);
 
     assert!(
-        super::preflight_submission(&state, &host, &submission, &resolved, &mut measured_ns)
-            .is_empty(),
+        super::preflight_submission(&state, &host, &submission, &resolved).is_empty(),
         "no object list, so pipeline 41 has no AIR to await"
     );
     // And it is a function of its inputs: asked again, the same answer.
-    assert!(
-        super::preflight_submission(&state, &host, &submission, &resolved, &mut measured_ns)
-            .is_empty()
-    );
+    assert!(super::preflight_submission(&state, &host, &submission, &resolved).is_empty());
 }
 
 /// The two walks over one stream reach the same records in the same order.
@@ -8123,8 +8125,7 @@ fn a_submission_frames_each_stream_once_and_preflight_frames_none() {
     let resolved = reims_vgpu_core::exec::ExecWork::default();
 
     let before = store_route_count("exec_stream_framed");
-    let mut measured_ns = 0u64;
-    let pending = preflight_submission(&state, &host, &submission, &resolved, &mut measured_ns);
+    let pending = preflight_submission(&state, &host, &submission, &resolved);
     assert!(pending.is_empty(), "the fixture resolves no leases");
     assert_eq!(
         store_route_count("exec_stream_framed"),

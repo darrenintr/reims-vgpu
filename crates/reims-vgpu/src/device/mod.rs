@@ -63,13 +63,6 @@ struct QueuedGfxWrite {
     offset: u64,
     data: u64,
     size: u32,
-    /// When the vCPU published this write, or `None` when it was applied
-    /// straight through without ever entering the queue.
-    ///
-    /// The guest's store retires the moment this is pushed, so the guest cannot
-    /// see the delay; the age measured against this stamp is the only place the
-    /// deferral becomes visible. See [`crate::runtime::drain::DoorbellCensus`].
-    queued_at: Option<std::time::Instant>,
 }
 
 /// One live device. Registry lookup and MMIO ingress remain short even while
@@ -168,13 +161,6 @@ fn publish_present_boundary(slot: &BoundDevice, frame_flush_seen: bool) {
 }
 
 fn apply_gfx_write(inner: &mut DeviceInner, slot: &BoundDevice, write: QueuedGfxWrite) {
-    match write.queued_at {
-        Some(at) => crate::runtime::drain::note_doorbell_queued(
-            write.offset,
-            at.elapsed().as_micros() as u64,
-        ),
-        None => crate::runtime::drain::note_doorbell_direct(),
-    }
     if let Some(ops) = slot.ops {
         let mut host = QemuHost::new(&ops, &mut inner.actions, &slot.prompt_actions);
         inner
@@ -438,12 +424,7 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
             return true;
         }
     }
-    let mut write = QueuedGfxWrite {
-        offset,
-        data,
-        size,
-        queued_at: None,
-    };
+    let write = QueuedGfxWrite { offset, data, size };
     let mut ingress = slot.gfx_ingress.lock();
     if ingress.is_empty() {
         if let Some(mut inner) = slot.inner.try_lock() {
@@ -451,9 +432,6 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
             return true;
         }
     }
-    // Stamped only on the path that actually defers, so the direct path pays no
-    // clock read at all.
-    write.queued_at = Some(std::time::Instant::now());
     ingress.push_back(write);
     drop(ingress);
     schedule_device(&slot);
@@ -472,13 +450,9 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
 /// access pays nothing for the instrument.
 fn lock_device_for_vcpu(slot: &BoundDevice) -> impl std::ops::DerefMut<Target = DeviceInner> + '_ {
     if let Some(guard) = slot.inner.try_lock() {
-        crate::runtime::drain::note_vcpu_lock_free();
         return guard;
     }
-    let waited = std::time::Instant::now();
-    let guard = slot.inner.lock();
-    crate::runtime::drain::note_vcpu_lock_wait(waited.elapsed().as_micros() as u64);
-    guard
+    slot.inner.lock()
 }
 
 pub fn device_iosfc_read(id: u64, offset: u64, size: u32) -> Option<u64> {
@@ -508,28 +482,14 @@ pub fn device_drain(id: u64) -> bool {
     let Some(slot) = device_slot(id) else {
         return false;
     };
-    // Opens this worker's wall-clock accounting: everything since the previous
-    // exit was the condvar wait the C shim parks in, and everything from here to
-    // the lock is contention with the vCPU thread. `duty` says how much of a
-    // second the worker was busy; these say what the rest of it was.
-    let entry_us = crate::runtime::drain::note_drain_entry();
     // The action BH needs the same device state to copy +0x188. A doorbell may
     // wake this worker before that BH runs; do not reacquire the lock and hide
     // the queued scanout behind another synchronous render/compute tranche.
     if slot.present_action_pending.load(Ordering::Acquire) {
-        crate::runtime::drain::note_drain_skipped();
-        crate::runtime::drain::note_drain_exit(entry_us, true);
         return true;
     }
     let mut d = lock_for_drain(&slot);
-    crate::runtime::drain::note_drain_lock_wait(
-        crate::observe::elapsed_us().saturating_sub(entry_us),
-    );
     let Some(ops) = slot.ops else {
-        // No host services — nothing to resolve from guest RAM. The lock wait is
-        // already banked, so this closes with no post-tranche span rather than
-        // leaving the entry open for the next one to absorb.
-        crate::runtime::drain::note_drain_exit(crate::observe::elapsed_us(), false);
         return true;
     };
     let DeviceInner { device, actions } = &mut *d;
@@ -546,35 +506,12 @@ pub fn device_drain(id: u64) -> bool {
     {
         device.state.present.window_active = false;
     }
-    // Split the tranche's two phases: guest work, then our host-window export.
-    // Both hold the device lock, and which one owns the worker's wall clock is
-    // the question `drain_duty` exists to answer.
-    let tranche_started = std::time::Instant::now();
-    // The same instant on the crate's own clock, so a lookup inside the drain
-    // can say how late in this tranche it happened without threading a start
-    // time through every call. See `census::tranche_elapsed_us`.
-    crate::runtime::drain::note_tranche_started(crate::observe::elapsed_us());
     device.drain(&mut host);
-    // The tail is timed apart from `Device::drain` because it is inside
-    // `drain_us` and inside no `DrainPhase`, and that residue is a third of the
-    // drain worker's wall clock on every workload measured — 933 ms a second of
-    // `drain_us` against 604 of `draw_us` on a driven `blur=40` boot. A gap that
-    // size on the one thread every guest packet serializes through cannot be
-    // left to inference.
-    let tail_started = std::time::Instant::now();
     // Submit any deferred draw batch before the worker sleeps: consumers
     // inside the tranche flush on their own (engine begin_entry), this bounds
     // only the idle-tail latency of the last same-target run.
     crate::backend::selected().flush_deferred_submissions(&device.state);
-    let tail_ns = tail_started.elapsed().as_nanos() as u64;
-    let boundary_started = std::time::Instant::now();
     publish_present_boundary(&slot, device.state.present.frame_flush_seen);
-    crate::runtime::drain::note_drain_tail(tail_ns, boundary_started.elapsed().as_nanos() as u64);
-    // Nanoseconds, because the tranche ledger's exclusive tiling is checked
-    // against it: every span inside `Device::drain` nests in this interval, so
-    // their sum can only fall short of it, and by what nothing claimed.
-    let drain_ns = tranche_started.elapsed().as_nanos() as u64;
-    let publish_started = std::time::Instant::now();
     // Push the finished present frame to the host-owned window (if running).
     // Off the QEMU main loop; a small dedicated mutex, never the render lock.
     #[cfg(feature = "host-window")]
@@ -584,53 +521,6 @@ pub fn device_drain(id: u64) -> bool {
     // and, once per cursor change, a copy.
     #[cfg(feature = "host-window")]
     window_publish::publish_window_cursor(&slot, &device.state);
-    crate::runtime::drain::note_drain_tranche(
-        &device.state,
-        &host,
-        drain_ns,
-        publish_started.elapsed().as_micros() as u64,
-    );
-    // Everything from here to the return is `gap_post_us`: the per-tranche
-    // sweeps below run on the worker's own wall clock and are outside both
-    // `drain_us` and `publish_us`, so `duty` cannot see them.
-    let busy_end_us = crate::observe::elapsed_us();
-    use crate::runtime::drain::{post_sweep, PostSweep};
-    // Same one-second cadence, so the cache trend lines up row-for-row with
-    // `store_routes` and `drain_duty`. Measure-only; see `note_cache_levels`.
-    post_sweep(PostSweep::CacheLevels, || {
-        crate::runtime::surface_cache::note_cache_levels(&device.state, &host)
-    });
-    // Per tranche rather than per census window, unlike the levels above: this
-    // measures how long a slot the guest named takes to appear, so the sampling
-    // interval is the resolution of the answer. Returns immediately when nothing
-    // is watched, which is every tranche on every rail but macos-26.
-    post_sweep(PostSweep::SlotRecheck, || {
-        crate::runtime::objects::slot_recheck::sweep(&device.state, &host)
-    });
-    // The ordering plane's own residue, on the same one-second cadence as the
-    // levels above and for the reason `backing_outstanding_census` is emitted
-    // beside `store_routes`: the routes count what *happened* to a pipeline and
-    // a pipeline that was declared and never advanced is counted once and never
-    // again, so a table accumulating builds nobody is running reads exactly like
-    // a healthy one. `pending` is the pipelines a transaction can be waiting on.
-    post_sweep(PostSweep::PipelineTable, || {
-        if let Some(line) = device.state.pipeline_occupancy_census() {
-            crate::observe::off(line);
-        }
-    });
-    // Beside it and on the same cadence: a page the guest released is judged
-    // against the write census, which only moves when this device writes. Also
-    // returns immediately when nothing is watched.
-    post_sweep(PostSweep::ReleasedPages, || {
-        crate::runtime::released_pages::sweep(&mut device.state);
-        crate::runtime::released_pages::note_levels(&device.state);
-    });
-    // The bind registry's own levels, on that same cadence and read against the
-    // `bb_retire_*` routes: what the retirements dropped, and what the survivors
-    // look like.
-    post_sweep(PostSweep::BindLevels, || {
-        crate::runtime::bound_buffers::note_registry_levels(&device.state)
-    });
     // The present-completion ack, re-homed off the QEMU paint — ONLY while the
     // host window is the display. With the window live no per-present
     // `ScanoutUpdate` is enqueued, so `display_surface::device_scanout_copy` —
@@ -659,7 +549,6 @@ pub fn device_drain(id: u64) -> bool {
     if device.state.pending.host_action_yield {
         slot.present_action_pending.store(true, Ordering::Release);
     }
-    crate::runtime::drain::note_drain_exit(busy_end_us, false);
     true
 }
 

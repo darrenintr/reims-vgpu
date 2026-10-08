@@ -452,6 +452,46 @@ pub(crate) fn licence_mapper_ref_texture_surface<M: HostMemory + HostOps>(
     held: ash::vk::Format,
     dst: &MapperRefTextureSurfaceDestination,
 ) -> Result<MapperRefTextureSurfaceLicence, GpuWritebackDecline> {
+    licence_mapper_ref_texture_surface_with_resolver(
+        state,
+        host,
+        held,
+        dst,
+        crate::runtime::guest_ram_map::RunResolver::whole_map(),
+    )
+}
+
+/// Compute-only candidate for a host whose whole guest is slightly larger than
+/// the host-pointer heap.
+///
+/// The returned target is not permission to allocate piecemeal. The compute
+/// engine preflights the *complete* target's unique imports before recording the
+/// dispatch; if they do not all fit, that storage output takes its ordinary
+/// readback destination instead. Keeping this entry point separate is what
+/// leaves render Stores and every other guest-RAM consumer on the standing
+/// whole-map admission rule.
+pub(crate) fn licence_mapper_ref_texture_surface_selective_heap<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    held: ash::vk::Format,
+    dst: &MapperRefTextureSurfaceDestination,
+) -> Result<MapperRefTextureSurfaceLicence, GpuWritebackDecline> {
+    licence_mapper_ref_texture_surface_with_resolver(
+        state,
+        host,
+        held,
+        dst,
+        crate::runtime::guest_ram_map::RunResolver::complete_target(),
+    )
+}
+
+fn licence_mapper_ref_texture_surface_with_resolver<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    held: ash::vk::Format,
+    dst: &MapperRefTextureSurfaceDestination,
+    resolver: crate::runtime::guest_ram_map::RunResolver,
+) -> Result<MapperRefTextureSurfaceLicence, GpuWritebackDecline> {
     let &MapperRefTextureSurfaceDestination {
         mapping_id,
         base_off,
@@ -562,7 +602,7 @@ pub(crate) fn licence_mapper_ref_texture_surface<M: HostMemory + HostOps>(
     // refuse here — a shim that cannot say where guest RAM lives and a machine
     // whose every span failed the bound both leave a granularity published, and
     // used to walk the whole page list before finding that out.
-    if let Some(refusal) = crate::runtime::guest_ram_map::standing_refusal(host) {
+    if let Some(refusal) = resolver.standing_refusal(host) {
         return Err(GpuWritebackDecline::GuestRefRefused { refusal });
     }
     // Timed on its own because it is the largest `O(pages)` step left and its
@@ -570,17 +610,10 @@ pub(crate) fn licence_mapper_ref_texture_surface<M: HostMemory + HostOps>(
     // mapping through the guest's page table — the check that licenses writing
     // to them at all — and until the host copies were removed that cost was
     // hidden inside a millisecond of memcpy.
-    use crate::runtime::drain::{note_readback_phase, ReadbackPhase};
-    let vouch_started = std::time::Instant::now();
     let vouched = vouch_for_write(state, host, mapping_id, "gpu_writeback");
-    note_readback_phase(
-        ReadbackPhase::Vouch,
-        vouch_started.elapsed().as_micros() as u64,
-    );
     if vouched.is_none() {
         return Err(GpuWritebackDecline::PagesNotOurs);
     }
-    let resolve_started = std::time::Instant::now();
     let page_size = state.page_size();
     let page_shift = state.page_shift;
     let Some(m) = state.mappings.get(&mapping_id) else {
@@ -617,14 +650,9 @@ pub(crate) fn licence_mapper_ref_texture_surface<M: HostMemory + HostOps>(
     // with no relation to each other, so a full-screen window is ~507 stretches
     // and asking for a single contiguous reference refused every 1080p flush of
     // a driven boot.
-    let runs = crate::runtime::guest_ram_map::references_for_runs(
-        host,
-        &gpas,
-        page_size,
-        plan.in_page,
-        extent,
-    )
-    .map_err(|refusal| GpuWritebackDecline::GuestRefRefused { refusal })?;
+    let runs = resolver
+        .references_for_runs(host, &gpas, page_size, plan.in_page, extent)
+        .map_err(|refusal| GpuWritebackDecline::GuestRefRefused { refusal })?;
     let target = crate::backend::vulkan::engine::GuestPageTarget {
         runs,
         row_length_texels: plan.row_length_texels,
@@ -647,10 +675,6 @@ pub(crate) fn licence_mapper_ref_texture_surface<M: HostMemory + HostOps>(
     // rows and has no pointer whose coverage it is restating.
     mapper::note_mapping_write_footprint(state, mapping_id, base_off, span_end - base_off);
     state.note_host_wrote_mapping(mapping_id);
-    note_readback_phase(
-        ReadbackPhase::Resolve,
-        resolve_started.elapsed().as_micros() as u64,
-    );
     Ok(MapperRefTextureSurfaceLicence {
         target,
         gpas,

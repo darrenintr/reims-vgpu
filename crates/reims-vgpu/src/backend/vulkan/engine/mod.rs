@@ -17,7 +17,6 @@ mod desc_arena;
 mod device_lost;
 mod digest;
 mod draw_execution;
-mod draw_phase;
 mod draw_preparation;
 pub(crate) mod draw_validation;
 mod driver_breadcrumb;
@@ -28,7 +27,6 @@ mod guest_scatter;
 mod host_ram;
 pub mod init_decline;
 mod linear_target_import;
-mod pipe_census;
 mod pools;
 mod queue_owner;
 /// This rail's half of a serialized resource's rail state: the resident-target
@@ -47,11 +45,9 @@ pub use pools::sampled_working_set::census as sampled_working_set_census;
 /// Reference interval used only to keep reuse-distance census bands stable.
 /// Residency policy does not read it.
 pub(crate) use pools::IDLE_MAINTENANCE_START_MS;
-pub mod gather_phase;
 pub mod gpu_span;
 pub mod reason;
 mod slab;
-pub mod stage_phase;
 pub mod types;
 pub mod vk_call;
 #[cfg(feature = "host-window")]
@@ -59,7 +55,6 @@ mod window_present;
 
 pub use context::MAX_DEVICE_RECREATES;
 pub(crate) use counters::{CounterSnapshot, EngineCounters, TargetReadDelivery};
-pub(crate) use draw_phase::take_window as draw_phase_window;
 pub(crate) use draw_preparation::DrawPreparationDecline;
 // Read only under `host-window`, which is what the boot harness builds. Its
 // absence there is a build failure and not a warning, so the `expect` says the
@@ -72,8 +67,8 @@ pub use types::viewport_slot_count;
 pub use types::{
     BlendStateResource, BufferContent, ColorAttachmentState, ColorClearValue, ColorWriteMask,
     ComputeBufferResource, ComputeDispatch, ComputeDispatchPayload, ComputeDispatchRegion,
-    ComputeImageDestination, ComputeImageResult, ComputeOutput, ComputeRequest,
-    ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledSource,
+    ComputeImageDestination, ComputeImageResult, ComputeOutput, ComputeReadbackLease,
+    ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledSource,
     ComputeStorageImageResource, ComputeStorageResidency, DepthState, DrawError, DrawOutput,
     DrawRequest, GuestRun, GuestRunSource, GuestSampledBacking, GuestTargetBacking,
     GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource, PipelineObjectIdentity,
@@ -1739,7 +1734,6 @@ pub fn quiesce_guest_writes() {
     if !GUEST_WRITE_DEBT.load(Ordering::Acquire) {
         return;
     }
-    let started = std::time::Instant::now();
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -1772,15 +1766,6 @@ pub fn quiesce_guest_writes() {
     // Under the same lock as the flag it accompanies, so no reader can see the
     // flag set beside a footprint that has already been forgotten.
     clear_guest_write_pages();
-    // Reported as `ReadbackPhase::Fence` because it *is* that phase — the same
-    // block on the same fences, moved. Its count is now settles rather than
-    // windows, which is the whole of what this change did to the rail, so
-    // `fence` no longer tracks `submit` and a reading that assumes it does is
-    // reading the old shape.
-    crate::runtime::drain::note_readback_phase(
-        crate::runtime::drain::ReadbackPhase::Fence,
-        started.elapsed().as_micros() as u64,
-    );
 }
 
 /// Whether any guest-page writeback is submitted and not yet settled.
@@ -2561,53 +2546,86 @@ pub fn max_render_target_dimension() -> u32 {
 /// What this Vulkan device can execute, for the GPU-dependent half of the
 /// guest's device-info reply.
 ///
-/// Before a device is resolved the answer is the Vulkan 1.2 floor rather than
-/// the reply table's own values: the served reply is only ever *reduced* by
-/// this, so a boot that answers before the device is up must not be the one
-/// that promises the most.
+/// # The device is brought up to answer, not read if it happens to be up
+///
+/// The guest asks this once per boot, when its driver loads, and keeps the
+/// answer for the life of the boot. It cannot ask again. Its Metal plugin
+/// answers `supportsTextureSampleCount:`, `maxThreadsPerThreadgroup`,
+/// `maxThreadgroupMemoryLength` and the D24S8 query straight from it, and
+/// pipeline creation validates against them. The context on this rail is
+/// created lazily, by the first draw, dispatch or probe that calls
+/// `ContextOwner::ensure`. A guest that loads its driver before anything has
+/// drawn (the ordinary boot order) was therefore answered from the Vulkan 1.2
+/// floor: one sample, no D24S8, 128x128x64 threads, 16 KiB, no fp16. It kept
+/// that answer even after the device came up a moment later. On a host that
+/// can do far more, every pipeline the guest builds with 4x MSAA or a larger
+/// threadgroup then fails guest-side validation and returns nil. No fail line
+/// on this device names that, because the pipeline never reaches it.
+///
+/// So this asks `ensure`, as the other host-capability probes
+/// ([`supports_storage_image_write_without_format`],
+/// [`supports_sampled_layout_linear_filter`]) already do. The floor is still
+/// the answer when bring-up fails, and that failure is reported once as a
+/// `vk_engine_probe` decline: a device that cannot open promises the least.
+/// The served reply is still only ever a *reduction* of `DEVICE_INFO_CAPS`.
 pub fn device_info_limits() -> crate::model::DeviceInfoLimits {
     use crate::backend::vulkan::caps::device_features::{
         VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES, VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
     };
-    lock_engine()
-        .owner
-        .ctx
-        .as_ref()
-        .map(|ctx| crate::model::DeviceInfoLimits {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref counters,
+        ..
+    } = &mut *guard;
+    match owner.ensure(counters) {
+        Ok(ctx) => crate::model::DeviceInfoLimits {
             max_sample_count: ctx.features.max_sample_count,
             d24_stencil8: ctx.features.d24_unorm_s8_attachment,
             max_threads_per_threadgroup: ctx.features.max_compute_workgroup_size,
             max_threadgroup_memory_bytes: ctx.features.max_compute_shared_memory_bytes,
             native_fp16: ctx.features.float16,
-        })
-        .unwrap_or(crate::model::DeviceInfoLimits {
-            max_sample_count: 1,
-            d24_stencil8: false,
-            max_threads_per_threadgroup: VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
-            max_threadgroup_memory_bytes: VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES,
-            native_fp16: false,
-        })
+        },
+        Err(error) => {
+            engine_probe_decline(EngineProbe::DeviceInfoLimits, &error)
+                .fail_once(EngineProbe::DeviceInfoLimits.discriminant());
+            crate::model::DeviceInfoLimits {
+                max_sample_count: 1,
+                d24_stencil8: false,
+                max_threads_per_threadgroup: VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
+                max_threadgroup_memory_bytes: VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES,
+                native_fp16: false,
+            }
+        }
+    }
 }
 
 /// `(maxTotalThreadsPerThreadgroup, threadExecutionWidth)` for this host, as
 /// the guest's `CmdGetComputeInfo` asks for them.
 ///
-/// Both are device limits, so both are queried. Before a device is resolved
-/// the answer is the Vulkan 1.2 required minimum and a single lane — the pair
-/// no dispatch can be oversized against.
+/// Both are device limits, so both are queried, and the device is brought up
+/// to answer them for the reason [`device_info_limits`] gives. When bring-up
+/// fails the answer is the Vulkan 1.2 required minimum and a single lane, the
+/// pair no dispatch can be oversized against.
 pub fn compute_threadgroup_limits() -> (u32, u32) {
     use crate::backend::vulkan::caps::device_features::VULKAN_MIN_COMPUTE_WORKGROUP_INVOCATIONS;
-    lock_engine()
-        .owner
-        .ctx
-        .as_ref()
-        .map(|ctx| {
-            (
-                ctx.features.max_compute_workgroup_invocations,
-                ctx.features.subgroup_size,
-            )
-        })
-        .unwrap_or((VULKAN_MIN_COMPUTE_WORKGROUP_INVOCATIONS, 1))
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref counters,
+        ..
+    } = &mut *guard;
+    match owner.ensure(counters) {
+        Ok(ctx) => (
+            ctx.features.max_compute_workgroup_invocations,
+            ctx.features.subgroup_size,
+        ),
+        Err(error) => {
+            engine_probe_decline(EngineProbe::ComputeThreadgroupLimits, &error)
+                .fail_once(EngineProbe::ComputeThreadgroupLimits.discriminant());
+            (VULKAN_MIN_COMPUTE_WORKGROUP_INVOCATIONS, 1)
+        }
+    }
 }
 
 /// Pin a content-ready resident render target against LRU eviction (deferred
@@ -2647,6 +2665,8 @@ pub fn unpin_resident_target(identity: &TargetIdentity) {
 enum EngineProbe {
     StorageWriteWithoutFormat,
     SampledLayoutLinearFilter,
+    DeviceInfoLimits,
+    ComputeThreadgroupLimits,
 }
 
 impl EngineProbe {
@@ -2654,6 +2674,8 @@ impl EngineProbe {
         match self {
             Self::StorageWriteWithoutFormat => "storage_write_without_format",
             Self::SampledLayoutLinearFilter => "sampled_layout_linear_filter",
+            Self::DeviceInfoLimits => "device_info_limits",
+            Self::ComputeThreadgroupLimits => "compute_threadgroup_limits",
         }
     }
 
@@ -2663,6 +2685,8 @@ impl EngineProbe {
         match self {
             Self::StorageWriteWithoutFormat => 7,
             Self::SampledLayoutLinearFilter => 9,
+            Self::DeviceInfoLimits => 10,
+            Self::ComputeThreadgroupLimits => 11,
         }
     }
 }
@@ -3111,7 +3135,6 @@ unsafe fn copy_image_level0_to_host_delivered(
     ops: ReadbackOps,
     delivery: ReadbackDelivery,
 ) -> Result<ReadbackResult, DrawError> {
-    let submit_started = std::time::Instant::now();
     // The slot is claimed *after* the entry, and the order is load-bearing.
     //
     // `begin_entry` submits any open draw batch first, and that flush runs
@@ -3179,15 +3202,7 @@ unsafe fn copy_image_level0_to_host_delivered(
     // recording and holds the draws the copy is about to read; resetting it
     // would discard them and beginning it again is invalid.
     if appended.is_none() {
-        unsafe {
-            pools.begin_slot_recording(
-                ctx,
-                cb,
-                gpu_span::Kind::Readback,
-                ops.reset_cb,
-                ops.begin_cb,
-            )?
-        };
+        unsafe { pools.begin_slot_recording(ctx, cb, ops.reset_cb, ops.begin_cb)? };
     }
     // A deferred draw may have left its render pass standing in this same
     // command buffer. The image barrier and copy below are outside-pass
@@ -3208,7 +3223,6 @@ unsafe fn copy_image_level0_to_host_delivered(
     // pool's results are undefined until reset, and resetting on the host needs
     // `hostQueryReset`, which is a Vulkan 1.2 feature this device does not ask
     // for.
-    unsafe { pools.readback_span_arm(ctx, cb) };
     // Nothing else supplies it. Queue submission order starts command buffers
     // in order; it does not finish them in order, and it is not a memory
     // dependency. A render pass's implicit final subpass dependency carries
@@ -3251,7 +3265,6 @@ unsafe fn copy_image_level0_to_host_delivered(
     // span from it to the end of the copy contains both. This slot is what
     // separates them: everything before it has reached TRANSFER, which after the
     // barrier means the draws are done.
-    unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::TRANSFER, 1) };
     let region = [ash::vk::BufferImageCopy::default()
         .image_subresource(color_subresource_layers())
         .image_extent(ash::vk::Extent3D {
@@ -3283,7 +3296,6 @@ unsafe fn copy_image_level0_to_host_delivered(
     // `pools::BATCH_MAX_DRAWS`.
     ctx.device
         .cmd_copy_image_to_buffer(cb, image, read_layout, readback.buffer, &region);
-    unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2) };
     if appended.is_some() {
         // `batch_flush` ends the command buffer, submits it with the fence
         // `batch_open_recording` handed back, and seals the batch's cleanup —
@@ -3291,7 +3303,6 @@ unsafe fn copy_image_level0_to_host_delivered(
         // draws and the copy together.
         pools.batch_flush(ctx, counters)?;
     } else {
-        unsafe { pools.gpu_span_seal_current(ctx, cb) };
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
@@ -3301,26 +3312,7 @@ unsafe fn copy_image_level0_to_host_delivered(
         let sealed = pools.seal_entry(Vec::new(), Vec::new());
         pools.finish_entry_async(&ctx.device, sealed);
     }
-    // Split three ways rather than timed as a whole: the submit and the copy
-    // scale with the surface, the fence does not scale with anything we control,
-    // and the fix for one is not the fix for the others.
-    use crate::runtime::drain::{note_readback_phase, ReadbackPhase};
-    note_readback_phase(
-        ReadbackPhase::Submit,
-        submit_started.elapsed().as_micros() as u64,
-    );
-    let fence_started = std::time::Instant::now();
     pools.wait_entry_fence(ctx, counters, fence)?;
-    note_readback_phase(
-        ReadbackPhase::Fence,
-        fence_started.elapsed().as_micros() as u64,
-    );
-    // The three queries this command buffer wrote are read when its ring slot
-    // retires, by `readback_span_read`, which is the one place a slot's fence is
-    // known signalled. They used to be read here, against this call's own fence
-    // — correct for this writer and not for the guest-page writeback, which
-    // shares the probe and does not wait.
-    let map_started = std::time::Instant::now();
     let out = match lease.disarm() {
         // The mapping is already established for the slot's lifetime, so all
         // this owes is the invalidate a non-coherent readback owes any reader.
@@ -3363,7 +3355,6 @@ unsafe fn copy_image_level0_to_host_delivered(
         None => pools::read_back_slot(ctx, &readback, rb_size, ops.map, ops.invalidate)
             .map(ReadbackResult::Copied),
     };
-    note_readback_phase(ReadbackPhase::Map, map_started.elapsed().as_micros() as u64);
     out
 }
 
@@ -3696,6 +3687,7 @@ impl GuestPageTarget {
             pitch_bytes: self.pitch_bytes(),
             width_texels: self.width,
             height_texels: self.height,
+            bytes_per_texel: self.bytes_per_texel(),
         }
     }
 
@@ -4006,6 +3998,7 @@ fn plan_overlay_regions(
         pitch_bytes: overlay.pitch_bytes,
         width_texels: overlay.width,
         height_texels: overlay.height,
+        bytes_per_texel: BPT,
     };
     let mut regions = Vec::new();
     for span in overlay.spans {
@@ -4128,7 +4121,6 @@ pub fn overlay_guest_bytes_onto_resident(
                 pools.begin_slot_recording(
                     ctx,
                     pair.0,
-                    gpu_span::Kind::Draw,
                     VkOp::ResidentOverlayResetCb,
                     VkOp::ResidentOverlayBeginCb,
                 )?;
@@ -4176,7 +4168,6 @@ pub fn overlay_guest_bytes_onto_resident(
             &back,
         );
         if appended.is_none() {
-            pools.gpu_span_seal_current(ctx, cb);
             ctx.device
                 .end_command_buffer(cb)
                 .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ResidentOverlayEndCb, e)))?;
@@ -5184,20 +5175,79 @@ unsafe fn plan_guest_copies(
 ) -> Result<Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)>, DrawError> {
     use host_ram::GuestWriteDecline;
     let geom = dst.geometry();
+    let invalid = || DrawError::GuestPageWrite(GuestWriteDecline::InvalidCopyRegion);
+    let bpt = crate::backend::vulkan::translate::pixel::bytes_per_texel(dst.format)
+        .map(u64::from)
+        .ok_or_else(invalid)?;
+    if bpt == 0
+        || geom.bytes_per_texel != bpt
+        || u64::from(dst.row_length_texels).checked_mul(bpt) != Some(geom.pitch_bytes)
+        || dst.row_length_texels < dst.width
+    {
+        return Err(invalid());
+    }
     let mut grouped: Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)> = Vec::new();
     for run in &dst.runs {
         let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest) }
             .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
         // `head` is what the granularity rounding added in front of the byte the
         // caller asked for, so the run's first requested byte sits here.
-        let base = bound.offset + bound.head;
+        let base = bound.offset.checked_add(bound.head).ok_or_else(invalid)?;
         let start = run.window_offset;
-        let end = start.saturating_add(run.guest.requested());
+        let end = start
+            .checked_add(run.guest.requested())
+            .ok_or_else(invalid)?;
+        let run_end = base
+            .checked_add(run.guest.requested())
+            .ok_or_else(invalid)?;
+        let bound_end = bound.offset.checked_add(bound.len).ok_or_else(invalid)?;
+        let allocation_size_bytes = run.guest.import().len();
+        if start % bpt != 0
+            || end % bpt != 0
+            || base % bpt != 0
+            || run_end > bound_end
+            || bound_end > allocation_size_bytes
+        {
+            return Err(invalid());
+        }
         for r in reims_vgpu_paging::regions::plan_regions(&geom, start, end) {
+            let offset = r
+                .window_offset
+                .checked_sub(start)
+                .and_then(|delta| base.checked_add(delta))
+                .ok_or_else(invalid)?;
+            let span = u64::from(r.height)
+                .checked_sub(1)
+                .and_then(|rows| rows.checked_mul(geom.pitch_bytes))
+                .and_then(|rows| {
+                    u64::from(r.width)
+                        .checked_mul(bpt)
+                        .and_then(|width| rows.checked_add(width))
+                })
+                .ok_or_else(invalid)?;
+            let planned_end = offset.checked_add(span).ok_or_else(invalid)?;
+            let expected = u64::from(r.y)
+                .checked_mul(geom.pitch_bytes)
+                .and_then(|row| {
+                    u64::from(r.x)
+                        .checked_mul(bpt)
+                        .and_then(|x| row.checked_add(x))
+                });
+            if r.width == 0
+                || r.height == 0
+                || offset % bpt != 0
+                || expected != Some(r.window_offset)
+                || u64::from(r.x) + u64::from(r.width) > u64::from(dst.width)
+                || u64::from(r.y) + u64::from(r.height) > u64::from(dst.height)
+                || planned_end > run_end
+                || planned_end > allocation_size_bytes
+            {
+                return Err(invalid());
+            }
             let region = ash::vk::BufferImageCopy::default()
                 // The rectangle's own offset is in window bytes; `- start`
                 // re-bases it onto this run, which is what `base` names.
-                .buffer_offset(base + (r.window_offset - start))
+                .buffer_offset(offset)
                 // In texels. This is the buffer-side row stride, and it is what
                 // makes a merged multi-row rectangle name consecutive guest
                 // rows — valid because within one run the guest bytes are
@@ -5237,8 +5287,6 @@ unsafe fn copy_image_level0_to_buffer(
     snap: &ResidentReadSnapshot,
     plan: &GuestCopyPlan,
 ) -> Result<(), DrawError> {
-    use crate::runtime::drain::{note_readback_phase, ReadbackPhase};
-    let submit_started = std::time::Instant::now();
     // Appended to a recording batch where there is one, for the reason
     // `copy_image_level0_to_host_delivered` gives: `begin_entry` would submit
     // that batch only to submit this copy behind it, and the copy has to be
@@ -5255,34 +5303,12 @@ unsafe fn copy_image_level0_to_buffer(
     };
     if appended.is_none() {
         unsafe {
-            pools.begin_slot_recording(
-                ctx,
-                cb,
-                gpu_span::Kind::Store,
-                VkOp::GuestWriteResetCb,
-                VkOp::GuestWriteBeginCb,
-            )?
+            pools.begin_slot_recording(ctx, cb, VkOp::GuestWriteResetCb, VkOp::GuestWriteBeginCb)?
         };
     }
     unsafe { pools.close_open_pass(&ctx.device, cb) };
-    // The device's own clock, for the reason the readback rail takes it: `fence_us`
-    // is CPU wall clock and cannot tell "the GPU is copying eight megabytes across
-    // PCIe" from "the round trip costs more than the work". Those have opposite
-    // fixes — a damage rect shrinks the first and does nothing at all to the
-    // second — so the rail that is now most of a flush must not be read without
-    // this pair. Slot 0 stamps the command buffer's start, slot 1 the point after
-    // the barrier where the draws ahead are known done, slot 2 the end of the copy.
-    //
-    // The reset must be recorded into the same command buffer: a query pool's
-    // results are undefined until reset, and resetting on the host needs
-    // `hostQueryReset`, a Vulkan 1.2 feature this device does not ask for.
-    unsafe { pools.readback_span_arm(ctx, cb) };
-    // Unconditional, for the reason `copy_image_level0_to_host_delivered` states
-    // at length: the barrier is a layout transition *and* a dependency, and this
-    // rail needs the dependency whether or not the layout already matches. A
-    // render pass leaves its attachment in [`caches::color0_pass_exit_layout`],
-    // so the common case is a real transition too, and it must still order this
-    // copy after the draws that produced the pixels.
+    // The barrier transitions the source and orders this transfer read after the
+    // rendering or compute writes that produced the pixels.
     let read_access = pools::ResidentAccess::transfer_read(snap.guest_backing.is_some());
     let barrier = [ash::vk::ImageMemoryBarrier::default()
         .src_access_mask(RESIDENT_READ_SRC_ACCESS)
@@ -5300,9 +5326,7 @@ unsafe fn copy_image_level0_to_buffer(
         &[],
         &barrier,
     );
-    unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::TRANSFER, 1) };
     unsafe { record_guest_copy_plan(ctx, pools, cb, snap.image, read_access.layout(), plan) };
-    unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2) };
     unsafe { release_guest_copy_to_host(ctx, cb, plan) };
     // The wait this rail no longer takes here.
     //
@@ -5320,7 +5344,6 @@ unsafe fn copy_image_level0_to_buffer(
         // draws and this copy together.
         pools.batch_flush(ctx, counters)?;
     } else {
-        unsafe { pools.gpu_span_seal_current(ctx, cb) };
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))?;
@@ -5330,10 +5353,6 @@ unsafe fn copy_image_level0_to_buffer(
         let sealed = pools.seal_entry(Vec::new(), Vec::new());
         pools.finish_entry_async(&ctx.device, sealed);
     }
-    note_readback_phase(
-        ReadbackPhase::Submit,
-        submit_started.elapsed().as_micros() as u64,
-    );
     Ok(())
 }
 
@@ -6140,7 +6159,6 @@ pub fn maintain_resources(now_ms: u64) {
     // On the heartbeat rather than after each compile, so a burst of new
     // pipelines serializes the cache once, after it, outside every tranche.
     ctx.persist_pipeline_cache_when_quiet(now_ms);
-    pipe_census::note_levels(now_ms, ctx.pipeline_creation_feedback);
 }
 
 /// Snapshot of create/alloc/hit-miss counters (for tests and thrash proxies).
@@ -7205,4 +7223,26 @@ mod run_table_arena_tests {
         assert!(places.is_empty());
         assert_eq!(packed.len(), 4);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn rgba32_destination_geometry_preserves_format_texel_size() {
+    let dst = GuestPageTarget {
+        runs: Vec::new(),
+        row_length_texels: 1536,
+        width: 1504,
+        height: 6016,
+        format: ash::vk::Format::R32G32B32A32_UINT,
+        shared_backing: None,
+    };
+    let geom = dst.geometry();
+    assert_eq!(geom.bytes_per_texel, 16);
+    assert_eq!(geom.pitch_bytes, 24576);
+    assert_eq!(geom.extent_end(), dst.extent_end());
+    assert_eq!(geom.extent_end(), 147848704);
+    let regions = reims_vgpu_paging::regions::plan_regions(&geom, 0, 4096);
+    assert_eq!(regions.len(), 1);
+    assert_eq!(regions[0].width, 256);
+    assert_eq!(u64::from(regions[0].width) * dst.bytes_per_texel(), 4096);
 }

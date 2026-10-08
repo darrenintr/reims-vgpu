@@ -135,7 +135,6 @@ pub(crate) fn emit_engine_delta() {
     }
     crate::observe::off(line);
     emit_registry_pressure(&now);
-    emit_draw_phase();
 }
 
 /// How far the resident registries reached, and what the populations that
@@ -215,71 +214,6 @@ fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot)
     ));
 }
 
-/// The split of `drain_duty`'s `draw_us`, over the same window.
-///
-/// `drain_duty` says a saturated second is 93-99% `draw_us` and `engine_delta`
-/// says ~450 MB/s crosses the bus each way. Those two are consistent with
-/// opposite fixes — moving fewer bytes, or stopping the per-draw GPU round trip
-/// — and neither line can tell them apart. This one can: `readback_us` and the
-/// staging half of `setup_us` scale with bytes, `wait_us` does not.
-///
-/// Silent when no draw ran, so an idle desktop costs nothing.
-fn emit_draw_phase() {
-    let Some(w) = crate::backend::vulkan::engine::draw_phase_window() else {
-        return;
-    };
-    crate::observe::off(format!(
-        "draw_phase draws={} prep_us={} slot_us={} pipeline_us={} \
-         pl_depth_us={} pl_shader_us={} pl_layoutpass_us={} pl_compile_us={} pl_sampler_us={} \
-         stage_us={} sg_roles_us={} sg_vertex_us={} sg_index_us={} sg_storage_us={} \
-         sg_seed_us={} stage_pass_us={} \
-         acquire_us={} acquire_sampled_us={} sampled_upload_us={} acquire_readback_us={} \
-         descriptors_us={} \
-         record_us={} rec_begin_us={} rec_barrier_us={} rec_pass_us={} rec_state_us={} \
-         rec_draw_us={} submit_us={} post_target_us={} post_store_us={} post_sampled_us={} \
-         post_park_us={} wait_us={} readback_us={} max_us={} stalls={}",
-        w.draws,
-        w.prep_us,
-        w.slot_us,
-        w.pipeline_us,
-        w.pipeline_depth_us,
-        w.pipeline_shader_us,
-        w.pipeline_layout_pass_us,
-        w.pipeline_compile_us,
-        w.pipeline_sampler_us,
-        w.stage_us,
-        w.stage_roles_us,
-        w.stage_vertex_us,
-        w.stage_index_us,
-        w.stage_storage_us,
-        w.stage_seed_us,
-        w.stage_pass_us,
-        w.acquire_us,
-        w.acquire_sampled_us,
-        w.sampled_upload_us,
-        w.acquire_readback_us,
-        w.descriptors_us,
-        w.record_us,
-        w.rec_begin_us,
-        w.rec_barrier_us,
-        w.rec_pass_us,
-        w.rec_state_us,
-        w.rec_draw_us,
-        w.submit_us,
-        w.post_target_us,
-        w.post_store_us,
-        w.post_sampled_us,
-        w.post_park_us,
-        w.wait_us,
-        w.readback_us,
-        w.max_us,
-        w.stalls,
-    ));
-    emit_stage_phase();
-    emit_gather_phase();
-    emit_gpu_span();
-}
-
 /// Beside `draw_phase`, because it is the one column in it the GPU wrote.
 ///
 /// `slot_us` above is the drain worker blocked on a ring fence, and every session
@@ -330,54 +264,6 @@ fn emit_gpu_span() {
         w.kind_n[3],
         w.kind_us[4],
         w.kind_n[4],
-    ));
-}
-
-/// Where a compute-gather dispatch's CPU cost goes, four ways.
-///
-/// Emitted only when a gather dispatched, so the line's presence is itself the
-/// statement that this boot ran the dispatch arm — see
-/// [`crate::backend::vulkan::engine::gather_phase`] for what each part is and
-/// what would remove it.
-fn emit_gather_phase() {
-    let Some(w) = crate::backend::vulkan::engine::gather_phase::take_window() else {
-        return;
-    };
-    crate::observe::off(format!(
-        "gather_phase plan_us={} plan_n={} stage_us={} stage_n={} \
-         dset_us={} dset_n={} record_us={} record_n={}",
-        w.plan_us, w.plan_n, w.stage_us, w.stage_n, w.dset_us, w.dset_n, w.record_us, w.record_n,
-    ));
-}
-
-/// Under `draw_phase`, dividing its largest column — `stage_us` is 83 % of that
-/// phase's second on a driven drag, and the five parts want opposite fixes.
-fn emit_stage_phase() {
-    let Some(w) = crate::backend::vulkan::engine::stage_phase::take_window() else {
-        return;
-    };
-    crate::observe::off(format!(
-        "stage_phase acquire_us={} acquires={} bytes_us={} bytes_n={} bytes_b={} \
-         runs_us={} runs_n={} runs_b={} swap_us={} swap_n={} swap_b={} \
-         shift_us={} shift_n={} shift_b={} \
-         gather_us={} gather_n={} gather_b={}",
-        w.acquire_us,
-        w.acquires,
-        w.bytes_us,
-        w.bytes_n,
-        w.bytes_b,
-        w.runs_us,
-        w.runs_n,
-        w.runs_b,
-        w.swap_us,
-        w.swap_n,
-        w.swap_b,
-        w.shift_us,
-        w.shift_n,
-        w.shift_b,
-        w.gather_us,
-        w.gather_n,
-        w.gather_b,
     ));
 }
 

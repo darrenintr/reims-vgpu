@@ -820,6 +820,69 @@ impl crate::observe::Decline for IndexLoadReason {
     }
 }
 
+/// What this device's model holds for a slot a draw bound as a render pipeline
+/// while the guest's object list says the slot holds another type.
+///
+/// **It decides nothing.** It exists to split one refusal population,
+/// `draw_load_pipeline fail reason=wrong_type ot=5`: 313 lines in one iOS
+/// Simulator run on x86/Vulkan (macOS 13, guest import off). Type 5 is
+/// `OBJECT_TYPE_REF_TEXTURE`, a texture handle over an IOSurface, and no
+/// recovered contract lets a `setRenderPipelineState:` ref name one. So
+/// accepting it is not on the table, and the refusal stays. What is open is
+/// *why* a draw reaches the slot. The decoded record says nothing more:
+/// `SetRenderPipelineState` carries one `object_ref`, decoded once in
+/// `reims_vgpu_protocol::decode::render`, and both rails read that field. Two
+/// mechanisms remain, and they need different owners:
+///
+/// - **The slot was recycled under a pipeline the stream still binds.** The
+///   model named this slot and declared a pipeline under that name, and the
+///   name is still live. So no `CmdDeleteObject` for it has reached this
+///   device, yet the guest list now holds a texture there. The slot's
+///   lifetime would then be the guest's list and not the delete, which is
+///   the macOS 26 `no_list_entry` mechanism `load_render_pipeline` describes,
+///   with a reused slot instead of a cleared one. Its owner would be a
+///   retained pipeline descriptor keyed by the name, the way
+///   `objects::resolve_resource` retains a texture's.
+/// - **The ref never named a pipeline here.** The model either never named
+///   the slot, or named it as something else (often the ref-texture itself).
+///   Then the question is about which ref the draw carries, not the slot's
+///   lifetime, and retaining anything would serve a wrong answer.
+///
+/// Which one is true has not been measured. Building the retention for the
+/// first would be guessing at a lifetime contract. This field is the
+/// measurement: one Simulator run with it says which population the 313
+/// belong to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PipelineSlotModel {
+    /// The model has no name for this slot.
+    Unnamed,
+    /// The slot has a live name and the pipeline table holds no entry for it:
+    /// this device never loaded a pipeline under that name.
+    NamedOther,
+    /// The slot's live name has a pipeline-table entry in this state
+    /// (`reims_vgpu_core::pipeline::PipelineState::name`).
+    Pipeline(&'static str),
+}
+
+impl PipelineSlotModel {
+    pub(crate) fn read(state: &DeviceState, task_id: u32, obj_ref: u32) -> Self {
+        let Some(name) = state.object_name(task_id, obj_ref) else {
+            return Self::Unnamed;
+        };
+        state
+            .pipeline_state(name)
+            .map_or(Self::NamedOther, Self::Pipeline)
+    }
+
+    pub(crate) fn slug(self) -> String {
+        match self {
+            Self::Unnamed => "unnamed".to_string(),
+            Self::NamedOther => "named_other".to_string(),
+            Self::Pipeline(state) => format!("pipeline_{state}"),
+        }
+    }
+}
+
 /// Load the render pipeline a draw named, or say why it could not be loaded.
 ///
 /// The sibling of `compute_exec::load_compute_pipeline`, and until now the half
@@ -872,6 +935,20 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
         &[OBJECT_TYPE_SERIALIZER_OBJECT],
     ) {
         Ok(found) => found,
+        // The one rung that also gets the model's side of the slot. See
+        // [`PipelineSlotModel`] for which question that answer settles.
+        Err(objects::LadderRung::WrongType { got }) => {
+            report.reason(
+                task_id,
+                pipeline_ref,
+                crate::observe::ladder_slug!("", wrong_type),
+                &format!(
+                    "ot={got} model={}",
+                    PipelineSlotModel::read(state, task_id, pipeline_ref).slug()
+                ),
+            );
+            return None;
+        }
         Err(rung) => {
             report.rung(task_id, pipeline_ref, rung);
             return None;

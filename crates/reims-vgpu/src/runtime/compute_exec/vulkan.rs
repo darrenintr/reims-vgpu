@@ -233,7 +233,7 @@ pub(super) fn mapper_ref_texture_destination<M: HostMemory + HostOps>(
     // plane-correct for a ref-texture view and already a sub-rectangle where the
     // dispatch writes one, and it is the same window the readback rail lands
     // through — so the two rails cannot name different bytes of one surface.
-    match crate::runtime::mapping_write::vulkan::licence_mapper_ref_texture_surface(
+    match crate::runtime::mapping_write::vulkan::licence_mapper_ref_texture_surface_selective_heap(
         state,
         host,
         held,
@@ -472,6 +472,96 @@ pub(crate) fn resident_serve(
     .then_some(ResidentServe::Sample(key, mirror_generation))
 }
 
+/// Whether a retained render target can serve a sampled binding of a whole
+/// mapper-ref-texture surface, so the stage-time guest read is unnecessary.
+///
+/// On the copying rail a surface a draw rendered exists twice: in the target,
+/// and in the guest pages its Store wrote. A kernel that samples it used to
+/// read the pages back — on the iOS Simulator one 15 MB window a frame, a
+/// couple of milliseconds after the Store wrote the same bytes. The target can
+/// serve instead only when it is provably those bytes:
+///
+/// - **the resident is the mapping's latest device write.** `finish` stamps the
+///   target with the mapping's `surface_content_epoch` after every Store and a
+///   draw into it clears the stamp, while every other device write to the
+///   mapping (`mark_mapping_written`: a compute writeback, a blit) moves the
+///   epoch. Equal therefore means nothing on the device has changed the pixels
+///   since this target's Store — the same witness the attachment LOAD elides
+///   its seed on;
+/// - **the guest has not written the window since**, under
+///   [`CurrencyStandard::WatchedAndUnwritten`]. A stale serve here has no rung
+///   under it — the kernel's output is published from it — and a miss costs
+///   only the guest read, which is exactly the trade that standard names;
+/// - the whole surface, one level, single-sample, at the binding's own format,
+///   because an image copy converts and crops nothing.
+///
+/// `None` is the ordinary answer and sends the binding to the guest read.
+pub(crate) fn render_target_serve<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    window: &crate::runtime::compute_exec::SampledSurfaceWindow,
+) -> Option<ResidentServe> {
+    use crate::runtime::surface_currency::{surface_currency, CurrencyStandard};
+    let m = state.mappings.get(&window.mapping_id)?;
+    if !m.has_geom
+        || m.width != window.width
+        || m.height != window.height
+        || window.surface_offset != 0
+        || window.mip_levels != 1
+    {
+        return None;
+    }
+    let identity = crate::backend::vulkan::present_identity::surface_identity(
+        state,
+        window.mapping_id,
+        window.width,
+        window.height,
+    );
+    let format = mtl_to_engine_sampled(window.pixel_format)?.vk_format();
+    if identity.resident_format() != format {
+        return None;
+    }
+    if crate::backend::vulkan::engine::resident_content_epoch(&identity)
+        != Some(m.surface_content_epoch)
+    {
+        return None;
+    }
+    if !surface_currency(state, host, window.mapping_id, window.width, window.height)
+        .serves(CurrencyStandard::WatchedAndUnwritten)
+    {
+        return None;
+    }
+    Some(ResidentServe::Target(
+        crate::runtime::resident_target::ResidentTarget::new(identity),
+    ))
+}
+
+/// The refusal a dispatch takes when its kernel's AIR will not become SPIR-V.
+///
+/// `reason=compute_vk_translate` is unchanged, so a count of it still reads
+/// against older boots. What it gains is `step=`, the translation cache's own
+/// slug for the step that refused: `m2v_kernel_translate` (metal2vulkan),
+/// `m2v_kernel_local_size_mismatch`, a layout-repair or reflection refusal,
+/// `m2v_translation_pending_at_sync_boundary`, and so on. That slug used to
+/// reach the log only through `compute_linux_m2v`, a separate line latched
+/// once per pipeline. So a `compute_record` line (7 per Simulator run) did not
+/// say which step it was, and reading it meant pairing two lines by `pipe=`.
+/// The steps need different owners (the translator, the cache's keying, the
+/// pre-scan), so a count that cannot split them cannot be acted on.
+///
+/// `model_pipeline` is the ordering plane's state for the pipeline, the same
+/// field `compute_linux_m2v` carries.
+pub(crate) fn kernel_translate_refusal(
+    decline: &crate::runtime::m2v_cache::M2vCacheDecline,
+    model_pipeline: &'static str,
+) -> ComputeStatus {
+    ComputeStatus::RailRefused(
+        crate::backend::refusal::RailRefusal::execute("compute_vk_translate")
+            .field("step", crate::observe::Decline::slug(decline))
+            .field("model_pipeline", model_pipeline),
+    )
+}
+
 /// Linux product compute path (doorbell / BQL).
 ///
 /// Stages buffers/textures with device `page_shift`, translates the kernel AIR
@@ -608,7 +698,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 .field("pipe", acc.pipeline_ref)
                 .field("model_pipeline", model_pipeline)
                 .fail_once(acc.pipeline_ref as u64);
-            return ComputeStatus::MetalFailed("compute_vk_translate");
+            return kernel_translate_refusal(&e, model_pipeline);
         }
     };
     if let Some(unsupported) = crate::runtime::spirv_bind::first_unsupported_vulkan_interface(
@@ -1128,6 +1218,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 seed_skipped: t
                     .rail
                     .serve
+                    .as_ref()
                     .and_then(ResidentServe::seed_generation)
                     .is_some(),
             });
@@ -1153,14 +1244,36 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 // empty because there is nothing for either to hold.
                 source: match t.rail.multisample_target.take() {
                     Some(identity) => ComputeSampledSource::MultisampleTarget(identity),
-                    None => match t.rail.serve.and_then(ResidentServe::sample_source) {
-                        Some((identity, generation)) => ComputeSampledSource::ResidentCopy(
-                            crate::backend::vulkan::engine::ComputeResidentSampleBind {
-                                identity,
-                                generation,
-                            },
-                        ),
-                        None => ComputeSampledSource::Bytes(std::mem::take(&mut t.bytes)),
+                    None => match t.rail.serve.as_ref() {
+                        Some(ResidentServe::Sample(identity, generation)) => {
+                            ComputeSampledSource::ResidentCopy(
+                                crate::backend::vulkan::engine::ComputeResidentSampleBind {
+                                    identity: *identity,
+                                    generation: *generation,
+                                },
+                            )
+                        }
+                        // This rail issued the target, so it reads back its
+                        // own type. Anything else names no image here, and
+                        // the guest read was skipped for it, so `bytes` is a
+                        // placeholder that must never be bound.
+                        Some(ResidentServe::Target(target)) => match target
+                            .get::<crate::backend::vulkan::engine::TargetIdentity>()
+                        {
+                            Some(identity) => ComputeSampledSource::TargetCopy(identity.clone()),
+                            None => {
+                                crate::observe::fail(format!(
+                                    "compute_linux sampled_target fail reason=foreign_target pipe={} bind={} target={target:?}",
+                                    acc.pipeline_ref, t.binding
+                                ));
+                                return ComputeStatus::MissingTexture(
+                                    "compute_sampled_target_foreign",
+                                );
+                            }
+                        },
+                        Some(ResidentServe::Seed(_)) | None => {
+                            ComputeSampledSource::Bytes(std::mem::take(&mut t.bytes))
+                        }
                     },
                 },
             });

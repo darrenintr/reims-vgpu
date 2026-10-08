@@ -572,7 +572,6 @@ fn present_action_owns_worker_boundary_until_scanout_copy() {
         offset: crate::model::GFX_REG_CHILD_DOORBELL,
         data: 4,
         size: crate::model::MMIO_U32,
-        queued_at: Some(std::time::Instant::now()),
     });
 
     assert!(device_drain(id));

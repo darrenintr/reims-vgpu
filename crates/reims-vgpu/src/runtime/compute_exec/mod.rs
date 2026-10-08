@@ -792,9 +792,7 @@ pub fn apply_record<M: HostMemory + HostOps>(
     record: &ComputeRecord<'_>,
     seg: &mut crate::runtime::compute_session::ComputeSegment,
 ) -> Option<ComputeStatus> {
-    let started = std::time::Instant::now();
     let out = apply_record_inner(state, host, task_id, record, seg);
-    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Compute, started);
     out
 }
 
@@ -813,9 +811,7 @@ pub fn apply_sequencing_record<M: HostMemory + HostOps>(
     cmd: &ComputeCommand,
     seg: &mut crate::runtime::compute_session::ComputeSegment,
 ) -> ComputeStatus {
-    let started = std::time::Instant::now();
     let out = crate::runtime::compute_session::apply_sequencing(state, host, task_id, cmd, seg);
-    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Compute, started);
     out
 }
 
@@ -1465,31 +1461,62 @@ pub(crate) struct StagedTexture<R: RailStage> {
         reason = "no rail this build compiled constructs one; every rail still reads the type"
     )
 )]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum ResidentServe {
     Seed(u32),
     Sample(crate::model::ComputeStorageResidencyKey, u32),
+    /// A sampled binding whose window a retained render target holds: a draw
+    /// rendered it, its Store wrote the same pixels to the guest's pages, and
+    /// nothing has written those pages since.
+    ///
+    /// Opaque, because the target is the running rail's own name for its
+    /// image; only the rail that issued it reads it back.
+    Target(crate::runtime::resident_target::ResidentTarget),
 }
 
 impl ResidentServe {
     /// The generation a seeded resident is held at, or `None` for a sampled
     /// one — whose generation belongs to its key rather than to the guest read
     /// this binding skipped.
-    pub(crate) fn seed_generation(self) -> Option<u32> {
+    pub(crate) fn seed_generation(&self) -> Option<u32> {
         match self {
-            Self::Seed(generation) => Some(generation),
-            Self::Sample(..) => None,
+            Self::Seed(generation) => Some(*generation),
+            Self::Sample(..) | Self::Target(_) => None,
         }
     }
 
-    /// The resident a sampled binding reads directly, or `None` for a seeded
-    /// one.
-    pub(crate) fn sample_source(self) -> Option<(crate::model::ComputeStorageResidencyKey, u32)> {
+    /// The compute resident a sampled binding reads directly, or `None` for a
+    /// seeded one or a render target.
+    pub(crate) fn sample_source(&self) -> Option<(crate::model::ComputeStorageResidencyKey, u32)> {
         match self {
-            Self::Sample(key, generation) => Some((key, generation)),
-            Self::Seed(_) => None,
+            Self::Sample(key, generation) => Some((*key, *generation)),
+            Self::Seed(_) | Self::Target(_) => None,
         }
     }
+
+    /// The render target a sampled binding is copied from, or `None` for
+    /// either compute-resident answer.
+    pub(crate) fn render_target(&self) -> Option<&crate::runtime::resident_target::ResidentTarget> {
+        match self {
+            Self::Target(target) => Some(target),
+            Self::Seed(_) | Self::Sample(..) => None,
+        }
+    }
+}
+
+/// A sampled binding's whole-surface window, as the render-target question
+/// asks it.
+///
+/// Neutral, because the question is: which mapping, which extent, at which
+/// format and offset. Only the answer names a rail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SampledSurfaceWindow {
+    pub(crate) mapping_id: u32,
+    pub(crate) surface_offset: u64,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pixel_format: u16,
+    pub(crate) mip_levels: u32,
 }
 
 /// Stage an opcode-9 buffer-backed texture: tight raw texels read out of the
@@ -1865,11 +1892,14 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
                 serve => serve,
             },
         };
-        let seed_generation = serve.and_then(ResidentServe::seed_generation).unwrap_or(0);
+        let seed_generation = serve
+            .as_ref()
+            .and_then(ResidentServe::seed_generation)
+            .unwrap_or(0);
         crate::observe::off(format!(
             "compute_stage_tex heap_ok ref={texture_ref} heap={heap_ref} fmt={format:#x} {width}x{height} storage={} seed_gen={seed_generation} resident_sample={} use_offset={} offset={offset:#x}",
             is_storage as u8,
-            serve.and_then(ResidentServe::sample_source).is_some() as u8,
+            serve.as_ref().and_then(ResidentServe::sample_source).is_some() as u8,
             use_offset as u8
         ));
         return Ok(StagedTexture {
@@ -2262,6 +2292,26 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
                     is_storage,
                     stage_fmt,
                 )
+            })
+            .or_else(|| {
+                // A window a draw rendered and stored. Sampled only: a storage
+                // binding's seed is the kernel's own previous output, which the
+                // compute mirror above is the witness for.
+                (!is_storage).then_some(()).and_then(|()| {
+                    crate::backend::selected().render_target_serve(
+                        state,
+                        &*host,
+                        &SampledSurfaceWindow {
+                            mapping_id,
+                            surface_offset,
+                            width,
+                            height,
+                            pixel_format: stage_fmt,
+                            // Metal forbids a mipmapped IOSurface texture.
+                            mip_levels: 1,
+                        },
+                    )
+                })
             });
         // The generation this staging is at. Unlike the heap and linear rails,
         // this one's fallback is the mapping's own content generation rather
@@ -2273,16 +2323,34 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
         // answers `None` and this is `content_generation`, which is what that
         // arm always used.
         let seed_generation = serve
+            .as_ref()
             .and_then(ResidentServe::seed_generation)
             .unwrap_or(content_generation);
-        if serve.and_then(ResidentServe::seed_generation).is_some() {
+        if serve
+            .as_ref()
+            .and_then(ResidentServe::seed_generation)
+            .is_some()
+        {
             crate::observe::off(format!(
                 "compute_stage_resident_skip mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} gen={seed_generation} bytes={need}"
             ));
-        } else if let Some((_, generation)) = serve.and_then(ResidentServe::sample_source) {
+        } else if let Some((_, generation)) = serve.as_ref().and_then(ResidentServe::sample_source)
+        {
             crate::observe::off(format!(
                 "compute_stage_resident_sample mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} gen={generation} bytes={need}"
             ));
+        }
+        if serve
+            .as_ref()
+            .and_then(ResidentServe::render_target)
+            .is_some()
+        {
+            crate::runtime::drain::note_store_route("compute_stage_target_sample");
+            if crate::observe::first_sight("compute_stage_target_sample", u64::from(mapping_id)) {
+                crate::observe::off(format!(
+                    "compute_stage_target_sample mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} bytes={need}"
+                ));
+            }
         }
         let mut bytes = vec![0u8; need];
         if serve.is_none()
@@ -2583,12 +2651,12 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
     } else {
         resident.and_then(|(_, _, serve)| serve)
     };
-    if let Some(generation) = serve.and_then(ResidentServe::seed_generation) {
+    if let Some(generation) = serve.as_ref().and_then(ResidentServe::seed_generation) {
         crate::observe::off(format!(
             "compute_stage_linear_resident_seed task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} gen={generation}",
             tex.pixel_format
         ));
-    } else if let Some((_, generation)) = serve.and_then(ResidentServe::sample_source) {
+    } else if let Some((_, generation)) = serve.as_ref().and_then(ResidentServe::sample_source) {
         crate::observe::off(format!(
             "compute_stage_linear_resident_sample task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} gen={generation}",
             stage_format
@@ -2642,6 +2710,7 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
         if let Some(key) = linear_key {
             if !crate::runtime::surface_cache::linear_mirrorable(stage_format) {
                 let seed = serve
+                    .as_ref()
                     .and_then(ResidentServe::seed_generation)
                     .unwrap_or_else(|| {
                         state

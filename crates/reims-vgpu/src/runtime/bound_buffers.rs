@@ -231,50 +231,43 @@ pub struct RegistryShape {
 /// whether the 12.8x more fresh resolutions on an importing host are churn in
 /// the retirement rules or churn in the keys.
 pub fn note_registry_levels(state: &crate::model::DeviceState) {
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
     static PEAK_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
-    if let Some(line) = registry_levels_line(
-        &state.bound_buffers,
-        &LAST_MS,
-        &PEAK_ENTRIES,
-        crate::observe::elapsed_ms() as u64,
-    ) {
-        crate::observe::off(line);
-    }
-}
+    // This function is called from every post-tranche sweep. Keep the level's
+    // high-water exact with the O(1) length, but do not build the O(n)
+    // (task, reference) histogram until the one-second report actually fires.
+    //
+    // The old order called `shape()` before this cadence gate. With the iOS
+    // Simulator holding ~20-27k fallback entries and hundreds of tranches per
+    // second, the diagnostic itself consumed 150-195 ms/s in
+    // `post_bindlv_us` while producing only one line. The census must observe
+    // the workload, not become a fifth of it.
+    let entries = state.bound_buffers.len();
+    let peak = PEAK_ENTRIES
+        .fetch_max(entries as u64, Ordering::Relaxed)
+        .max(entries as u64);
 
-/// The census line, or `None` when this tranche is not the one that reports.
-///
-/// The gate comes first and the only per-tranche work is `len()`, which is O(1)
-/// and is all the peak needs. [`BoundBuffers::shape`] builds a map over every
-/// held key, so it runs only for the tranche that claims the interval. It used
-/// to run on every tranche, above the gate, to feed a line that is emitted once
-/// a second: with the registry holding a working set's worth of entries that was
-/// 383 ms of every second on the drain worker's own clock (`post_bindlv_us`,
-/// outside `drain_us` and `publish_us`, so `duty` could not see it).
-fn registry_levels_line(
-    held: &BoundBuffers,
-    last_ms: &std::sync::atomic::AtomicU64,
-    peak_entries: &std::sync::atomic::AtomicU64,
-    now_ms: u64,
-) -> Option<String> {
-    use std::sync::atomic::Ordering;
-
-    let entries = held.len() as u64;
-    let peak = peak_entries
-        .fetch_max(entries, Ordering::Relaxed)
-        .max(entries);
-    if !crate::runtime::released_pages::claim_census_interval(last_ms, now_ms) {
-        return None;
+    let now = crate::observe::elapsed_ms() as u64;
+    let last = LAST_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 1000 {
+        return;
     }
-    let shape = held.shape();
-    Some(format!(
+    // Losing the race only costs a skipped interval, never a double line.
+    if LAST_MS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+
+    let shape = state.bound_buffers.shape();
+    crate::observe::off(format!(
         "bound_buffers (levels, not per-interval) entries={} peak={} pairs={} \
          multi_offset_pairs={} max_offsets={}",
         shape.entries, peak, shape.pairs, shape.multi_offset_pairs, shape.max_offsets
-    ))
+    ));
 }
 
 /// Every held bind resolution on this device.
@@ -282,10 +275,6 @@ fn registry_levels_line(
 pub struct BoundBuffers {
     held: HashMap<Key, BoundBuffer>,
     packed: HashMap<(u32, u32), PackedBufferResolution>,
-    /// How many times [`Self::shape`] has walked `held`. Read by the test that
-    /// holds the census to one walk per interval; an atomic because the registry
-    /// is read through `&self`.
-    shape_walks: std::sync::atomic::AtomicU64,
 }
 
 impl BoundBuffers {
@@ -442,13 +431,11 @@ impl BoundBuffers {
     /// at several offsets, each paying its own walk, and the narrower key is
     /// costing exactly `entries - pairs` resolutions.
     ///
-    /// Walked once per census interval ([`registry_levels_line`] holds that) rather
-    /// than tracked incrementally: a second index would have to be maintained by every retirement rule, which
+    /// Walked once per census interval rather than tracked incrementally: a
+    /// second index would have to be maintained by every retirement rule, which
     /// is a correctness surface bought for a measurement, and the population is
     /// the guest's live working set rather than anything unbounded.
     pub fn shape(&self) -> RegistryShape {
-        self.shape_walks
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut per_pair: HashMap<(u32, u32), u32> = HashMap::new();
         for k in self.held.keys() {
             *per_pair.entry((k.task, k.buffer_ref)).or_default() += 1;
@@ -478,102 +465,6 @@ mod tests {
             source_offset: 0,
             runs: Arc::new(Vec::new()),
             pages: None,
-        }
-    }
-
-    fn registry(entries: u32) -> BoundBuffers {
-        let mut b = BoundBuffers::default();
-        for i in 0..entries {
-            // Two references in three are held at a second offset, so the shape
-            // has something to count.
-            b.insert(i % 7, i, 0, None, bound(u64::from(i) * 0x1000, 0x1000));
-            if i % 3 == 0 {
-                b.insert(i % 7, i, 0x100, None, bound(u64::from(i) * 0x1000, 0x1000));
-            }
-        }
-        b
-    }
-
-    /// The census walks the registry once per interval, not once per tranche.
-    ///
-    /// `post_bindlv_us` measured 383 ms of a second because the walk sat above the
-    /// gate. A tranche inside the interval must cost a length read and nothing
-    /// else, and the line the interval does emit must be the one a walk produces.
-    #[test]
-    fn the_registry_is_walked_once_per_census_interval() {
-        use std::sync::atomic::AtomicU64;
-        let b = registry(600);
-        let last = AtomicU64::new(0);
-        let peak = AtomicU64::new(0);
-
-        // First tranche of the interval claims it and walks once.
-        let first = registry_levels_line(&b, &last, &peak, 5_000).expect("claims the interval");
-        assert_eq!(b.shape_walks.load(std::sync::atomic::Ordering::Relaxed), 1);
-
-        // Every tranche that follows inside the second is quiet and walks nothing.
-        for t in 1..=5_000u64 {
-            assert!(registry_levels_line(&b, &last, &peak, 5_000 + t % 999).is_none());
-        }
-        assert_eq!(
-            b.shape_walks.load(std::sync::atomic::Ordering::Relaxed),
-            1,
-            "a tranche off the interval walked the registry"
-        );
-
-        // The next interval walks again, and the content is the walk's.
-        let next = registry_levels_line(&b, &last, &peak, 6_000).expect("next interval");
-        assert_eq!(b.shape_walks.load(std::sync::atomic::Ordering::Relaxed), 2);
-        assert_eq!(
-            first, next,
-            "an unchanged registry reports an unchanged shape"
-        );
-        let shape = b.shape();
-        assert!(first.contains(&format!("entries={}", shape.entries)));
-        assert!(first.contains(&format!("pairs={}", shape.pairs)));
-        assert!(first.contains(&format!("multi_offset_pairs={}", shape.multi_offset_pairs)));
-        assert!(
-            shape.multi_offset_pairs > 0,
-            "the fixture exercises the shape"
-        );
-    }
-
-    /// The peak is still sampled every tranche, because it is a length read: a
-    /// registry that grows and shrinks inside one interval is still seen at its
-    /// largest, exactly as before the walk moved behind the gate.
-    #[test]
-    fn the_peak_sees_growth_between_census_lines() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        let last = AtomicU64::new(0);
-        let peak = AtomicU64::new(0);
-        let mut b = registry(10);
-        registry_levels_line(&b, &last, &peak, 2_000);
-        b = registry(500);
-        assert!(registry_levels_line(&b, &last, &peak, 2_100).is_none());
-        b = registry(20);
-        let line = registry_levels_line(&b, &last, &peak, 3_100).expect("next interval");
-        assert_eq!(peak.load(Ordering::Relaxed), 500 + 500_u64.div_ceil(3));
-        assert!(line.contains(&format!("peak={}", peak.load(Ordering::Relaxed))));
-    }
-
-    /// Prices one walk against the registry sizes a driven boot holds. The
-    /// figure belongs to the host that runs it: `cargo test --release --
-    /// --ignored registry_walk_cost --nocapture`.
-    #[test]
-    #[ignore = "pricing, not a regression gate"]
-    fn registry_walk_cost() {
-        for n in [500u32, 2_000, 8_000, 32_000] {
-            let b = registry(n);
-            let started = std::time::Instant::now();
-            const WALKS: u32 = 200;
-            for _ in 0..WALKS {
-                std::hint::black_box(b.shape());
-            }
-            let per = started.elapsed().as_secs_f64() * 1e6 / f64::from(WALKS);
-            println!(
-                "entries={:<6} shape()={per:>8.1} us/walk  -> per tranche x1000/s = {:>7.1} ms/s",
-                b.len(),
-                per
-            );
         }
     }
 

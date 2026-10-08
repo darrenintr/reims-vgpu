@@ -3093,23 +3093,8 @@ pub struct DeviceState {
     pub max_task_id_seen: u32,
     /// See [`Self::max_task_id_seen`].
     pub max_mapping_id_seen: u32,
-    /// Count of MapMemory2/UnmapMemory packets (measure census).
+    /// Count of MapMemory2/UnmapMemory packets (verbose census).
     pub map_family_events: u64,
-    /// Per-task live guest-VA mappings, for the map/unmap pairing audit.
-    ///
-    /// Observation only — see [`crate::runtime::map_audit`] for what it watches
-    /// and why the wire is entitled to answer it. Keyed separately from
-    /// [`Self::tasks`] because a map packet may name a task id this device has
-    /// no entry for, and that case is itself worth counting rather than
-    /// dropping.
-    pub map_audit: std::collections::BTreeMap<u32, crate::runtime::map_audit::MapIntervals>,
-    /// Per-task page-table node pages, for the host-write guard.
-    ///
-    /// Observation only — see [`crate::runtime::node_guard`]. Keyed and dropped
-    /// exactly as [`Self::map_audit`] is, and for the same reason: these pages
-    /// belong to the task's address space, so a reused id inheriting them would
-    /// be watching memory that is now somebody else's.
-    pub node_guard: std::collections::BTreeMap<u32, crate::runtime::node_guard::NodeWatch>,
     /// Live object refs per task, as `(task_id, ref)`.
     ///
     /// This is membership for host-copy teardown. [`Self::task_resources`]
@@ -3598,8 +3583,6 @@ impl DeviceState {
             max_mapping_id_seen: 0,
             tasks: TaskTable::new(),
             map_family_events: 0,
-            map_audit: std::collections::BTreeMap::new(),
-            node_guard: std::collections::BTreeMap::new(),
             objects: std::collections::BTreeSet::new(),
             task_resources: TaskResources::default(),
             lifecycle: Mutex::new(reims_vgpu_core::lifecycle::Lifecycle::new()),
@@ -4109,13 +4092,6 @@ impl DeviceState {
         if let Some(rail) = self.rail.get() {
             rail.delete_task(task_id);
         }
-        // A deleted task's whole address space goes with it, so its live
-        // mappings are not leaks and a reused id must not inherit them.
-        self.map_audit.remove(&task_id);
-        // Same lifetime, same reason: the watched pages were nodes of the tree
-        // this id is losing, and after a redefine they describe whatever the
-        // guest has since done with them.
-        self.node_guard.remove(&task_id);
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
@@ -4176,15 +4152,6 @@ impl DeviceState {
         // HostOps views we held (does not touch host_gva_surfaces encode).
         // Runtime flushes retired_views via HostOps::unmap_pages.
         self.retire_task_gva_views(task_id);
-        // The two observation ledgers keyed by task id go with it, exactly as
-        // they do on a redefine. Both were reachable only through `define_task`
-        // before, which cleaned them up whenever an id came back — so a task the
-        // guest deletes and never redefines left its record behind for the life
-        // of the process. Neither ledger is read for a task that does not exist,
-        // so this costs no behaviour; it stops an id the guest is done with from
-        // holding a page set that describes memory it has given back.
-        self.map_audit.remove(&task_id);
-        self.node_guard.remove(&task_id);
         self.tasks.remove(task_id);
         true
     }

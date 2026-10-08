@@ -1100,7 +1100,6 @@ fn bind_sampled_images(
         // [`crate::backend::metal::resident`], and charged apart from the rest
         // of `metal_encode_us` for the same reason: the fix for byte movement
         // is not the fix for encoder overhead.
-        let span_alloc = crate::runtime::chain_phase::CostSpan::new("metal_sampled_tex_alloc_us");
         let descriptor = TextureDescriptor::new();
         descriptor.set_texture_type(MTLTextureType::D2);
         descriptor.set_pixel_format(pixel_format);
@@ -1125,12 +1124,7 @@ fn bind_sampled_images(
                 depth: 1,
             },
         };
-        drop(span_alloc);
-        {
-            let _span_upload =
-                crate::runtime::chain_phase::CostSpan::new("metal_sampled_tex_upload_us");
-            texture.replace_region(region, 0, bytes as *const _, bytes_per_row);
-        }
+        texture.replace_region(region, 0, bytes as *const _, bytes_per_row);
         if fragment_stage {
             encoder.set_fragment_texture(texture_index as u64, Some(&texture));
         } else {
@@ -1986,7 +1980,6 @@ pub fn render_core_mrt(
     // They are contiguous and non-overlapping, so their sum is `engine_us` less
     // the argument validation above and the depth/stencil readback below.
     // Checking that sum is the first thing to do with a reading.
-    let span_pso = crate::runtime::chain_phase::CostSpan::new("metal_pso_us");
     let vertex = match load_only_function(device, vert_mtlb, "vertex", err) {
         Ok(f) => f,
         Err(st) => return st,
@@ -2059,14 +2052,11 @@ pub fn render_core_mrt(
         Ok(v) => v,
         Err(st) => return st,
     };
-    drop(span_pso);
-
     let mut retained_tex: Vec<Texture> = Vec::new();
     // (slot, tex, bpp)
     let mut color_textures: Vec<(u32, Texture, usize)> = Vec::new();
     for (i, c) in colors.iter().enumerate() {
         let (slot, _fmt_u32, bpp, mtl_fmt) = color_meta[i];
-        let span_alloc = crate::runtime::chain_phase::CostSpan::new("metal_rt_alloc_us");
         // Three ways to reach a target, and only the first allocates. The
         // retained arms are why this rail stopped paying an allocation and an
         // 8 MB upload per draw per attachment; see
@@ -2111,7 +2101,6 @@ pub fn render_core_mrt(
                 }
             },
         };
-        drop(span_alloc);
         // Archive reims_vgpu_backend_metal: upload target_rgba8 before Load
         // (fresh RT every job; NULL seed → Clear invent below).
         //
@@ -2122,7 +2111,6 @@ pub fn render_core_mrt(
         //
         // Skipped outright for a retained target that already holds the pixels,
         // which is the copy this rail exists to stop making.
-        let _span_seed = crate::runtime::chain_phase::CostSpan::new("metal_rt_seed_us");
         if let Some(seed) = c.seed_rgba8.filter(|_| !holds_prior) {
             let region = MTLRegion {
                 origin: MTLOrigin { x: 0, y: 0, z: 0 },
@@ -2144,7 +2132,6 @@ pub fn render_core_mrt(
     }
     let mut retained_buf: Vec<Buffer> = Vec::new();
 
-    let span_pass = crate::runtime::chain_phase::CostSpan::new("metal_pass_us");
     let pass = RenderPassDescriptor::new();
     for (i, c) in colors.iter().enumerate() {
         let (slot, target, _) = &color_textures[i];
@@ -2254,9 +2241,6 @@ pub fn render_core_mrt(
         pass.set_visibility_result_buffer(Some(buffer));
     }
 
-    drop(span_pass);
-
-    let span_encode = crate::runtime::chain_phase::CostSpan::new("metal_encode_us");
     let queue = thread_queue(device);
     let Some(command_buffer) = crate::backend::metal::raw_metal::new_command_buffer(&queue) else {
         return Status::execute("metal_render_command_buffer_unavailable");
@@ -2530,16 +2514,12 @@ pub fn render_core_mrt(
     }
 
     encoder.end_encoding();
-    drop(span_encode);
-
     // One command buffer, one pass, one blocking round trip, per decoded draw.
     // Item 1 of the ranking in this function's own doc, and the only one of the
     // three whose cost is a latency the CPU cannot fill rather than work it
     // could do faster.
-    let span_commit = crate::runtime::chain_phase::CostSpan::new("metal_commit_us");
     command_buffer.commit();
     command_buffer.wait_until_completed();
-    drop(span_commit);
     if command_buffer.status() == MTLCommandBufferStatus::Error {
         let detail = command_buffer_error_description(&command_buffer);
         set_err(err, format!("Metal command buffer failed: {detail}"));
@@ -2554,7 +2534,6 @@ pub fn render_core_mrt(
         query.samples = Some(unsafe { core::ptr::read_unaligned(buffer.contents() as *const u64) });
     }
 
-    let span_readback = crate::runtime::chain_phase::CostSpan::new("metal_readback_us");
     for (i, c) in colors.iter_mut().enumerate() {
         if let Some(out) = c.out_rgba8.as_mut() {
             if out.is_empty() {
@@ -2646,7 +2625,6 @@ pub fn render_core_mrt(
             );
         }
     }
-    drop(span_readback);
     color_textures.clear();
     if let Some(depth) = depth_attachment {
         if depth.store_action == REIMS_VGPU_MTL_STORE_ACTION_STORE {

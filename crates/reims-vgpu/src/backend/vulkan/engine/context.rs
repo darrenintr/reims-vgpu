@@ -527,62 +527,10 @@ pub(crate) struct VertexDivisorCapabilities {
 /// # This region is per ring slot, and it has to be
 ///
 /// The doc that stood here said "two queries are enough because the readback is
-/// serialized: the caller waits on this copy's fence before it can start
-/// another, so the pool is never read while a second submission is writing it."
-/// That premise stopped being true when the guest-page writeback stopped waiting
-/// on its fence. Two writers then shared **one** three-query region: the
-/// readback, which still waits, and `copy_image_level0_to_buffer`, which submits
-/// and returns.
-///
-/// Vulkan orders nothing between two submissions on one queue without explicit
-/// synchronization — submission order is start order, not completion order — so
-/// the second writeback's `vkCmdResetQueryPool` could execute while the first's
-/// timestamps were still pending, and its `vkCmdWriteTimestamp` could execute
-/// before its own reset. Resetting a query in use and writing one whose reset
-/// has not run are both undefined, and the Khronos validation layer reported it
-/// on a driven macos-11 boot as `VUID-vkGetQueryPoolResults-None-09401`
-/// ("query not reset ... queries must also be reset between uses").
-///
-/// The fix is [`DrawSpanProbe`]'s, directly below, and for its reason: the ring
-/// slot is the natural owner because the slot's fence is exactly the event that
-/// makes its queries readable, and the ring already retires a slot before
-/// reusing it. Both writers record into a slot command buffer, so both get a
-/// region of their own for free.
-pub(crate) struct TimestampProbe {
-    /// Query `base(slot) + 0` is written at `TOP_OF_PIPE` before the barrier,
-    /// `+ 1` at `TRANSFER` immediately after it, `+ 2` at `BOTTOM_OF_PIPE` after
-    /// the copy. [`Self::PER_SLOT`] is the count each region holds, the count
-    /// the command buffer resets, and the count the read asks for; a mismatch
-    /// reads as a silent zero rather than as an error, which is how the
-    /// two-slot first version shipped and measured nothing.
-    pub pool: vk::QueryPool,
-    /// How a raw tick difference becomes nanoseconds. Shared with
-    /// [`DrawSpanProbe`] so this probe cannot ship without the valid-bits mask
-    /// that one's doc explains — it did, and every reading it produced was a
-    /// raw subtraction of two numbers whose high halves the driver leaves
-    /// undefined.
-    pub scale: TickScale,
-}
-
-impl TimestampProbe {
-    /// Queries per ring slot: the start stamp, the post-barrier stamp, and the
-    /// post-copy stamp.
-    pub const PER_SLOT: u32 = 3;
-
-    /// First query index belonging to ring slot `slot`.
-    pub const fn base(slot: usize) -> u32 {
-        slot as u32 * Self::PER_SLOT
-    }
-}
-
 /// How a queue family's raw timestamp ticks become nanoseconds.
 ///
-/// One type rather than a field pair on each probe, because the two halves are
-/// only correct together and a probe that carries the period without the mask
-/// silently produces garbage on any host that writes fewer than 64 meaningful
-/// bits. Making the pair the thing a probe holds is what stops the second one
-/// being written without it — which is exactly what happened to
-/// [`TimestampProbe`].
+/// One type rather than a field pair, because the period and valid-bit mask are
+/// only correct together on queue families that expose timestamps.
 #[derive(Clone, Copy)]
 pub(crate) struct TickScale {
     /// `VkPhysicalDeviceLimits::timestampPeriod` — nanoseconds per tick.
@@ -640,8 +588,7 @@ impl TickScale {
 /// retires a slot before reusing it — see [`super::gpu_span::SlotSpan`].
 pub(crate) struct DrawSpanProbe {
     pub pool: vk::QueryPool,
-    /// How a raw tick difference becomes nanoseconds. See [`TickScale`], which
-    /// [`TimestampProbe`] shares so the mask cannot be omitted from one of them.
+    /// How a raw tick difference becomes nanoseconds. See [`TickScale`].
     pub scale: TickScale,
 }
 
@@ -772,27 +719,14 @@ pub(crate) struct DeviceContext {
     /// this device (D32_SFLOAT_S8_UINT preferred, D24_UNORM_S8_UINT fallback).
     /// Used only by the stencil-test path; depth-only uses D32_SFLOAT.
     pub depth_stencil_format: vk::Format,
-    /// A two-slot timestamp query pool for the composite readback, and the tick
-    /// length that turns its delta into wall clock. `None` when this queue
-    /// family reports `timestampValidBits == 0` or the device reports a
-    /// `timestampPeriod` of zero, both of which Vulkan permits.
-    ///
-    /// This exists to answer one question the rest of the device cannot:
-    /// `readback_split fence_us` is wall clock spent blocked, and a blocked
-    /// caller cannot tell GPU work from the latency of asking. See
-    /// [`TimestampProbe`].
-    pub timestamps: Option<TimestampProbe>,
     /// Two timestamps per ring slot, for the GPU execution time of a draw
-    /// submission. `None` on the same two capability answers as
-    /// [`Self::timestamps`], and additionally when [`crate::config::GPU_SPANS`] is
+    /// submission. `None` when the queue family cannot provide timestamps,
+    /// and additionally when [`crate::config::GPU_SPANS`] is
     /// off — which is the whole of how that switch narrows, because a `None` here
     /// means no query is ever reset, written or read.
     ///
-    /// Separate from [`Self::timestamps`] rather than a wider pool because the two
-    /// are indexed by different things: the readback's three queries are safe to
-    /// share for the device's life precisely because that path is serialized,
-    /// while a draw's pair belongs to the ring slot whose fence will make it
-    /// readable. See [`super::gpu_span`].
+    /// Each draw pair belongs to the ring slot whose fence makes it readable.
+    /// See [`super::gpu_span`].
     pub draw_spans: Option<DrawSpanProbe>,
     /// The thread that publishes and announces FIFO completion stamps, and the
     /// timeline semaphore FIFO-owned submissions signal.
@@ -817,10 +751,6 @@ pub(crate) struct DeviceContext {
     /// in [`crate::observe::elapsed_ms`]; `0` when the blob on disk is current.
     /// See [`Self::note_pipeline_cache_grew`].
     pub pipeline_cache_grew_at_ms: AtomicU64,
-    /// `VK_EXT_pipeline_creation_feedback` was enabled, so a create can say
-    /// whether the driver served it from the pipeline cache. Measurement only:
-    /// see [`super::pipe_census`].
-    pub pipeline_creation_feedback: bool,
     /// `VK_KHR_swapchain` was enabled for the engine-owned host window.
     #[cfg(feature = "host-window")]
     pub swapchain: bool,
@@ -1160,8 +1090,6 @@ impl DeviceContext {
         crate::runtime::guest_ram_map::reset();
         let portability_subset = has_device_extension(vk::KHR_PORTABILITY_SUBSET_NAME);
         let vertex_attribute_divisor = has_device_extension(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME);
-        let pipeline_creation_feedback =
-            has_device_extension(vk::EXT_PIPELINE_CREATION_FEEDBACK_NAME);
         #[cfg(feature = "host-window")]
         let swapchain = has_device_extension(ash::khr::swapchain::NAME);
         // Combined depth-stencil format for the stencil-test path. The Vulkan
@@ -1211,11 +1139,6 @@ impl DeviceContext {
         }
         if vertex_attribute_divisor {
             enabled_device_extensions.push(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME.as_ptr());
-        }
-        // No feature bit and no behaviour change: the extension only lets a
-        // create report how it was served.
-        if pipeline_creation_feedback {
-            enabled_device_extensions.push(vk::EXT_PIPELINE_CREATION_FEEDBACK_NAME.as_ptr());
         }
         #[cfg(feature = "host-window")]
         if swapchain {
@@ -1287,25 +1210,6 @@ impl DeviceContext {
             qfs[gq as usize].timestamp_valid_bits,
             props.limits.timestamp_period,
         );
-        // One region per ring slot, for the reason `TimestampProbe`'s doc gives:
-        // the guest-page writeback submits without waiting, so two of its copies
-        // can be in flight at once and a shared region is reset under the first.
-        let timestamps = scale.and_then(|scale| {
-            let ci = vk::QueryPoolCreateInfo::default()
-                .query_type(vk::QueryType::TIMESTAMP)
-                .query_count(TimestampProbe::PER_SLOT * super::pools::RING_DEPTH as u32);
-            device
-                .create_query_pool(&ci, None)
-                .map(|pool| TimestampProbe { pool, scale })
-                .map_err(|e| {
-                    crate::observe::Emit::decline(
-                        "vk_timestamp_pool",
-                        &VkCall::new(VkOp::ContextCreateQueryPool, e),
-                    )
-                    .fail_once(0);
-                })
-                .ok()
-        });
         let draw_spans = scale
             .filter(|_| {
                 crate::config::read(crate::config::GPU_SPANS).0 != crate::config::Switch::Off
@@ -1503,14 +1407,12 @@ impl DeviceContext {
             features,
             explicit_linear_support: Mutex::new(HashMap::new()),
             depth_stencil_format,
-            timestamps,
             draw_spans,
             stamp_completion,
             queue_owner,
             pipeline_cache_path: Some(pipeline_cache_path),
             pipeline_cache_saved_len: AtomicUsize::new(initial_len),
             pipeline_cache_grew_at_ms: AtomicU64::new(0),
-            pipeline_creation_feedback,
             #[cfg(feature = "host-window")]
             swapchain,
         })
@@ -1625,9 +1527,6 @@ impl DeviceContext {
         // running.
         if let Some(mut completion) = self.stamp_completion.take() {
             unsafe { completion.stop(&self.device) };
-        }
-        if let Some(probe) = self.timestamps.take() {
-            self.device.destroy_query_pool(probe.pool, None);
         }
         if let Some(probe) = self.draw_spans.take() {
             self.device.destroy_query_pool(probe.pool, None);
@@ -2659,44 +2558,8 @@ mod draw_span_probe_tests {
         );
     }
 
-    /// The readback probe tiles its pool the same way, because it had the same
-    /// problem and did not know it.
-    ///
-    /// It held **one** three-query region for the device's life, on the written
-    /// argument that "the readback is serialized: the caller waits on this
-    /// copy's fence before it can start another". That stopped being true when
-    /// the guest-page writeback stopped waiting, leaving two writers sharing one
-    /// region with no synchronization between their submissions — a reset
-    /// executing while another submission's timestamps were pending, which the
-    /// Khronos validation layer reported as
-    /// `VUID-vkGetQueryPoolResults-None-09401` on a driven macos-11 boot.
-    ///
-    /// Asserting the tiling here is what stops the region going back to being
-    /// shared: a base that ignores its slot fails this immediately.
-    #[test]
-    fn the_readback_probe_gives_every_ring_slot_its_own_region() {
-        let bases: Vec<u32> = (0..super::super::pools::RING_DEPTH)
-            .map(TimestampProbe::base)
-            .collect();
-        for w in bases.windows(2) {
-            assert_eq!(
-                w[1] - w[0],
-                TimestampProbe::PER_SLOT,
-                "slot bases must tile the pool: {bases:?}"
-            );
-        }
-        assert_eq!(
-            bases.last().expect("the ring is not empty") + TimestampProbe::PER_SLOT,
-            TimestampProbe::PER_SLOT * super::super::pools::RING_DEPTH as u32,
-            "the pool is exactly as large as the ring needs"
-        );
-    }
-
-    /// A queue family that writes no timestamps yields no scale, so neither
-    /// probe is built and the census reports zero rather than a wrong number.
-    /// One constructor is what stops a mask being derived beside a period it
-    /// does not belong to — which is how the readback probe came to have a
-    /// period and no mask at all.
+    /// A queue family that writes no timestamps yields no scale, so the draw
+    /// span probe is not built. The period and valid-bit mask stay one answer.
     #[test]
     fn a_queue_family_without_timestamps_yields_no_scale() {
         assert!(TickScale::resolve(0, 1.0).is_none());

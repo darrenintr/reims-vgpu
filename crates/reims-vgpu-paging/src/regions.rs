@@ -100,17 +100,21 @@ pub struct WindowRegion {
 /// taken rather than derived so this module never has to guess which of the two
 /// a caller meant — the two have been conflated before, and a copy that reads
 /// `pitch` as `width` writes the padding.
+///
+/// `bytes_per_texel` is the destination format's texel width and is likewise
+/// taken, never assumed. Every texel coordinate below is a byte offset divided
+/// by it. This module used to fix it at four, which was right for the BGRA8
+/// overlay and wrong for the guest-page copy that also plans through here: a
+/// sixteen-byte `R32G32B32A32_UINT` compute output came out with every
+/// rectangle's `x` and `width` four times too large, and the copy wrote past
+/// each guest run into unrelated guest memory.
 #[derive(Clone, Copy, Debug)]
 pub struct WindowGeometry {
     pub pitch_bytes: u64,
     pub width_texels: u32,
     pub height_texels: u32,
+    pub bytes_per_texel: u64,
 }
-
-/// Bytes per texel. This rail is BGRA8 only — the device's `mapping_write`
-/// refuses any other format by name before reaching here, so widening this is
-/// a format decision made there and not a constant to generalise on spec.
-const BYTES_PER_TEXEL: u64 = 4;
 
 impl WindowGeometry {
     /// One past the last byte the frame's texels occupy: the last texel of the
@@ -120,7 +124,7 @@ impl WindowGeometry {
             return 0;
         }
         u64::from(self.height_texels - 1) * self.pitch_bytes
-            + u64::from(self.width_texels) * BYTES_PER_TEXEL
+            + u64::from(self.width_texels) * self.bytes_per_texel
     }
 }
 
@@ -135,14 +139,15 @@ impl WindowGeometry {
 /// and two fragments, so merging is the difference between three rectangles per
 /// run and four, over five hundred runs. It is only valid because the copy
 /// descriptor carries the row stride separately — the caller must set its
-/// buffer row length to `pitch_bytes / 4` for a merged rectangle to name the
+/// buffer row length to `pitch_bytes / bytes_per_texel` for a merged rectangle to name the
 /// bytes this function thinks it names.
 pub fn plan_regions(geom: &WindowGeometry, start: u64, end: u64) -> Vec<WindowRegion> {
     let mut out = Vec::new();
-    if geom.pitch_bytes == 0 || geom.width_texels == 0 || geom.height_texels == 0 {
+    let texel = geom.bytes_per_texel;
+    if geom.pitch_bytes == 0 || geom.width_texels == 0 || geom.height_texels == 0 || texel == 0 {
         return out;
     }
-    let row_texel_bytes = u64::from(geom.width_texels) * BYTES_PER_TEXEL;
+    let row_texel_bytes = u64::from(geom.width_texels) * texel;
     // Never past the frame: a window longer than the texels it describes must
     // not turn its tail into rows that do not exist.
     let end = end.min(geom.extent_end());
@@ -164,8 +169,8 @@ pub fn plan_regions(geom: &WindowGeometry, start: u64, end: u64) -> Vec<WindowRe
         if seg_start >= seg_end {
             continue;
         }
-        let x = (seg_start - row_start) / BYTES_PER_TEXEL;
-        let width = (seg_end - seg_start) / BYTES_PER_TEXEL;
+        let x = (seg_start - row_start) / texel;
+        let width = (seg_end - seg_start) / texel;
         if width == 0 {
             continue;
         }
@@ -208,11 +213,14 @@ mod tests {
     use super::*;
     use alloc::vec;
 
+    const BYTES_PER_TEXEL: u64 = 4;
+
     fn tight(width: u32, height: u32) -> WindowGeometry {
         WindowGeometry {
             pitch_bytes: u64::from(width) * BYTES_PER_TEXEL,
             width_texels: width,
             height_texels: height,
+            bytes_per_texel: BYTES_PER_TEXEL,
         }
     }
 
@@ -288,6 +296,7 @@ mod tests {
             pitch_bytes: 7808, // 1920 texels plus 128 bytes of padding
             width_texels: 1920,
             height_texels: 64,
+            bytes_per_texel: BYTES_PER_TEXEL,
         };
         for r in plan_regions(&g, 5000, 40_000) {
             let expected = u64::from(r.y) * g.pitch_bytes + u64::from(r.x) * BYTES_PER_TEXEL;
@@ -311,6 +320,7 @@ mod tests {
             pitch_bytes: 4096,
             width_texels: 1000, // 4000 bytes of texels, 96 bytes of padding
             height_texels: 8,
+            bytes_per_texel: BYTES_PER_TEXEL,
         };
         let regions = plan_regions(&g, 0, g.extent_end());
         assert!(!regions.is_empty());
@@ -352,6 +362,7 @@ mod tests {
             pitch_bytes: 0,
             width_texels: 4,
             height_texels: 4,
+            bytes_per_texel: BYTES_PER_TEXEL,
         };
         assert!(plan_regions(&zero_pitch, 0, 64).is_empty());
         assert!(plan_regions(&tight(0, 4), 0, 64).is_empty());
@@ -360,5 +371,85 @@ mod tests {
         let g = tight(16, 16);
         assert!(plan_regions(&g, 100, 100).is_empty());
         assert!(plan_regions(&g, 200, 100).is_empty());
+    }
+
+    /// A wide texel is planned in its own width, and every rectangle stays
+    /// inside the bytes of the range it was planned from.
+    ///
+    /// The shape is the one that reset a live macOS 13 guest at login: a
+    /// 1504x6016 `R32G32B32A32_UINT` compute output under a 24576-byte guest
+    /// pitch, landed through 4 KiB runs. At a fixed four bytes a texel each
+    /// rectangle named four times the texels its run held, so the copy wrote
+    /// past the run into whatever guest memory followed it.
+    #[test]
+    fn a_sixteen_byte_texel_stays_inside_its_run() {
+        const RUN: u64 = 4096;
+        let g = WindowGeometry {
+            pitch_bytes: 24_576,
+            width_texels: 1504,
+            height_texels: 6016,
+            bytes_per_texel: 16,
+        };
+        assert_eq!(g.extent_end(), 6015 * 24_576 + 1504 * 16);
+        let mut seen = vec![0u8; 1504 * 6016];
+        let mut offset = 0u64;
+        while offset < g.extent_end() {
+            let end = (offset + RUN).min(g.extent_end());
+            for r in plan_regions(&g, offset, end) {
+                assert!(r.x + r.width <= g.width_texels, "{r:?} leaves the row");
+                let last = u64::from(r.y + r.height - 1) * g.pitch_bytes
+                    + u64::from(r.x + r.width) * g.bytes_per_texel;
+                assert!(
+                    r.window_offset >= offset && last <= end,
+                    "{r:?} names bytes outside [{offset}, {end})"
+                );
+                for row in r.y..r.y + r.height {
+                    for col in r.x..r.x + r.width {
+                        seen[(row as usize) * 1504 + col as usize] += 1;
+                    }
+                }
+            }
+            offset = end;
+        }
+        assert!(seen.iter().all(|&n| n == 1), "every texel exactly once");
+    }
+}
+
+#[cfg(test)]
+mod rgba32_tests {
+    use super::*;
+    #[test]
+    fn rgba32_rectangles_match_bytes_and_fit_every_guest_run() {
+        let g = WindowGeometry {
+            pitch_bytes: 24576,
+            bytes_per_texel: 16,
+            width_texels: 1504,
+            height_texels: 6016,
+        };
+        assert_eq!(g.extent_end(), 147848704);
+        let first = plan_regions(&g, 0, 4096);
+        assert_eq!((first[0].x, first[0].width), (0, 256));
+        let tail = plan_regions(&g, 16384, 24576);
+        assert_eq!((tail[0].x, tail[0].width), (1024, 480));
+        for run_size in [4096, 16384, 65536] {
+            let mut copied = 0;
+            for start in (0..g.extent_end()).step_by(run_size) {
+                let end = (start + run_size as u64).min(g.extent_end());
+                for r in plan_regions(&g, start, end) {
+                    assert!(r.x + r.width <= g.width_texels);
+                    assert!(r.y + r.height <= g.height_texels);
+                    assert_eq!(
+                        r.window_offset,
+                        u64::from(r.y) * g.pitch_bytes + u64::from(r.x) * 16
+                    );
+                    let planned_end = r.window_offset
+                        + u64::from(r.height - 1) * g.pitch_bytes
+                        + u64::from(r.width) * 16;
+                    assert!(r.window_offset >= start && planned_end <= end);
+                    copied += u64::from(r.width) * u64::from(r.height) * 16;
+                }
+            }
+            assert_eq!(copied, 144769024);
+        }
     }
 }

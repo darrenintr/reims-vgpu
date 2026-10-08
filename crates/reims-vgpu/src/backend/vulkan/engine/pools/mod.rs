@@ -12,13 +12,13 @@ use std::time::Instant;
 use super::buffer_slab::{BufferSlabToken, BUFFER_SLAB_IDLE_KEEP_EMPTY};
 use super::caches::{FramebufferCompatibilityKey, PassCompatibilityKey};
 use super::compute_execution::ComputeExecutionDecline;
-use super::context::{DeviceContext, DrawSpanProbe, TimestampProbe, FENCE_TIMEOUT_NS};
+use super::context::{DeviceContext, FENCE_TIMEOUT_NS};
 use super::counters::{CreateSite, EngineCounters};
 use super::desc_arena::{DescriptorArena, DESC_BLOCK_MAX_SETS};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::types::{DrawError, ResidentReclaim, StorageImageFormat, TargetIdentity};
 use super::vk_call::{VkCall, VkOp};
-use super::{buffer_slab, color_subresource_range, gpu_span, host_ram, reason, slab, types};
+use super::{buffer_slab, color_subresource_range, host_ram, reason, slab, types};
 use crate::backend::vulkan::caps::{MappedMemoryKind, MemoryClass};
 use crate::backend::vulkan::translate;
 use crate::model::ComputeStorageResidencyKey;
@@ -1153,18 +1153,6 @@ struct CmdSlot {
     cmd_buf: vk::CommandBuffer,
     fence: vk::Fence,
     pending: Option<PendingGpuCleanup>,
-    /// Whether this slot's GPU timestamp pair has been written, and how far.
-    /// Read and cleared when the slot retires, which is the first moment the
-    /// fence makes the queries readable. See [`super::gpu_span`].
-    span: gpu_span::SlotSpan,
-    /// Whether this slot's copy command buffer armed the three-query readback
-    /// region belonging to it.
-    ///
-    /// Same lifetime rule as [`Self::span`] and for the same reason — the fence
-    /// is what makes the region readable — but a separate flag because the two
-    /// probes are armed by different callers and a slot can carry either, both
-    /// or neither. Set by `readback_span_arm`, cleared by the read at retire.
-    readback_span_armed: bool,
 }
 
 /// In-flight ring depth: the next draw/dispatch records + submits while
@@ -1247,17 +1235,6 @@ const _: () = assert!(
 const _: () = assert!(
     RING_DEPTH <= SlotMask::BITS as usize,
     "SlotMask must have one bit per ring slot"
-);
-
-/// The hang trail keeps one outstanding-submission record per ring slot, and it
-/// cannot name [`RING_DEPTH`] itself: that module compiles on the Metal-direct
-/// arm too, where `backend::vulkan` does not exist. This is the only place both
-/// constants are in scope, so the relation is asserted here. A trail too short
-/// would drop exactly the slot a wedge is on and report `outstanding` as if the
-/// ring were shallower than it is.
-const _: () = assert!(
-    RING_DEPTH <= crate::runtime::gpu_hang_trail::SUBMIT_SLOTS,
-    "the hang trail must hold one submission record per ring slot"
 );
 
 /// A GPU object displaced while a CB may still reference it. Destroyed only

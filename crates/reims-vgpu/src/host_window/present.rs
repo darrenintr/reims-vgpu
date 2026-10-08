@@ -841,10 +841,6 @@ struct App {
     /// forward by every redraw request, so a steady publish stream never lets it
     /// fire; see [`WINDOW_REDRAW_BACKSTOP`] for what it is a floor under.
     next_backstop: std::time::Instant,
-    /// The refresh rate last reported for the monitor the window is on, in mHz;
-    /// `Some(None)` is "asked and the platform could not say". Kept so
-    /// `host_window_display` is a line per change, not per event.
-    reported_refresh: Option<Option<u32>>,
     /// Frame seq the drawable currently holds, or `None` before the first
     /// present.
     last_presented_seq: Option<u64>,
@@ -1007,7 +1003,6 @@ impl ApplicationHandler<WindowWake> for App {
                 // Kick the first frame; RedrawRequested re-arms each subsequent
                 // one, so without this the window would never draw.
                 window.request_redraw();
-                self.note_display_refresh(&window);
                 self.window = Some(window);
                 // The device may have published its cursor before this window
                 // existed; the slot kept it.
@@ -1060,11 +1055,6 @@ impl ApplicationHandler<WindowWake> for App {
             WindowEvent::Resized(size) => {
                 self.trace_window_event("resized", format!("size={}x{}", size.width, size.height));
                 self.note_resized((size.width.max(1), size.height.max(1)));
-            }
-            WindowEvent::Moved(_) => {
-                if let Some(window) = self.window.clone() {
-                    self.note_display_refresh(&window);
-                }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 // No action of its own: the physical size it implies arrives as
@@ -1240,35 +1230,6 @@ fn redraw_due(frame_pending: bool, now: std::time::Instant, backstop: std::time:
 }
 
 impl App {
-    /// Say what the monitor under the window can display, when that changes.
-    ///
-    /// `present_hz` counts frames handed to the swapchain, and MAILBOX will take
-    /// more of them than a panel scans out. Without the panel's rate beside it, a
-    /// reading above 60 on a 60 Hz monitor looks like headroom and is not, and a
-    /// reading of 60 on a 120 Hz monitor looks like a cap and may be one. `None`
-    /// is the platform declining to say, reported as `unknown` rather than
-    /// guessed.
-    fn note_display_refresh(&mut self, window: &Window) {
-        let monitor = window.current_monitor();
-        let refresh_mhz = monitor
-            .as_ref()
-            .and_then(winit::monitor::MonitorHandle::refresh_rate_millihertz);
-        if self.reported_refresh == Some(refresh_mhz) {
-            return;
-        }
-        self.reported_refresh = Some(refresh_mhz);
-        let name = monitor
-            .and_then(|m| m.name())
-            .unwrap_or_else(|| String::from("unknown"));
-        crate::observe::off(match refresh_mhz {
-            Some(mhz) => format!(
-                "host_window_display refresh_mhz={mhz} refresh_hz={:.2} monitor={name:?}",
-                f64::from(mhz) / 1_000.0
-            ),
-            None => format!("host_window_display refresh_mhz=unknown monitor={name:?}"),
-        });
-    }
-
     /// A window that has not opened yet.
     ///
     /// Both entry points build one — [`run`] on the calling thread and
@@ -1303,7 +1264,6 @@ impl App {
             // guest frame.
             frame_pending: true,
             next_backstop: std::time::Instant::now(),
-            reported_refresh: None,
             last_presented_seq: None,
             redraw_required: true,
             guest_extent: None,

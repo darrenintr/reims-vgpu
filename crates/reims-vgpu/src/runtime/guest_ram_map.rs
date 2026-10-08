@@ -226,6 +226,71 @@ crate::observe::decline_display!(MapRefusal);
 /// The greppable event class for this module's refusals.
 const EVENT: &str = "guest_ram_map";
 
+/// The admission contract for turning a scattered guest window into bounded
+/// RAMBlock references.
+///
+/// This type owns the one exception to the ordinary whole-map rule. A complete
+/// compute target may be *described* while the standing refusal is only
+/// [`MapRefusal::ImportExceedsHeap`], because the Vulkan engine admits all of
+/// that target's unique parents atomically before recording GPU work. No other
+/// refusal is widened, and no other caller can express that exception as a
+/// boolean or by re-reading the heap limit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RunResolver {
+    admission: RunAdmission,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunAdmission {
+    WholeMap,
+    CompleteTarget,
+}
+
+impl RunResolver {
+    /// The ordinary rail: a standing refusal refuses every reference.
+    pub(crate) const fn whole_map() -> Self {
+        Self {
+            admission: RunAdmission::WholeMap,
+        }
+    }
+
+    /// A complete operation whose backend will admit all required parents
+    /// before recording work. Currently used only by mapper-ref compute output.
+    pub(crate) const fn complete_target() -> Self {
+        Self {
+            admission: RunAdmission::CompleteTarget,
+        }
+    }
+
+    /// The standing refusal this resolver must obey, if any.
+    pub(crate) fn standing_refusal<H: HostOps + ?Sized>(
+        self,
+        host: &mut H,
+    ) -> Option<MapRefusal> {
+        let refusal = standing_refusal(host)?;
+        match (self.admission, refusal) {
+            (RunAdmission::CompleteTarget, MapRefusal::ImportExceedsHeap { .. }) => None,
+            _ => Some(refusal),
+        }
+    }
+
+    /// Resolve one scattered window under this admission contract.
+    pub(crate) fn references_for_runs<H: HostOps + ?Sized>(
+        self,
+        host: &mut H,
+        gpas: &[u64],
+        page_size: u64,
+        in_page: u64,
+        len: u64,
+    ) -> Result<Vec<GuestWindowRun>, MapRefusal> {
+        references_for_runs_with_resolver(self, host, gpas, page_size, in_page, len)
+    }
+
+    fn admits_whole_guest_over_budget(self) -> bool {
+        self.admission == RunAdmission::CompleteTarget
+    }
+}
+
 /// The imports this process holds, or the refusal that stopped it building any.
 ///
 /// Resolved once and then read. A `Mutex` rather than a `OnceLock` because a
@@ -332,6 +397,7 @@ pub fn span_census() -> (usize, u64) {
     MAP.lock()
         .unwrap_or_else(|p| p.into_inner())
         .as_ref()
+        .filter(|r| r.refusal.is_none())
         .map(|r| (r.imports.len(), r.imports.iter().map(|i| i.len()).sum()))
         .unwrap_or((0, 0))
 }
@@ -344,6 +410,7 @@ pub fn imports() -> Vec<Arc<GuestRamImport>> {
     MAP.lock()
         .unwrap_or_else(|p| p.into_inner())
         .as_ref()
+        .filter(|r| r.refusal.is_none())
         .map(|r| r.imports.clone())
         .unwrap_or_default()
 }
@@ -553,6 +620,17 @@ pub fn references_for_runs<H: HostOps + ?Sized>(
     in_page: u64,
     len: u64,
 ) -> Result<Vec<GuestWindowRun>, MapRefusal> {
+    RunResolver::whole_map().references_for_runs(host, gpas, page_size, in_page, len)
+}
+
+fn references_for_runs_with_resolver<H: HostOps + ?Sized>(
+    resolver: RunResolver,
+    host: &mut H,
+    gpas: &[u64],
+    page_size: u64,
+    in_page: u64,
+    len: u64,
+) -> Result<Vec<GuestWindowRun>, MapRefusal> {
     if gpas.is_empty() || page_size == 0 || len == 0 {
         return Err(report_once(MapRefusal::Scattered {
             pages: gpas.len(),
@@ -572,7 +650,12 @@ pub fn references_for_runs<H: HostOps + ?Sized>(
 
     with_map(host, |resolved| {
         if let Some(refusal) = resolved.refusal {
-            return Err(report_once(refusal));
+            let admitted = resolver.admits_whole_guest_over_budget()
+                && matches!(refusal, MapRefusal::ImportExceedsHeap { .. });
+            if !admitted {
+                return Err(report_once(refusal));
+            }
+            crate::runtime::drain::note_store_route("guest_ram_selective_heap");
         }
         let mut out = Vec::new();
         for run in reims_vgpu_paging::runs::contig_page_runs(gpas, page_size) {
@@ -796,15 +879,16 @@ fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
     // outcome that is worse than either.
     let needed: u64 = imports.iter().map(|i| i.len()).sum();
     let over_budget = import_budget().filter(|budget| needed > *budget);
-    if let Some(budget) = over_budget {
-        return Resolved {
-            imports: Vec::new(),
-            refusal: Some(MapRefusal::ImportExceedsHeap { needed, budget }),
-        };
-    }
-    let refusal = imports
-        .is_empty()
-        .then_some(MapRefusal::NoUsableRegion { spans: count });
+    let refusal = if let Some(budget) = over_budget {
+        // Keep the bounded descriptors private so the compute-specific
+        // selective path can ask whether *its* complete target fits. Every
+        // existing public accessor still treats this as an empty, refused map.
+        Some(MapRefusal::ImportExceedsHeap { needed, budget })
+    } else {
+        imports
+            .is_empty()
+            .then_some(MapRefusal::NoUsableRegion { spans: count })
+    };
     // Once per boot, because this is what makes `guest_import_levels`'s
     // denominator interpretable. That line reports `imported/reported` and a
     // reader seeing `1/4` cannot tell which three went untouched, or whether the
@@ -1161,6 +1245,39 @@ mod tests {
                 imports().len(),
                 0,
                 "and must not leave a partial import behind"
+            );
+        });
+    }
+
+    /// The ordinary rail remains all-or-nothing on an oversized guest, while
+    /// the compute-only resolver may still describe a bounded target so the
+    /// engine can decide atomically whether that target's parents fit.
+    #[test]
+    fn selective_heap_resolution_does_not_widen_the_ordinary_map() {
+        const PAGE: u64 = 0x1000;
+        let needed = two_spans_bytes();
+        with_budget(PAGE, needed - 1, || {
+            let mut host = two_spans();
+            let gpas = [PAGE, 2 * PAGE];
+
+            assert!(matches!(
+                references_for_runs(&mut host, &gpas, PAGE, 0, 2 * PAGE),
+                Err(MapRefusal::ImportExceedsHeap { .. })
+            ));
+            assert!(
+                imports().is_empty(),
+                "the public whole-map view must stay refused"
+            );
+
+            let runs = RunResolver::complete_target()
+                .references_for_runs(&mut host, &gpas, PAGE, 0, 2 * PAGE)
+                .expect("compute may describe the target for engine admission");
+            assert_eq!(runs.len(), 1);
+            assert_eq!(runs[0].window_offset, 0);
+            assert_eq!(runs[0].guest.requested(), 2 * PAGE);
+            assert!(
+                imports().is_empty(),
+                "selective resolution must not silently enable other rails"
             );
         });
     }

@@ -96,8 +96,25 @@ pub enum DrawReason {
     MultisampleResidentTargetMissing {
         sample_count: u32,
     },
+    /// A non-resolving multisample draw would need its samples to cross a
+    /// single-sample linear copy, and this device has no contract for that.
+    ///
+    /// The guest strides a multisample texture's linear span for every sample
+    /// (`bpr = samples * width * bpp` on rail macos-15; see the runtime test
+    /// `a_multisample_linear_target_keeps_its_guest_bytes_instead_of_a_one_sample_clear`).
+    /// The order of the samples inside that span is unrecovered. Vulkan also
+    /// cannot copy between a buffer and a multisample image at all. So neither
+    /// direction has a lawful realization: a seed would put one sample's bytes
+    /// where the guest laid out four, and a readback would publish one sample
+    /// over four. The draw is refused rather than given either.
+    ///
+    /// `transfer` is which of the four the draw needed. They have different
+    /// owners: a readback comes from a Store no resident rail claimed, and a
+    /// seed or a backing load comes from a Load or DontCare prefix. A count that
+    /// cannot tell them apart cannot say which owner to change.
     MultisampleLinearTransferUnsupported {
         sample_count: u32,
+        transfer: MultisampleLinearTransfer,
     },
     MultisampleSampleCountUnsupported {
         requested: u32,
@@ -398,6 +415,51 @@ impl crate::observe::Decline for DrawReason {
     }
 }
 
+/// The single-sample linear copy a non-resolving multisample draw asked for.
+/// See [`DrawReason::MultisampleLinearTransferUnsupported`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MultisampleLinearTransfer {
+    /// The pass would start from CPU bytes (`DrawRequest::target_rgba8`).
+    HostSeed,
+    /// The pass would start from guest pages (`DrawRequest::target_guest_seed`).
+    GuestSeed,
+    /// The pass would load the resident's guest backing before it begins
+    /// (`DrawRequest::load_guest_target_backing`).
+    GuestBackingLoad,
+    /// The pass's Store would be read back to the CPU for a guest writeback,
+    /// because no resident rail claimed it (`!DrawRequest::skip_readback`).
+    Readback,
+}
+
+impl MultisampleLinearTransfer {
+    /// The first transfer `req` asks of its colour attachment, in the order
+    /// the engine would do them: the seeds before the pass, the readback
+    /// after it. `None` means the samples never leave the resident.
+    pub fn first_asked(req: &super::types::DrawRequest) -> Option<Self> {
+        if req.target_rgba8.is_some() {
+            Some(Self::HostSeed)
+        } else if req.target_guest_seed.is_some() {
+            Some(Self::GuestSeed)
+        } else if req.load_guest_target_backing {
+            Some(Self::GuestBackingLoad)
+        } else if !req.skip_readback {
+            Some(Self::Readback)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::HostSeed => "host_seed",
+            Self::GuestSeed => "guest_seed",
+            Self::GuestBackingLoad => "guest_backing_load",
+            Self::Readback => "readback",
+        }
+    }
+}
+
 impl std::fmt::Display for DrawReason {
     /// `reason=<slug>` plus the fields that make the line actionable. A decline
     /// naming only its class leaves the reader without the number that caused
@@ -434,10 +496,17 @@ impl std::fmt::Display for DrawReason {
             Self::MultisampleAttachmentSampleCountMismatch { attachment, raster } => {
                 write!(f, " attachment={attachment} raster={raster}")
             }
-            Self::MultisampleResidentTargetMissing { sample_count }
-            | Self::MultisampleLinearTransferUnsupported { sample_count } => {
+            Self::MultisampleResidentTargetMissing { sample_count } => {
                 write!(f, " sample_count={sample_count}")
             }
+            Self::MultisampleLinearTransferUnsupported {
+                sample_count,
+                transfer,
+            } => write!(
+                f,
+                " sample_count={sample_count} transfer={}",
+                transfer.name()
+            ),
             Self::MultisampleSampleCountUnsupported { requested, limit } => {
                 write!(f, " requested={requested} limit={limit}")
             }
@@ -662,7 +731,10 @@ mod tests {
             raster: 2,
         },
         DrawReason::MultisampleResidentTargetMissing { sample_count: 4 },
-        DrawReason::MultisampleLinearTransferUnsupported { sample_count: 4 },
+        DrawReason::MultisampleLinearTransferUnsupported {
+            sample_count: 4,
+            transfer: MultisampleLinearTransfer::Readback,
+        },
         DrawReason::MultisampleSampleCountUnsupported {
             requested: 4,
             limit: 1,
@@ -782,6 +854,51 @@ mod tests {
         let before = slugs.len();
         slugs.dedup();
         assert_eq!(before, slugs.len(), "duplicate DrawReason slug");
+    }
+
+    /// A refused multisample draw names the transfer it needed. Each of the
+    /// four request fields that would move samples through a single-sample
+    /// linear copy maps to its own name, and a request that keeps its samples
+    /// on the resident asks for none.
+    #[test]
+    fn a_multisample_linear_refusal_names_the_transfer_it_needed() {
+        use super::super::types::DrawRequest;
+        use MultisampleLinearTransfer as T;
+
+        let resident_only = DrawRequest {
+            skip_readback: true,
+            ..DrawRequest::default()
+        };
+        assert_eq!(T::first_asked(&resident_only), None);
+
+        let readback = DrawRequest {
+            skip_readback: false,
+            ..DrawRequest::default()
+        };
+        assert_eq!(T::first_asked(&readback), Some(T::Readback));
+
+        let backing = DrawRequest {
+            skip_readback: true,
+            load_guest_target_backing: true,
+            ..DrawRequest::default()
+        };
+        assert_eq!(T::first_asked(&backing), Some(T::GuestBackingLoad));
+
+        let host_seed = DrawRequest {
+            skip_readback: true,
+            target_rgba8: Some(std::sync::Arc::new(vec![0; 16])),
+            ..DrawRequest::default()
+        };
+        assert_eq!(T::first_asked(&host_seed), Some(T::HostSeed));
+
+        let reason = DrawReason::MultisampleLinearTransferUnsupported {
+            sample_count: 4,
+            transfer: T::first_asked(&readback).expect("asked"),
+        };
+        assert_eq!(
+            reason.to_string(),
+            "reason=multisample_linear_transfer_unsupported sample_count=4 transfer=readback"
+        );
     }
 
     #[test]

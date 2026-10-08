@@ -566,10 +566,6 @@ pub(crate) struct WindowPresenter {
     /// no swapchain to acquire from. A minimized window, and its own counter
     /// because `busy = fence + acquire` was an identity worth keeping true.
     cadence_busy_no_area: u64,
-    /// Busy refusals over the life of the presenter, never reset: the interval
-    /// census differences it between two presents.
-    busy_total_ever: u64,
-    intervals: crate::runtime::frame_interval::FrameIntervals,
     /// Whether the run in progress is a window with no area, so the reason is
     /// stated when the run starts and not on every frame of it.
     surface_had_no_area: bool,
@@ -861,8 +857,6 @@ impl WindowPresenter {
             cadence_busy_fence: 0,
             cadence_busy_acquire: 0,
             cadence_busy_no_area: 0,
-            busy_total_ever: 0,
-            intervals: crate::runtime::frame_interval::FrameIntervals::default(),
             surface_had_no_area: false,
             // Attach refused above unless this was true, so the presenter that
             // exists is one whose queue can address its surface.
@@ -1857,15 +1851,8 @@ impl WindowPresenter {
         if presented {
             self.cadence_presents = self.cadence_presents.saturating_add(1);
             self.cadence_direct = self.cadence_direct.saturating_add(u64::from(direct));
-            self.intervals
-                .note_present(crate::runtime::frame_interval::PresentStamp {
-                    now_us: crate::observe::elapsed_us(),
-                    drain_idle_total_us: crate::runtime::drain::drain_idle_total_us(),
-                    busy_total: self.busy_total_ever,
-                });
         } else {
             self.cadence_busy = self.cadence_busy.saturating_add(1);
-            self.busy_total_ever = self.busy_total_ever.saturating_add(1);
         }
         let elapsed = self.cadence_started.elapsed();
         if elapsed.as_millis() < 1_000 {
@@ -1883,9 +1870,6 @@ impl WindowPresenter {
             },
             self.cadence_offered,
         ));
-        if let Some(line) = self.intervals.take_line() {
-            crate::observe::off(line);
-        }
         self.cadence_started = Instant::now();
         self.cadence_presents = 0;
         self.cadence_direct = 0;

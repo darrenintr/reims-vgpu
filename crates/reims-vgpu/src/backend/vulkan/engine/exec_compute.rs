@@ -660,11 +660,15 @@ pub(crate) unsafe fn execute_compute_inner(
         .unwrap_or(0) as u64;
         let resident_copy = match &resource.source {
             ComputeSampledSource::ResidentCopy(bind) => Some(*bind),
-            ComputeSampledSource::Bytes(_) => None,
+            ComputeSampledSource::Bytes(_) | ComputeSampledSource::TargetCopy(_) => None,
             // Returned above.
             ComputeSampledSource::MultisampleTarget(_) => unreachable!(),
         };
-        if resident_copy.is_some() && resource.mip_levels > 1 {
+        let target_copy = match &resource.source {
+            ComputeSampledSource::TargetCopy(identity) => Some(identity),
+            _ => None,
+        };
+        if (resident_copy.is_some() || target_copy.is_some()) && resource.mip_levels > 1 {
             // A resident is one window at one level. Seeding a pyramid's base
             // from it would leave every level above it empty, which reads as a
             // texture whose upper levels were never written — the exact defect
@@ -676,7 +680,57 @@ pub(crate) unsafe fn execute_compute_inner(
                 },
             ));
         }
-        let (upload, resident_src) = if let Some(bind) = resident_copy {
+        let (upload, resident_src) = if let Some(identity) = target_copy {
+            // Marked before the lookup, for the reason the multisample arm
+            // above gives: a target the guest is still sampling must not age
+            // out between a refusal and the next attempt.
+            pools.registry_note_sampled_use(identity);
+            let held = pools.registry_get(identity).map(|slot| {
+                (
+                    slot.image,
+                    slot.access,
+                    slot.content_ready,
+                    slot.sample_count,
+                    slot.width,
+                    slot.height,
+                    slot.format.declared(),
+                )
+            });
+            let Some((image, access, content_ready, samples, width, height, format)) = held else {
+                return Err(DrawError::ComputeExecution(
+                    ComputeExecutionDecline::TargetSampleAbsent {
+                        binding: resource.binding,
+                        identity: identity.clone(),
+                        prior: pools.prior_reclaim(identity),
+                    },
+                ));
+            };
+            // An image copy converts nothing, so the target has to hold the
+            // binding's own texels at the binding's own extent.
+            if !content_ready
+                || samples != 1
+                || width != resource.width
+                || height != resource.height
+                || format != resource.format.vk_format()
+            {
+                return Err(DrawError::ComputeExecution(
+                    ComputeExecutionDecline::TargetSampleUnusable {
+                        binding: resource.binding,
+                        identity: identity.clone(),
+                        content_ready,
+                        resident_samples: samples,
+                        resident_width: width,
+                        resident_height: height,
+                        resident_format: format,
+                        resource_width: resource.width,
+                        resource_height: resource.height,
+                        resource_format: resource.format,
+                    },
+                ));
+            }
+            counters.note_compute_sampled_resident_copy(staged_bytes);
+            (None, Some((image, access)))
+        } else if let Some(bind) = resident_copy {
             // The caller skipped the guest read; nothing may be uploaded here.
             // Every mismatch names the check that refused.
             let Some((src_image, src_key, generation, src_access)) =
@@ -799,9 +853,41 @@ pub(crate) unsafe fn execute_compute_inner(
                 pools.acquire_readback_extra(ctx, resource.bytes.len() as u64, counters)?,
             ),
             super::types::ComputeImageDestination::GuestPages { target, .. } => {
-                ComputeImageDst::Direct(unsafe {
-                    super::plan_guest_copy(ctx, pools, counters, target)?
-                })
+                match unsafe {
+                    pools.prepare_guest_ram_refs(
+                        ctx,
+                        target.runs.iter().map(|run| &run.guest),
+                    )
+                } {
+                    Ok(()) => ComputeImageDst::Direct(unsafe {
+                        super::plan_guest_copy(ctx, pools, counters, target)?
+                    }),
+                    Err(decline) => {
+                        // The runtime deliberately offered a selective target on
+                        // a whole-guest heap refusal. It is direct only when the
+                        // complete set fits and every required parent imports
+                        // before any copy resource is acquired; otherwise this
+                        // storage output stays on the exact readback arm it
+                        // would have taken before the selective candidate existed.
+                        crate::runtime::drain::note_store_route(
+                            "compute_direct_preflight_fallback",
+                        );
+                        if crate::observe::first_sight(
+                            "compute_direct_preflight_fallback",
+                            u64::from(resource.binding),
+                        ) {
+                            crate::observe::off(format!(
+                                "compute_direct_preflight_fallback bind={} dims={}x{} reason={decline:?}",
+                                resource.binding, resource.width, resource.height
+                            ));
+                        }
+                        ComputeImageDst::Readback(pools.acquire_readback_extra(
+                            ctx,
+                            resource.bytes.len() as u64,
+                            counters,
+                        )?)
+                    }
+                }
             }
         };
         simg_slots.push(PreparedStorageImage {
@@ -911,13 +997,7 @@ pub(crate) unsafe fn execute_compute_inner(
     // The ring slot's CB retired at begin_entry and its fence is unsignaled —
     // no pre-record wait remains (pre_record_wait_us stays 0 on this path).
     unsafe {
-        pools.begin_slot_recording(
-            ctx,
-            cb,
-            super::gpu_span::Kind::Compute,
-            VkOp::ComputeExecResetCb,
-            VkOp::ComputeExecBeginCb,
-        )?
+        pools.begin_slot_recording(ctx, cb, VkOp::ComputeExecResetCb, VkOp::ComputeExecBeginCb)?
     };
 
     // Seed sampled images (staging upload or resident device copy)
@@ -1386,7 +1466,6 @@ pub(crate) unsafe fn execute_compute_inner(
         );
     }
 
-    unsafe { pools.gpu_span_seal_current(ctx, cb) };
     ctx.device
         .end_command_buffer(cb)
         .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ComputeExecEndCb, e)))?;
