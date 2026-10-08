@@ -393,9 +393,27 @@ build_reims_vgpu_efi() {
   "$REIMS_VGPU_EFI_ROM_SCRIPT" || die "reims-vgpu-efi build failed"
 }
 
+# A pinned prebuilt QEMU bundle already includes its matching GOP ROM and
+# shader utilities. Keep the default in-tree build-on-boot path unchanged.
+if [ "$QEMU_BIN" != "$QEMU_BIN_DEFAULT" ]; then
+  _pinned_bin_dir="$(cd "$(dirname "$QEMU_BIN")" && pwd -P)"
+  if [ -x "$_pinned_bin_dir/llvm-dis" ] && [ -x "$_pinned_bin_dir/spirv-val" ]; then
+    export PATH="$_pinned_bin_dir:$PATH"
+  fi
+  if [ -z "${REIMS_VGPU_GOP_ROM+x}" ] && [ -r "$_pinned_bin_dir/../firmware/reims-vgpu-gop.rom" ]; then
+    REIMS_VGPU_GOP_ROM="$(readlink -f "$_pinned_bin_dir/../firmware/reims-vgpu-gop.rom")"
+    echo "boot-x86.sh: prebuilt bundle GOP: $REIMS_VGPU_GOP_ROM"
+  fi
+fi
+
 require_shader_toolchain
-ensure_rust_tools
-build_reims_vgpu_efi
+if [ "$QEMU_BIN" != "$QEMU_BIN_DEFAULT" ] && [ "${REIMS_VGPU_GOP_ROM+x}" ]; then
+  [ -z "$REIMS_VGPU_GOP_ROM" ] || [ -r "$REIMS_VGPU_GOP_ROM" ] || die "GOP ROM not readable: $REIMS_VGPU_GOP_ROM"
+  echo "boot-x86.sh: using pinned GOP ROM; skipping EFI rebuild"
+else
+  ensure_rust_tools
+  build_reims_vgpu_efi
+fi
 # Product Linux x86 rail needs Vulkan. Override REIMS_VGPU_BACKEND only for an explicit
 # alternate build.
 if [ "$QEMU_BIN" = "$QEMU_BIN_DEFAULT" ]; then
