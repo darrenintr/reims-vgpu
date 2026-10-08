@@ -1,0 +1,61 @@
+name: Build Reims QEMU (Linux x86_64)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, ci/qemu-linux-bundle]
+    paths: ['.github/workflows/build-linux-qemu.yml', 'Cargo.toml', 'Cargo.lock', 'crates/**', 'scripts/qemu-build/**', 'vendor/qemu', 'vm/boot-x86.sh']
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-uefi
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config ninja-build meson python3 python3-venv \
+            libglib2.0-dev libpixman-1-dev libslirp-dev libnuma-dev \
+            libgtk-3-dev libsdl2-dev libsdl2-image-dev \
+            libpipewire-0.3-dev libpulse-dev libasound2-dev \
+            libcapstone-dev libgnutls28-dev libgcrypt20-dev \
+            libfdt-dev liburing-dev libseccomp-dev libusb-1.0-0-dev \
+            libcap-ng-dev zlib1g-dev libzstd-dev liblz4-dev libbzip2-dev \
+            libvulkan1 llvm spirv-tools zstd
+      - name: Build Reims PCI GOP ROM
+        run: bash crates/reims-vgpu-efi/scripts/reims-vgpu-efi-rom/reims-vgpu-efi-rom.sh
+      - name: Build QEMU with linked Reims Vulkan backend
+        run: bash scripts/qemu-build/qemu-build.sh --target x86_64 --backend vulkan
+      - name: Package and smoke-test
+        run: bash scripts/qemu-build/package-linux-bundle.sh
+      - name: Verify extracted archive
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bundle-test"
+          tar -I zstd -xf dist/reims-qemu-linux-x86_64.tar.zst -C "$RUNNER_TEMP/bundle-test"
+          bundle="$RUNNER_TEMP/bundle-test/reims-qemu-linux-x86_64"
+          test -s "$bundle/firmware/reims-vgpu-gop.rom"
+          test -f "$bundle/share/qemu/efi-virtio.rom"
+          "$bundle/bin/qemu-system-x86_64" --version
+          "$bundle/bin/qemu-system-x86_64" -device reims-vgpu-pci,help
+          (cd "$bundle" && sha256sum -c SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reims-qemu-linux-x86_64
+          path: dist/reims-qemu-linux-x86_64.tar.zst
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

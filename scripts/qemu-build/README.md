@@ -52,3 +52,37 @@ QEMU_BIN=$PWD/vendor/qemu/build/qemu-system-x86_64 vm/boot-x86.sh --device reims
 - **aarch64 + metal:** macOS, Xcode CLT, HVF/Cocoa.
 - **aarch64 + vulkan:** macOS, Xcode CLT, HVF/Cocoa, Vulkan loader, and MoltenVK ICD.
 - **x86_64:** Linux QEMU build deps; KVM for boots.
+
+## Prebuilt Linux QEMU (GitHub Actions)
+
+The workflow at `.github/workflows/build-linux-qemu.yml` builds the pinned
+QEMU submodule on Ubuntu 24.04, links the Vulkan/host-window Reims Rust
+staticlib, builds the PCI GOP option ROM, and uploads a compressed artifact.
+It runs for relevant pushes and pull requests, and supports manual dispatch
+once present on the repository's default branch.
+
+Download the `reims-qemu-linux-x86_64` artifact from a successful run, then:
+
+```bash
+tar -I zstd -xf reims-qemu-linux-x86_64.tar.zst
+BUNDLE="$PWD/reims-qemu-linux-x86_64"
+cd /path/to/reims-vgpu
+QEMU_BIN="$BUNDLE/bin/qemu-system-x86_64" \
+  vm/boot-x86.sh --interactive --device reims-vgpu-pci --rail macos-13
+```
+
+Use the wrapper `bin/qemu-system-x86_64`, not its `.real` executable.
+The wrapper sets the shared-library path, QEMU firmware path and shader-tool
+PATH. The boot script detects the bundled GOP ROM and avoids a local Rust
+rebuild when using the prebuilt QEMU.
+
+The archive contains QEMU, installed QEMU BIOS/EFI ROMs, `llvm-dis`,
+`spirv-val`, compatible non-graphics shared libraries and the PCI GOP ROM.
+Reims is statically linked into QEMU, so no separate `libreims_vgpu.so` is
+required. It does not contain macOS disks, OpenCore, private OVMF variables,
+glibc, or host Vulkan GPU drivers. The host still needs KVM, Vulkan loader/ICD,
+and a working Wayland or X11 display.
+
+CI tests QEMU startup, device registration, firmware discovery, audio/display
+backends, and archive integrity. A live macOS boot/GPU rendering test still
+requires a configured host and guest image.
