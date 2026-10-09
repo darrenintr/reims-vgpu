@@ -805,10 +805,26 @@ fn line_width_widens_a_wireframe_and_is_not_asked_of_a_filled_draw() {
     let filled = run(false, None).expect("a filled draw needs no capability");
     let thin_covered = covered(&thin);
     let filled_covered = covered(&filled);
-    assert_eq!(
-        filled_covered,
-        ((w as f32 - 2.0 * inset) * (h as f32 - 2.0 * inset)) as usize,
-        "the fixture triangle covers its viewport and nothing outside it"
+    // The viewport's edges sit on pixel centres, and whether a fragment whose
+    // centre lies exactly on a viewport bound is generated is the
+    // implementation's: Vulkan bounds rasterization by the scissor, not the
+    // viewport. RADV bounds it by the viewport rounded out to whole pixels, so
+    // it covers one row and column more than a strict reading would (2303 of
+    // 48 x 48 against 47 x 47). Both are the fixture covering its viewport; a
+    // count outside that band is not.
+    // Strictly inside: the viewport's own extent. Rounded out: every pixel the
+    // viewport rectangle touches, from the floor of its near edge to the ceiling
+    // of its far one.
+    let span = |extent: u32| -> (usize, usize) {
+        let (near, far) = (inset, extent as f32 - inset);
+        ((far - near) as usize, (far.ceil() - near.floor()) as usize)
+    };
+    let ((inner_w, outer_w), (inner_h, outer_h)) = (span(w), span(h));
+    let (inner, outer) = (inner_w * inner_h, outer_w * outer_h);
+    assert!(
+        (inner..=outer).contains(&filled_covered),
+        "the fixture triangle covers its viewport and nothing outside it: \
+         {filled_covered} not in {inner}..={outer}"
     );
     assert!(
         thin_covered > 0 && thin_covered < filled_covered,

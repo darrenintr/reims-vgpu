@@ -44,6 +44,17 @@ const CLASSIFICATIONS: &[&str] = &[
     "virtual",
     "cpu",
     "other",
+    // `vulkan::recreate::Reason`: why a swapchain was (re)built
+    "init",
+    "resize",
+    "suboptimal",
+    // `vulkan::recreate::Replacement`: how the old one was retired
+    "transactional",
+    // `vulkan::recreate::Previous`: what became of the old one
+    "none",
+    "kept",
+    "gone",
+    "replaced",
 ];
 
 #[test]
