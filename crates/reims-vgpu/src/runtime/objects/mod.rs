@@ -108,7 +108,7 @@ struct ReportedBackingFail {
     last_at_ms: u64,
     /// How many times the device has asked and been refused, the first
     /// included. The whole point of the pair: see
-    /// [`backing_outstanding_census`].
+    /// [`backing_unrecovered_detail`].
     attempts: u32,
     /// Whether [`ReportedBackingFail::retry_refused`] has already said this
     /// refusal outlived [`BACKING_UNRECOVERED_AFTER_MS`]. Once per latch entry,
@@ -136,7 +136,7 @@ impl ReportedBackingFail {
     /// transient one, where the guest had not filled the PTE yet, is followed
     /// within milliseconds by `backing_recovered` on the same `gva=`. A real
     /// loss is a surface retried every frame and refused every frame, and the
-    /// only thing that ever said so was [`backing_outstanding_census`], whose
+    /// only thing that ever said so was `backing_outstanding_census`, whose
     /// once-a-second caller went with the runtime census (`7370e53c`). Since
     /// then a loss has looked like a `backing_fail` with no later
     /// `backing_recovered`, which is also what an abandoned surface looks like.
@@ -373,115 +373,6 @@ fn clear_backing_fail(surface_id: u32, backed_gva: u64) {
             now.saturating_sub(at_ms)
         ));
     }
-}
-
-/// The backing refusals still latched, for the census — or `None` if there are
-/// none.
-///
-/// # The reading this exists to make possible
-///
-/// A refusal leaves [`backing_fail_latch`] exactly three ways, and until this
-/// existed only one of them said so. It is *recovered* when the surface backs at
-/// the address the refusal named, which emits `backing_recovered`. It is
-/// *superseded* when the surface backs somewhere else — the guest re-pointed it,
-/// so the refusal is moot — which [`clear_backing_fail`] now counts. Or it is
-/// still here, which is the only one that can be lost guest work, and it was the
-/// silence the other two were mistaken for.
-///
-/// The three add up: `backing_fail` lines equal
-/// `backing_recovered + backing_superseded + n` from the last
-/// census window. That identity is the point — a reader who finds fewer
-/// recoveries than refusals now has a line to check instead of a hand-matched
-/// diff of backing GVAs, which is how this hole was found.
-///
-/// # Reading the three numbers, because two of them used to say the opposite
-///
-/// `oldest_ms` is the age of the longest-outstanding refusal's **first** raise,
-/// `since_last_ms` the age of the most recent one, and `attempts` how many times
-/// the device has asked. Together they separate the two states a bare count
-/// cannot:
-///
-/// - `attempts` climbing, `since_last_ms` near zero — the device is asking every
-///   frame and being refused every frame. **This is the one that is lost guest
-///   work**, and every present for that surface is painting stale or black.
-/// - `attempts=1`, `since_last_ms` tracking `oldest_ms` — the device asked once,
-///   was refused, and **nothing has asked since**. `apply_backing` is
-///   reached from the per-present path, so nothing asking means nothing is
-///   presenting that surface: the guest is done with it. Nothing is lost.
-///
-/// This carried one number, `oldest_ms`, and its doc read it exactly backwards —
-/// "`oldest_ms=12` is a refusal caught mid-retry; `oldest_ms=83000` is a surface
-/// this device never backed". [`note_backing_fail`] used a plain `insert`, so a
-/// retry *overwrote* the timestamp: an actively-retried refusal pins that age
-/// near zero forever, and a large one means the retries stopped. The sentence
-/// had it the wrong way round for both states, which is why the reading below
-/// went unmade across three boots.
-///
-/// Silent when the latch is empty, because an empty latch is the expected state
-/// and this rides a one-second cadence.
-///
-/// # What a driven boot reads
-///
-/// x86/PCI, `web-content-probe -n 10 --churn 1`, 12 951 log lines, probe green.
-/// The identity closes exactly:
-///
-/// ```text
-///   backing_fail        8
-///   backing_recovered   7
-///   backing_superseded  0
-///   outstanding n             1      8 = 7 + 0 + 1
-/// ```
-///
-/// Fifteen census lines for the boot, so the cadence costs nothing. The first
-/// reads `oldest_ms=294` and the last `oldest_ms=14317` — which is the argument
-/// for carrying the age at all, because one of those `n=1`s is a retry still in
-/// flight and the other is a surface that was never backed, and the count alone
-/// cannot tell them apart.
-///
-/// # The standing `sid=27` reading, and what it turned out to be
-///
-/// Three driven boots each ended with exactly one outstanding refusal, every
-/// time `sid=27`, `reason=translate st=zero-pfn pte=0x0`, a 2-3 page surface, at
-/// a different backing each boot. It was carried as an open question across two
-/// sessions: abandoned by the guest, or a retry that never came?
-///
-/// **Abandoned.** It is answerable from the third boot's own census series
-/// without any new signal, once `insert`'s refresh is accounted for. The 23
-/// `backing_outstanding` lines run `oldest_ms` 204 → 22242 while `t` runs
-/// 401037 → 423075: the two deltas are **equal at every sample**, 22038 apiece.
-/// A timestamp that tracks wall clock exactly is a timestamp nothing refreshed,
-/// so the device asked once, at t=400833, and never again.
-///
-/// The surface agrees. `sid=27` is 93×21 and then 99×29 — a tooltip — set up at
-/// t≈26 s and untouched for the following six minutes. `zero-pfn` says the
-/// guest's own leaf PTE is empty: it took the backing away. Nothing presented it
-/// afterwards, which is why nothing asked again.
-///
-/// `attempts` is in the line so this costs a glance rather than an afternoon,
-/// and so the *other* state — a surface retried every frame and refused every
-/// frame — is not mistaken for it. That one is real lost work and this boot does
-/// not contain one.
-pub(crate) fn backing_outstanding_census() -> Option<String> {
-    let now = crate::observe::elapsed_ms() as u64;
-    let guard = backing_fail_latch()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    // The oldest entry is the one worth naming: it is the one least likely to
-    // be a retry still in flight, and a single line cannot carry them all.
-    let oldest = guard
-        .iter()
-        .min_by_key(|(_, reported)| reported.first_at_ms)
-        .map(|((sid, reason), reported)| (*sid, *reason, *reported))?;
-    let (sid, reason, held) = oldest;
-    Some(format!(
-        "backing_outstanding n={} oldest_ms={} since_last_ms={} attempts={} \
-         sid={sid} reason={reason} gva={}",
-        guard.len(),
-        now.saturating_sub(held.first_at_ms),
-        now.saturating_sub(held.last_at_ms),
-        held.attempts,
-        gva_text(held.gva),
-    ))
 }
 
 fn gva_text(gva: Option<u64>) -> String {

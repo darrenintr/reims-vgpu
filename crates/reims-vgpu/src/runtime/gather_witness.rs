@@ -378,15 +378,6 @@ pub enum GatherRail {
 }
 
 impl GatherRail {
-    /// Short name for a census line.
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            Self::Linear => "linear",
-            Self::MapperRefTexture => "t11",
-            Self::RefTexture => "t5",
-        }
-    }
-
     /// Census names for the rail's gather count and its gathered kilobytes.
     fn names(self) -> (&'static str, &'static str) {
         match self {
