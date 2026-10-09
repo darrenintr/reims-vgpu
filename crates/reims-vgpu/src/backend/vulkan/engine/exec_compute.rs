@@ -854,10 +854,7 @@ pub(crate) unsafe fn execute_compute_inner(
             ),
             super::types::ComputeImageDestination::GuestPages { target, .. } => {
                 match unsafe {
-                    pools.prepare_guest_ram_refs(
-                        ctx,
-                        target.runs.iter().map(|run| &run.guest),
-                    )
+                    pools.prepare_guest_ram_refs(ctx, target.runs.iter().map(|run| &run.guest))
                 } {
                     Ok(()) => ComputeImageDst::Direct(unsafe {
                         super::plan_guest_copy(ctx, pools, counters, target)?

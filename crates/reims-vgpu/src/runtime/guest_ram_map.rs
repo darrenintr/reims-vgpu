@@ -263,10 +263,7 @@ impl RunResolver {
     }
 
     /// The standing refusal this resolver must obey, if any.
-    pub(crate) fn standing_refusal<H: HostOps + ?Sized>(
-        self,
-        host: &mut H,
-    ) -> Option<MapRefusal> {
+    pub(crate) fn standing_refusal<H: HostOps + ?Sized>(self, host: &mut H) -> Option<MapRefusal> {
         let refusal = standing_refusal(host)?;
         match (self.admission, refusal) {
             (RunAdmission::CompleteTarget, MapRefusal::ImportExceedsHeap { .. }) => None,

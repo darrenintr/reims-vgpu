@@ -272,8 +272,7 @@ impl ResourcePools {
         refs: impl IntoIterator<Item = &'a crate::runtime::guest_ram::GuestRef>,
     ) -> Result<(), host_ram::HostRamDecline> {
         let refs: Vec<_> = refs.into_iter().collect();
-        self.host_ram_imports
-            .preflight_refs(refs.iter().copied())?;
+        self.host_ram_imports.preflight_refs(refs.iter().copied())?;
 
         let mut seen = std::collections::HashSet::new();
         for guest_ref in refs {
