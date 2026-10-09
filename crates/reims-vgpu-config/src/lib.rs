@@ -853,27 +853,6 @@ pub const PIPELINE_MEMO: &str = "REIMS_VGPU_PIPELINE_MEMO";
 /// says so.
 pub const COMPUTE_GATHER: &str = "REIMS_VGPU_COMPUTE_GATHER";
 
-/// **Default on.** `off` stops the device writing the two GPU timestamps that
-/// bound a draw submission's command buffer, which is the only way it knows how
-/// long the GPU spent executing one.
-///
-/// Off is a refusal and never a permission: no query is created, reset, written
-/// or read on that arm, and the census publishes no line rather than a zero. The
-/// probe is on by default because two timestamps per submission is ~4 000 a
-/// second against the readback rail's existing three per composite, and because a
-/// reading nobody has to ask for is the one that gets read — every session before
-/// this one inferred GPU occupancy from `slot_us`, a wall-clock wait, and five of
-/// them concluded the rail was GPU-bound without a GPU-side number existing
-/// anywhere in the device.
-///
-/// It is a switch rather than a constant because it is not free. A timestamp is a
-/// pipeline flush point on some hardware, so an A/B that needs the absolute floor
-/// — anything ranking submission shape or ring depth — should take it out on both
-/// arms and say that it did. See
-/// `crate::backend::vulkan::engine::gpu_span` for what the pair measures and
-/// the two caveats that belong to the reading rather than to the code.
-pub const GPU_SPANS: &str = "REIMS_VGPU_GPU_SPANS";
-
 /// **Default off, and a probe rather than a rail.** `on` makes every draw send
 /// its colour attachment out of `TRANSFER_SRC_OPTIMAL` and straight back into it
 /// after the render pass has ended.

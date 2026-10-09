@@ -125,13 +125,9 @@ pub enum VkOp {
 
     /// `vkGetPipelineCacheData` before persisting a grown pipeline cache.
     ContextPipelineCacheGetData,
-    /// `vkCreateQueryPool` for the readback's two-slot timestamp probe.
-    ContextCreateQueryPool,
     /// The timeline semaphore FIFO-owned submissions signal, so the completion
     /// thread can wait them without owning a ring fence.
     ContextCreateSemaphore,
-    /// `vkGetQueryPoolResults` reading that probe after its fence signalled.
-    ContextGetQueryPoolResults,
 
     // ---- desc_arena.rs — the per-frame descriptor-set arena ----
     /// `vkCreateDescriptorPool` for the arena's pool.
@@ -414,9 +410,7 @@ impl Decline for VkCall {
             VkOp::ScatterCreatePipeline => "vk_scatter_create_pipeline",
 
             VkOp::ContextPipelineCacheGetData => "vk_context_pipeline_cache_get_data",
-            VkOp::ContextCreateQueryPool => "vk_context_create_query_pool",
             VkOp::ContextCreateSemaphore => "vk_context_create_semaphore",
-            VkOp::ContextGetQueryPoolResults => "vk_context_get_query_pool_results",
 
             VkOp::DescArenaCreatePool => "vk_desc_arena_create_pool",
             VkOp::DescArenaAllocSets => "vk_desc_arena_alloc_sets",
@@ -595,9 +589,7 @@ mod tests {
         VkOp::ScatterCreatePipelineLayout,
         VkOp::ScatterCreatePipeline,
         VkOp::ContextPipelineCacheGetData,
-        VkOp::ContextCreateQueryPool,
         VkOp::ContextCreateSemaphore,
-        VkOp::ContextGetQueryPoolResults,
         VkOp::DescArenaCreatePool,
         VkOp::DescArenaAllocSets,
         VkOp::DescArenaAllocSetsGrown,

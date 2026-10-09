@@ -45,7 +45,6 @@ pub use pools::sampled_working_set::census as sampled_working_set_census;
 /// Reference interval used only to keep reuse-distance census bands stable.
 /// Residency policy does not read it.
 pub(crate) use pools::IDLE_MAINTENANCE_START_MS;
-pub mod gpu_span;
 pub mod reason;
 mod slab;
 pub mod types;

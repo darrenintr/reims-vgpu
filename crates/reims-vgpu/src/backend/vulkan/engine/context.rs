@@ -501,107 +501,6 @@ pub(crate) struct VertexDivisorCapabilities {
     pub max_divisor: u32,
 }
 
-/// GPU-side timing for the composite readback: how long the GPU spent executing
-/// the copy command buffer, as distinct from how long the CPU spent waiting for
-/// it.
-///
-/// `readback_split fence_us` measures wall clock between `vkQueueSubmit` and
-/// `vkWaitForFences` returning. That interval contains three different things
-/// with three different fixes — the draw batch still executing, the copy
-/// executing, and the cost of asking (queue scheduling, the GPU leaving a
-/// low-power state, and the CPU's own wake from the fence's signal) — and no
-/// number in this device separated them. It matters which, because
-/// `ResidentArmCensus` established that holding the host GPU at its top clock
-/// moves that same wall clock from 2.55-2.83 ms to 0.40 ms, six sevenths of it
-/// with no code change. Six sevenths being the governor is consistent with two
-/// opposite readings: the GPU doing the same work slower, or the GPU spending
-/// most of the interval not working at all.
-///
-/// A timestamp written at the top of the copy command buffer and another at its
-/// bottom answers it directly and without correlating two clocks: the delta is
-/// GPU ticks between two points in the GPU's own timeline, and
-/// `timestampPeriod` scales it to nanoseconds. If the copy's execution is a
-/// small fraction of `fence_us`, the rest is the batch and the asking, and
-/// making the copy cheaper cannot pay.
-///
-/// # This region is per ring slot, and it has to be
-///
-/// The doc that stood here said "two queries are enough because the readback is
-/// How a queue family's raw timestamp ticks become nanoseconds.
-///
-/// One type rather than a field pair, because the period and valid-bit mask are
-/// only correct together on queue families that expose timestamps.
-#[derive(Clone, Copy)]
-pub(crate) struct TickScale {
-    /// `VkPhysicalDeviceLimits::timestampPeriod` — nanoseconds per tick.
-    pub ns_per_tick: f32,
-    /// The low `timestampValidBits` of a query result, as a mask.
-    ///
-    /// Vulkan permits a queue family to write fewer than 64 meaningful bits and
-    /// leaves the rest **undefined**, so a raw subtraction of two results is not
-    /// the elapsed ticks on such a host — it is a difference of two numbers whose
-    /// high halves are whatever the driver left there. Masking both operands
-    /// first is the whole fix, and a counter that wraps within the mask is then a
-    /// wrapping subtract rather than a garbage one. 32 valid bits at a 1 ns tick
-    /// wraps every 4.3 s, which a per-second census crosses regularly.
-    pub valid_mask: u64,
-}
-
-impl TickScale {
-    /// The pair a queue family reports, or `None` where it reports no usable
-    /// timestamps at all. The one constructor, so a mask can only come from the
-    /// `valid_bits` beside the period it belongs to.
-    pub fn resolve(valid_bits: u32, timestamp_period: f32) -> Option<Self> {
-        (valid_bits > 0 && timestamp_period > 0.0).then(|| Self {
-            ns_per_tick: timestamp_period,
-            // A `valid_bits` of 64 has to become an all-ones mask rather than a
-            // shift that overflows.
-            valid_mask: if valid_bits >= u64::BITS {
-                u64::MAX
-            } else {
-                (1u64 << valid_bits) - 1
-            },
-        })
-    }
-
-    /// Elapsed nanoseconds between two raw query results, masked to the bits the
-    /// queue family actually writes and treating a wrap within that width as a
-    /// wrap rather than as an enormous negative.
-    pub fn elapsed_ns(&self, from: u64, to: u64) -> u64 {
-        let span = (to & self.valid_mask).wrapping_sub(from & self.valid_mask) & self.valid_mask;
-        // In f64, not integer ticks-times-period: `timestampPeriod` is a float
-        // and drivers do report values below 1 ns (a counter faster than 1 GHz),
-        // which an integer multiply would truncate to zero and report as "the
-        // GPU did nothing".
-        (span as f64 * self.ns_per_tick.max(0.0) as f64) as u64
-    }
-}
-
-/// A timestamp pair per submission ring slot: the top of a draw command buffer
-/// and its bottom.
-///
-/// Why a pair per *slot* and not one pair shared: up to
-/// [`super::pools::RING_DEPTH`] command buffers are in flight at once, and a
-/// shared pair would be overwritten by the next submission long before the first
-/// one's fence made it readable. The slot is the natural key because the slot's
-/// fence is exactly the event that makes its pair readable, and the ring already
-/// retires a slot before reusing it — see [`super::gpu_span::SlotSpan`].
-pub(crate) struct DrawSpanProbe {
-    pub pool: vk::QueryPool,
-    /// How a raw tick difference becomes nanoseconds. See [`TickScale`].
-    pub scale: TickScale,
-}
-
-impl DrawSpanProbe {
-    /// Queries per ring slot: the top stamp and the bottom stamp.
-    pub const PER_SLOT: u32 = 2;
-
-    /// First query index belonging to ring slot `slot`.
-    pub const fn base(slot: usize) -> u32 {
-        slot as u32 * Self::PER_SLOT
-    }
-}
-
 /// The Vulkan limit governing every shader-visible buffer offset this engine
 /// emits.
 ///
@@ -719,15 +618,6 @@ pub(crate) struct DeviceContext {
     /// this device (D32_SFLOAT_S8_UINT preferred, D24_UNORM_S8_UINT fallback).
     /// Used only by the stencil-test path; depth-only uses D32_SFLOAT.
     pub depth_stencil_format: vk::Format,
-    /// Two timestamps per ring slot, for the GPU execution time of a draw
-    /// submission. `None` when the queue family cannot provide timestamps,
-    /// and additionally when [`crate::config::GPU_SPANS`] is
-    /// off — which is the whole of how that switch narrows, because a `None` here
-    /// means no query is ever reset, written or read.
-    ///
-    /// Each draw pair belongs to the ring slot whose fence makes it readable.
-    /// See [`super::gpu_span`].
-    pub draw_spans: Option<DrawSpanProbe>,
     /// The thread that publishes and announces FIFO completion stamps, and the
     /// timeline semaphore FIFO-owned submissions signal.
     ///
@@ -1201,35 +1091,6 @@ impl DeviceContext {
             .create_device(pd, &dci, None)
             .map_err(|result| DrawError::Init(InitDecline::CreateDevice { result }))?;
         let props = instance.get_physical_device_properties(pd);
-        // Capability answers, not assumptions: Vulkan permits a queue family to
-        // support no timestamps at all, and permits `timestampPeriod` to be any
-        // positive float. A device that says either gets no probe at all and the
-        // census reports zero rather than a wrong number. One resolve for both
-        // probes, so neither can be built against a mask the other derived.
-        let scale = TickScale::resolve(
-            qfs[gq as usize].timestamp_valid_bits,
-            props.limits.timestamp_period,
-        );
-        let draw_spans = scale
-            .filter(|_| {
-                crate::config::read(crate::config::GPU_SPANS).0 != crate::config::Switch::Off
-            })
-            .and_then(|scale| {
-                let ci = vk::QueryPoolCreateInfo::default()
-                    .query_type(vk::QueryType::TIMESTAMP)
-                    .query_count(DrawSpanProbe::PER_SLOT * super::pools::RING_DEPTH as u32);
-                device
-                    .create_query_pool(&ci, None)
-                    .map(|pool| DrawSpanProbe { pool, scale })
-                    .map_err(|e| {
-                        crate::observe::Emit::decline(
-                            "vk_draw_span_pool",
-                            &VkCall::new(VkOp::ContextCreateQueryPool, e),
-                        )
-                        .fail_once(0);
-                    })
-                    .ok()
-            });
         // Gated on the feature actually being enabled, not on the API version.
         // `timelineSemaphore` is core in 1.2 and this backend's baseline is 1.2,
         // so a device that declines it is out of spec — which is exactly why the
@@ -1407,7 +1268,6 @@ impl DeviceContext {
             features,
             explicit_linear_support: Mutex::new(HashMap::new()),
             depth_stencil_format,
-            draw_spans,
             stamp_completion,
             queue_owner,
             pipeline_cache_path: Some(pipeline_cache_path),
@@ -1527,9 +1387,6 @@ impl DeviceContext {
         // running.
         if let Some(mut completion) = self.stamp_completion.take() {
             unsafe { completion.stop(&self.device) };
-        }
-        if let Some(probe) = self.draw_spans.take() {
-            self.device.destroy_query_pool(probe.pool, None);
         }
         self.device
             .destroy_pipeline_cache(self.pipeline_cache, None);
@@ -2494,81 +2351,6 @@ mod recreate_budget_tests {
         assert_eq!(owner.recreate_count, 0);
         assert!(!owner.poisoned, "noting work must not change device state");
         assert!(owner.init_error.is_none());
-    }
-}
-
-#[cfg(test)]
-mod draw_span_probe_tests {
-    use super::*;
-
-    fn probe(valid_bits: u32, ns_per_tick: f32) -> TickScale {
-        TickScale::resolve(valid_bits, ns_per_tick).expect("the fixture is a usable queue family")
-    }
-
-    /// The ordinary case: a full-width counter, a tick that is not one
-    /// nanosecond, and a delta that does not wrap.
-    #[test]
-    fn a_full_width_counter_scales_its_delta_by_the_tick() {
-        let p = probe(64, 2.5);
-        assert_eq!(p.elapsed_ns(1_000, 1_400), 1_000);
-    }
-
-    /// A queue family that writes 32 meaningful bits leaves the rest
-    /// **undefined**, so the high halves of the two results may differ by
-    /// anything. Masking both operands is what makes the subtraction the elapsed
-    /// ticks rather than a difference of two drivers' scratch bits — and this is
-    /// the case a raw `bottom - top` reports as a span of years.
-    #[test]
-    fn undefined_high_bits_do_not_reach_the_answer() {
-        let p = probe(32, 1.0);
-        let top = 0xdead_beef_0000_0100u64;
-        let bottom = 0x1234_5678_0000_0300u64;
-        assert_eq!(p.elapsed_ns(top, bottom), 0x200);
-    }
-
-    /// 32 valid bits at a one-nanosecond tick wraps every 4.3 seconds, which a
-    /// per-second census crosses several times a boot. A wrap is a wrap and not a
-    /// negative: without the mask on the result this reads as ~18 000 000 000 µs
-    /// and would own every column it is quoted beside.
-    #[test]
-    fn a_wrap_within_the_valid_width_is_a_wrap() {
-        let p = probe(32, 1.0);
-        assert_eq!(p.elapsed_ns(0xffff_ff00, 0x0000_00ff), 0x1ff);
-    }
-
-    /// Each ring slot owns a disjoint pair, because the slot's fence is what makes
-    /// its pair readable and two slots are in flight at once.
-    #[test]
-    fn every_ring_slot_gets_its_own_disjoint_pair() {
-        let bases: Vec<u32> = (0..super::super::pools::RING_DEPTH)
-            .map(DrawSpanProbe::base)
-            .collect();
-        for w in bases.windows(2) {
-            assert_eq!(
-                w[1] - w[0],
-                DrawSpanProbe::PER_SLOT,
-                "slot bases must tile the pool: {bases:?}"
-            );
-        }
-        let last = bases.last().expect("the ring is not empty");
-        assert_eq!(
-            last + DrawSpanProbe::PER_SLOT,
-            DrawSpanProbe::PER_SLOT * super::super::pools::RING_DEPTH as u32,
-            "the pool is exactly as large as the ring needs"
-        );
-    }
-
-    /// A queue family that writes no timestamps yields no scale, so the draw
-    /// span probe is not built. The period and valid-bit mask stay one answer.
-    #[test]
-    fn a_queue_family_without_timestamps_yields_no_scale() {
-        assert!(TickScale::resolve(0, 1.0).is_none());
-        assert!(TickScale::resolve(64, 0.0).is_none());
-        assert_eq!(
-            TickScale::resolve(64, 1.0).expect("usable").valid_mask,
-            u64::MAX,
-            "64 valid bits must not shift out of range"
-        );
     }
 }
 
