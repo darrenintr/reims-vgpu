@@ -820,7 +820,7 @@ engine_counters! {
         /// Ordered window display transactions, time queued behind earlier GPU
         /// work, and time in their submit-plus-present host driver calls.  The
         /// queue and driver times are deliberately separate from
-        /// `engine_lock`: neither is paid while the resource registry is held.
+        /// the engine lock: neither is paid while the resource registry is held.
         queue_present_transactions,
         queue_present_queue_us,
         queue_present_driver_us,

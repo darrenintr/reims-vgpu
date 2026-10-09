@@ -282,8 +282,7 @@ impl DeviceObjectCaches {
             let mut caches = self.0.lock();
             std::mem::replace(&mut *caches, ObjectCaches::new())
         };
-        // `Device`, which is what its own doc calls teardown.
-        let guard = lock_engine_at(EngineLockSite::Device);
+        let guard = lock_engine();
         if let Some(ctx) = guard.owner.ctx.as_ref() {
             unsafe { taken.destroy_all(&ctx.device) };
         } else {
@@ -818,261 +817,14 @@ mod device_capability_snapshot_tests {
 /// happens to reuse the same identity.
 static RESIDENT_RESOURCE_EPOCH: AtomicU64 = AtomicU64::new(1);
 
-/// Which thread class is asking for the engine lock.
-///
-/// The single `ENGINE` mutex serializes the drain worker's guest execution
-/// against the host window's present, and only one direction of that
-/// contention reaches the screen: a worker delayed by the window loses
-/// throughput it can make up, while a window delayed by the worker drops the
-/// frame it was about to show. `engine_lock` cannot say which side paid without
-/// the two being named apart, so every acquire declares itself.
-///
-/// # Why there are three and not two
-///
-/// [`Self::Worker`] used to mean "the drain worker **and** every entry point
-/// QEMU reaches that is not the window", which is three populations on one
-/// counter and the one reading nobody could take from it. The drain worker owns
-/// the lock for a whole tranche — 28-45 ms on a driven x86 boot, 117 ms at the
-/// tail — and the threads that queue behind it are not peers of each other:
-///
-/// * The **drain worker** blocking is throughput it makes up on the next
-///   tranche.
-/// * A **vCPU** blocking is the guest stopped dead inside an MMIO store, and
-///   every other emulated device's timing goes with it. That is the population
-///   an audio underrun or a late timer is a symptom of.
-/// * QEMU's **main loop** blocking inside the action BH stalls every device in
-///   the process, not just this one.
-///
-/// The last two are both [`Self::Device`]: this crate cannot tell a vCPU thread
-/// from the main loop without QEMU telling it, and the actionable split is
-/// "the render tranche" against "everything QEMU needed while it ran".
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EngineLockSite {
-    /// The drain worker executing guest commands. Recognised by the thread
-    /// having entered [`crate::qemu::abi::reims_vgpu_qemu_device_drain`] at
-    /// least once, which is a property no other thread has.
-    Worker,
-    /// Every other entry point QEMU reaches: a vCPU inside an MMIO store, the
-    /// main loop inside the action BH, poll, reset, teardown.
-    Device,
-    /// The host window's event loop: present, attach, resize, detach.
-    Window,
-}
+type EngineGuard = parking_lot::MutexGuard<'static, EngineState>;
 
-impl EngineLockSite {
-    fn index(self) -> usize {
-        match self {
-            Self::Worker => 0,
-            Self::Device => 1,
-            Self::Window => 2,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Worker => "worker",
-            Self::Device => "device",
-            Self::Window => "window",
-        }
-    }
-
-    const ALL: [Self; 3] = [Self::Worker, Self::Device, Self::Window];
-}
-
-thread_local! {
-    /// Whether this thread has ever run a drain.
-    ///
-    /// Latched rather than scoped: a thread that has drained once is the drain
-    /// worker for the process's life on both shims, and a scoped marker would
-    /// have to be restored on every early return out of a `?`-heavy call tree.
-    /// A test process that drains from its own thread labels that thread the
-    /// worker, which is what it is for the duration.
-    static IS_DRAIN_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Mark the calling thread as the drain worker. Called by the drain entry point
-/// before it takes the lock, so the first tranche is attributed correctly.
-pub(crate) fn mark_drain_thread() {
-    IS_DRAIN_THREAD.with(|c| c.set(true));
-}
-
-/// Which site a `lock_engine()` acquire belongs to, from the calling thread.
-fn calling_site() -> EngineLockSite {
-    if IS_DRAIN_THREAD.with(std::cell::Cell::get) {
-        EngineLockSite::Worker
-    } else {
-        EngineLockSite::Device
-    }
-}
-
-/// Wait-to-acquire and hold time on `ENGINE`, split by [`EngineLockSite`].
-///
-/// Both halves are needed to read either. A window `wait_us` that owns its
-/// second says the window is blocked; the worker's `hold_us` beside it says
-/// whether the worker is what blocked it, and `hold_max_us` whether that was
-/// one long hold or many short ones. Neither is derivable from `drain_duty`,
-/// which times the device lock rather than this one and cannot see the window
-/// thread at all.
-#[derive(Default)]
-struct EngineLockCensus {
-    /// Acquires that took the mutex with no wait, per site.
-    uncontended: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
-    /// Acquires that found it held and had to block, per site.
-    contended: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
-    /// Wall clock blocked on the mutex, summed over `contended`.
-    wait_us: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
-    wait_max_us: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
-    /// Wall clock from acquire to release, over every acquire.
-    hold_us: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
-    hold_max_us: [std::sync::atomic::AtomicU64; EngineLockSite::ALL.len()],
-}
-
-static ENGINE_LOCK: EngineLockCensus = EngineLockCensus::new();
-
-impl EngineLockCensus {
-    #[allow(clippy::declare_interior_mutable_const)]
-    const ZERO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    const fn new() -> Self {
-        Self {
-            uncontended: [Self::ZERO; EngineLockSite::ALL.len()],
-            contended: [Self::ZERO; EngineLockSite::ALL.len()],
-            wait_us: [Self::ZERO; EngineLockSite::ALL.len()],
-            wait_max_us: [Self::ZERO; EngineLockSite::ALL.len()],
-            hold_us: [Self::ZERO; EngineLockSite::ALL.len()],
-            hold_max_us: [Self::ZERO; EngineLockSite::ALL.len()],
-        }
-    }
-
-    fn note_wait(&self, site: EngineLockSite, us: u64) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let i = site.index();
-        self.contended[i].fetch_add(1, Relaxed);
-        self.wait_us[i].fetch_add(us, Relaxed);
-        self.wait_max_us[i].fetch_max(us, Relaxed);
-    }
-
-    fn note_uncontended(&self, site: EngineLockSite) {
-        self.uncontended[site.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn note_hold(&self, site: EngineLockSite, us: u64) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let i = site.index();
-        self.hold_us[i].fetch_add(us, Relaxed);
-        self.hold_max_us[i].fetch_max(us, Relaxed);
-    }
-
-    /// Drain the window into one line, or `None` when the lock was never taken
-    /// in it (a boot with no engine work at all).
-    fn take(&self, win_ms: u64) -> Option<String> {
-        use std::sync::atomic::Ordering::Relaxed;
-        let mut body = String::new();
-        let mut any = false;
-        for site in EngineLockSite::ALL {
-            let i = site.index();
-            let free = self.uncontended[i].swap(0, Relaxed);
-            let blocked = self.contended[i].swap(0, Relaxed);
-            let wait_us = self.wait_us[i].swap(0, Relaxed);
-            let wait_max_us = self.wait_max_us[i].swap(0, Relaxed);
-            let hold_us = self.hold_us[i].swap(0, Relaxed);
-            let hold_max_us = self.hold_max_us[i].swap(0, Relaxed);
-            any |= free != 0 || blocked != 0;
-            let label = site.label();
-            body.push_str(&format!(
-                " {label}={} {label}_blocked={blocked} {label}_wait_us={wait_us} \
-                 {label}_wait_max_us={wait_max_us} {label}_hold_us={hold_us} \
-                 {label}_hold_max_us={hold_max_us}",
-                free + blocked
-            ));
-        }
-        any.then(|| format!("engine_lock win_ms={win_ms}{body}"))
-    }
-}
-
-/// The window `drain_duty` last reported over, drained into one `engine_lock`
-/// line. Called from the drain's per-second census block so it shares that
-/// denominator rather than deriving a second one.
-pub(crate) fn take_engine_lock_census(win_ms: u64) -> Option<String> {
-    ENGINE_LOCK.take(win_ms)
-}
-
-/// A held engine lock that reports how long it was held.
-///
-/// Derefs to [`EngineState`], so a call site reads exactly as it did against
-/// `parking_lot::MutexGuard`. The hold is timed on release rather than sampled,
-/// because the spans that matter here are the long ones — a readback fence
-/// inside the lock — and a sampler would miss precisely those.
-struct EngineGuard {
-    guard: parking_lot::MutexGuard<'static, EngineState>,
-    site: EngineLockSite,
-    acquired: std::time::Instant,
-}
-
-impl std::ops::Deref for EngineGuard {
-    type Target = EngineState;
-    fn deref(&self) -> &EngineState {
-        &self.guard
-    }
-}
-
-impl std::ops::DerefMut for EngineGuard {
-    fn deref_mut(&mut self) -> &mut EngineState {
-        &mut self.guard
-    }
-}
-
-impl Drop for EngineGuard {
-    fn drop(&mut self) {
-        ENGINE_LOCK.note_hold(self.site, self.acquired.elapsed().as_micros() as u64);
-    }
-}
-
-/// Acquire the global engine lock. The single `ENGINE` mutex serializes all 34
-/// engine entry points across the drain worker and the QEMU main/present path,
-/// so this is on every one of them.
-///
-/// The uncontended path reads no clock beyond the one `Instant::now` the hold
-/// timer needs: `try_lock` decides whether a wait happened, so an acquire that
-/// did not block costs a failed-then-taken atomic and nothing else.
-#[inline]
-fn lock_engine_at(site: EngineLockSite) -> EngineGuard {
-    let guard = match ENGINE.try_lock() {
-        Some(guard) => {
-            ENGINE_LOCK.note_uncontended(site);
-            guard
-        }
-        None => {
-            let blocked_at = std::time::Instant::now();
-            let guard = ENGINE.lock();
-            let waited = blocked_at.elapsed();
-            ENGINE_LOCK.note_wait(site, waited.as_micros() as u64);
-            // Only the worker's wait belongs to a tranche; the ledger ignores a
-            // charge from any other thread, so this needs no site test.
-            crate::runtime::drain::note_tranche_cost(
-                crate::runtime::drain::TrancheCost::LockWait,
-                waited.as_nanos() as u64,
-            );
-            guard
-        }
-    };
-    EngineGuard {
-        guard,
-        site,
-        acquired: std::time::Instant::now(),
-    }
-}
-
-/// [`lock_engine_at`] for the drain worker and the QEMU entry points, which is
-/// every caller but the host window's event loop.
-///
-/// Which of the two it is comes from the calling thread rather than from the
-/// call site: the same functions are reached from a drain tranche and from a
-/// vCPU's MMIO store, so no fixed site could name both correctly. See
-/// [`EngineLockSite`] for why telling them apart is the whole point.
+/// Acquire the global engine lock. The single `ENGINE` mutex serializes every
+/// engine entry point across the drain worker, the QEMU main/present path and
+/// the host window's event loop.
 #[inline]
 fn lock_engine() -> EngineGuard {
-    lock_engine_at(calling_site())
+    ENGINE.lock()
 }
 
 /// Device-reset proxy: guest-derived Vulkan objects evicted at the lifetime boundary.
@@ -1141,7 +893,7 @@ pub fn window_present_attach(
     width: u32,
     height: u32,
 ) -> Result<(), DrawError> {
-    let mut guard = lock_engine_at(EngineLockSite::Window);
+    let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
         ref counters,
@@ -1197,7 +949,7 @@ pub fn window_present_attached() -> bool {
 
 #[cfg(feature = "host-window")]
 pub fn window_present_resize(width: u32, height: u32) {
-    let mut guard = lock_engine_at(EngineLockSite::Window);
+    let mut guard = lock_engine();
     if let Some(presenter) = guard.window_presenter.as_mut() {
         presenter.resize(width, height);
     }
@@ -1262,7 +1014,7 @@ pub fn window_present_frame(
     cpu: Option<WindowCpuFrame<'_>>,
 ) -> Result<WindowPresentOutcome, DrawError> {
     let dispatch = {
-        let mut guard = lock_engine_at(EngineLockSite::Window);
+        let mut guard = lock_engine();
         let EngineState {
             ref mut owner,
             ref mut pools,
@@ -1284,7 +1036,7 @@ pub fn window_present_frame(
             // host driver while holding ENGINE would only stop the drain from
             // preparing later work; no resource-state decision remains here.
             let finished = pending.wait();
-            let mut guard = lock_engine_at(EngineLockSite::Window);
+            let mut guard = lock_engine();
             match guard.window_presenter.as_mut() {
                 None => Err(DrawError::Facade(
                     EngineFacadeDecline::WindowPresenterNotAttached,
@@ -1313,7 +1065,7 @@ pub fn window_present_frame(
 /// exists. Called from winit's `exiting` callback.
 #[cfg(feature = "host-window")]
 pub fn window_present_detach() {
-    let mut guard = lock_engine_at(EngineLockSite::Window);
+    let mut guard = lock_engine();
     let Some(mut presenter) = guard.window_presenter.take() else {
         return;
     };
@@ -6436,56 +6188,6 @@ mod device_loss_window_rail_tests {
 }
 
 #[cfg(test)]
-mod engine_lock_site_tests {
-    use super::*;
-
-    /// A thread that has not run a drain is not the drain worker, and one that
-    /// has is.
-    ///
-    /// The whole value of the split is that a vCPU stalled inside an MMIO store
-    /// is countable apart from the tranche that stalled it, and the only thing
-    /// separating those two threads is this latch. Asserted on a fresh thread
-    /// because the marker is thread-local: running it on the test's own thread
-    /// would pass whatever the latch did, since the test would be both.
-    #[test]
-    fn a_thread_is_the_worker_only_after_it_has_drained() {
-        let seen = std::thread::spawn(|| {
-            let before = calling_site();
-            mark_drain_thread();
-            (before, calling_site())
-        })
-        .join()
-        .expect("probe thread");
-        assert_eq!(seen.0, EngineLockSite::Device, "before any drain");
-        assert_eq!(seen.1, EngineLockSite::Worker, "after one drain");
-
-        // And the latch does not leak across threads: a second thread that has
-        // not drained still reports `Device`, however many have.
-        let other = std::thread::spawn(calling_site).join().expect("probe two");
-        assert_eq!(other, EngineLockSite::Device);
-    }
-
-    /// Every site has its own label and its own census slot. Two sharing either
-    /// would put a stalled vCPU and the tranche that stalled it on one counter,
-    /// which is the state this split exists to leave.
-    #[test]
-    fn every_site_has_its_own_slot_and_label() {
-        let mut labels: Vec<_> = EngineLockSite::ALL.iter().map(|s| s.label()).collect();
-        let count = labels.len();
-        labels.sort_unstable();
-        labels.dedup();
-        assert_eq!(labels.len(), count, "two sites share a label");
-        let mut indices: Vec<_> = EngineLockSite::ALL.iter().map(|s| s.index()).collect();
-        indices.sort_unstable();
-        assert_eq!(
-            indices,
-            (0..count).collect::<Vec<_>>(),
-            "indices must tile the census arrays exactly"
-        );
-    }
-}
-
-#[cfg(test)]
 mod group_by_buffer_tests {
     use super::*;
     use ash::vk::Handle;
@@ -6744,103 +6446,6 @@ mod guest_write_footprint_tests {
             "abutting the high end shares its last page"
         );
         clear_guest_write_pages();
-    }
-}
-
-#[cfg(test)]
-mod engine_lock_census_tests {
-    use super::*;
-
-    /// A boot where nothing ever touched the engine must not emit a line of
-    /// zeros: `engine_lock` is read as "the window waited this long", and a row
-    /// of zeros published every second on an idle device trains a reader to
-    /// skip the line on the second where it finally says something.
-    #[test]
-    fn an_untaken_lock_emits_no_line() {
-        let census = EngineLockCensus::new();
-        assert!(census.take(1000).is_none());
-    }
-
-    /// The two sites are separate ledgers. A worker acquire must not move any
-    /// window column, because the whole point of the split is to say which
-    /// thread paid.
-    #[test]
-    fn each_site_keeps_its_own_waits_and_holds() {
-        let census = EngineLockCensus::new();
-        census.note_uncontended(EngineLockSite::Worker);
-        census.note_wait(EngineLockSite::Worker, 40);
-        census.note_hold(EngineLockSite::Worker, 900);
-        census.note_wait(EngineLockSite::Window, 7000);
-        census.note_hold(EngineLockSite::Window, 120);
-        let line = census.take(1000).expect("a taken lock emits");
-        assert!(
-            line.contains(" worker=2 worker_blocked=1 worker_wait_us=40"),
-            "{line}"
-        );
-        assert!(line.contains(" worker_hold_us=900"), "{line}");
-        assert!(
-            line.contains(" window=1 window_blocked=1 window_wait_us=7000"),
-            "{line}"
-        );
-        assert!(line.contains(" window_hold_us=120"), "{line}");
-    }
-
-    /// `wait_max_us` and `hold_max_us` are maxima, not second sums of the
-    /// totals beside them. One 30 ms hold and thirty 1 ms holds are the same
-    /// `hold_us` and mean opposite things for a window trying to present
-    /// between them, and the max is the only column that separates them.
-    #[test]
-    fn the_max_columns_are_maxima_not_totals() {
-        let census = EngineLockCensus::new();
-        for us in [3_u64, 30_000, 12] {
-            census.note_wait(EngineLockSite::Window, us);
-            census.note_hold(EngineLockSite::Worker, us);
-        }
-        let line = census.take(1000).expect("a taken lock emits");
-        assert!(line.contains(" window_wait_us=30015"), "{line}");
-        assert!(line.contains(" window_wait_max_us=30000"), "{line}");
-        assert!(line.contains(" worker_hold_us=30015"), "{line}");
-        assert!(line.contains(" worker_hold_max_us=30000"), "{line}");
-    }
-
-    /// Draining is what makes the line a rate. A second window must report the
-    /// second window's traffic, not the running total since boot.
-    #[test]
-    fn taking_the_window_resets_it() {
-        let census = EngineLockCensus::new();
-        census.note_uncontended(EngineLockSite::Worker);
-        census.note_hold(EngineLockSite::Worker, 500);
-        assert!(census.take(1000).is_some());
-        assert!(census.take(1000).is_none());
-        census.note_uncontended(EngineLockSite::Window);
-        let line = census.take(1000).expect("the second window emits");
-        assert!(line.contains(" worker=0 worker_blocked=0"), "{line}");
-        assert!(line.contains(" worker_hold_us=0"), "{line}");
-        assert!(line.contains(" window=1"), "{line}");
-    }
-
-    /// The real acquire attributes to the site it was asked for, and times a
-    /// wait it actually took. Serialized against the rest of the suite by
-    /// `--test-threads=1`, which every GPU-touching test here already needs.
-    #[test]
-    fn a_contended_acquire_charges_the_site_that_blocked() {
-        let _ = ENGINE_LOCK.take(0);
-        let held = lock_engine_at(EngineLockSite::Worker);
-        let waiter = std::thread::spawn(|| {
-            drop(lock_engine_at(EngineLockSite::Window));
-        });
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        drop(held);
-        waiter.join().expect("the waiting thread acquires");
-        let line = ENGINE_LOCK.take(1000).expect("both acquires are counted");
-        assert!(line.contains(" window=1 window_blocked=1"), "{line}");
-        let waited: u64 = line
-            .split(" window_wait_us=")
-            .nth(1)
-            .and_then(|rest| rest.split(' ').next())
-            .and_then(|value| value.parse().ok())
-            .expect("window_wait_us parses");
-        assert!(waited >= 10_000, "waited only {waited} us: {line}");
     }
 }
 

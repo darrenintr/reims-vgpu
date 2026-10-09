@@ -21,9 +21,6 @@
 /// stops ordering every one of them as `Unknown`.
 pub(crate) mod binding_usage;
 pub mod caps;
-/// The census lines only this rail can answer. Reached through
-/// [`Backend::emit_census`], never through a `cfg`.
-mod census;
 pub mod engine;
 /// A draw's pipeline and both its shaders, resolved once per pipeline object.
 pub mod pipeline_resolve;
@@ -35,7 +32,7 @@ use crate::backend::compute_session::ComputeSession;
 #[cfg(feature = "host-window")]
 use crate::backend::window;
 use crate::backend::{
-    Backend, CensusSite, GuestWriteReach, ObjectRetirement, PlaneDrawReader, Rail, RetainedObject,
+    Backend, GuestWriteReach, ObjectRetirement, PlaneDrawReader, Rail, RetainedObject,
     StampOrdering,
 };
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
@@ -386,10 +383,6 @@ impl Backend for VulkanBackend {
         draw::vulkan::note_plane_store_published(mapping_id);
     }
 
-    fn note_drain_thread(&self) {
-        engine::mark_drain_thread();
-    }
-
     fn install_stamp_announce(&self, announce: crate::backend::StampAnnounce) {
         engine::stamp_completion::install_announce(announce);
     }
@@ -657,18 +650,6 @@ impl Backend for VulkanBackend {
 
     fn forget_mapping(&self, mapping_id: u32) {
         draw::vulkan::forget_plane_draw_ring(mapping_id);
-    }
-
-    fn emit_census(&self, state: &DeviceState, site: CensusSite) {
-        match site {
-            CensusSite::Serialization { win_ms } => census::emit_engine_lock(win_ms),
-            CensusSite::WorkingSet => census::emit_working_set(),
-            CensusSite::Throughput => census::emit_engine_delta(),
-            CensusSite::Levels => {
-                census::emit_object_cache_levels(state);
-                census::emit_guest_import_levels();
-            }
-        }
     }
 }
 

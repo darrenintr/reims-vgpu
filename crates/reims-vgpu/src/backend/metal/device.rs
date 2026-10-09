@@ -10,7 +10,7 @@
 
 use crate::backend::compute_session::ComputeSession;
 use crate::backend::metal::runtime::system_device;
-use crate::backend::{Backend, CensusSite, MipmapGeneration, Rail};
+use crate::backend::{Backend, MipmapGeneration, Rail};
 use crate::model::{DeviceInfoLimits, DeviceState};
 use crate::protocol::mipmap::MetalMipmapError;
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
@@ -199,21 +199,6 @@ impl Backend for MetalBackend {
     /// behind this rail is one of them.
     fn compute_threadgroup_limits(&self) -> (u32, u32) {
         (1024, 32)
-    }
-
-    /// This rail's caches are its own and are not held in the device's rail
-    /// slot, so the device is not read here. It is in the signature because the
-    /// Vulkan rail's caches *are*, and the trait carries the more demanding of
-    /// the two.
-    fn emit_census(&self, _state: &crate::model::DeviceState, site: CensusSite) {
-        // One line, at one site. The other three are engine counters, phase
-        // windows and a mutex census that this rail has no counterpart for —
-        // absent rather than zeroed, so a reader cannot mistake "no such engine"
-        // for "an idle one".
-        if site == CensusSite::Levels {
-            super::census::emit_object_cache_levels();
-            super::census::emit_resident_color_levels();
-        }
     }
 
     /// This rail keys its retained colour render targets by mapping id, so a

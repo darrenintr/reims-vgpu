@@ -279,6 +279,7 @@ impl<T: Clone> Registry<T> {
         }
     }
 
+    #[cfg(test)]
     fn levels(&self) -> (usize, u64, usize) {
         (
             self.entries.len(),
@@ -492,17 +493,6 @@ pub fn published(key: &ResidentColorKey, content_gen: u64) {
 /// stated as such.
 pub fn forget(mapping_id: u32) {
     REGISTRY.lock().forget_mapping(mapping_id);
-}
-
-/// `(count, bytes, live)` — retained targets, their total size, and how many of
-/// them hold a published frame a load could actually be served from.
-///
-/// The third number is the one that says whether the rail is working. A count
-/// that climbs while `live` stays at zero is a rail retaining textures and
-/// re-uploading into all of them, which reads as a win on memory and is a loss
-/// on everything.
-pub fn levels() -> (usize, u64, usize) {
-    REGISTRY.lock().levels()
 }
 
 #[cfg(test)]

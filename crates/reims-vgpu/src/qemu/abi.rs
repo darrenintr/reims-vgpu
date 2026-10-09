@@ -28,8 +28,7 @@
 //!   set. Moving it to a worker would have to fall back to `first_cpu` or
 //!   `do_run_on_cpu`, and the shim header records why that is an AB-BA hang
 //!   rather than a slower answer. The cost is real and is the guest's own: a
-//!   tranche stalls the vCPU that handed it over, and `engine_lock`'s `device`
-//!   counters are what price it.
+//!   tranche stalls the vCPU that handed it over.
 //! * The macOS window loop runs on the process main thread because AppKit
 //!   requires it. QEMU's Darwin wrapper has already moved emulation off that
 //!   thread by then, so the two do not share.
@@ -44,7 +43,6 @@
     reason = "the shared QEMU C ABI safety contract is documented at module scope"
 )]
 
-use crate::backend::Backend as _;
 use crate::qemu::host_ops::ReimsVgpuHostOps;
 use crate::runtime::host::HostAction;
 use crate::{
@@ -491,12 +489,6 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_drain(handle: u64) -> c_int {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
             }
-            // Before the drain, so the first tranche's lock acquires are already
-            // attributed to the worker. Entering this function is the only
-            // property that distinguishes the drain thread from a vCPU inside
-            // an MMIO store, and telling those apart is what makes a stalled
-            // guest attributable.
-            crate::backend::selected().note_drain_thread();
             if device_drain(handle) {
                 REIMS_VGPU_QEMU_OK
             } else {

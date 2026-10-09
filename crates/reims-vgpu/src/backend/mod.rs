@@ -491,13 +491,6 @@ pub(crate) trait Backend: Copy {
     // host process it could not have observed from inside its own call tree,
     // and a rail with no use for the fact ignores it.
 
-    /// Mark the calling thread as the drain worker.
-    ///
-    /// Entering the drain is the only property that separates that thread from
-    /// a vCPU inside an MMIO store, so a rail that attributes lock waits has to
-    /// be told here or it cannot tell a stalled guest from a busy one.
-    fn note_drain_thread(&self) {}
-
     /// Install the way a rail's own completion thread reaches back into the
     /// guest, for a stamp whose word the GPU has already written.
     ///
@@ -634,9 +627,9 @@ pub(crate) trait Backend: Copy {
     /// that answers `false` leaves the screen to QEMU's own display, and the
     /// six window methods below it are never reached.
     ///
-    /// A trait method rather than a `cfg` for [`Self::emit_census`]'s reason,
-    /// and this is the case where the difference is fatal rather than
-    /// misleading. `host-window` is compiled unconditionally into a build
+    /// A trait method rather than a `cfg`, because a `cfg` answers "which rail
+    /// was compiled" and this asks "which rail is *running*", and here the
+    /// difference is fatal rather than misleading. `host-window` is compiled unconditionally into a build
     /// carrying both rails, so `feature = "host-window"` spelled "the Vulkan
     /// rail" opened a `winit` event loop on a Metal boot, beside QEMU's Cocoa
     /// display. Two windows is not what that costs: building the event loop
@@ -788,25 +781,6 @@ pub(crate) trait Backend: Copy {
         crate::runtime::render_writeback::settle_guest_writes(site);
         StampOrdering::Settled
     }
-
-    /// Emit this rail's census lines for one point in the drain's census window.
-    ///
-    /// Census only, and the reason it is a trait method rather than a `cfg` is
-    /// that a `cfg` answers "which rail was compiled" and this asks "which rail
-    /// is *running*". A build carrying both would print one rail's engine
-    /// counters for a device executing on the other, and — worse, because it is
-    /// silent — would drop the Metal cache-levels line entirely, since its gate
-    /// spelled "the Metal arm" as `not(backend-vulkan)`.
-    ///
-    /// A rail with nothing to say at a site says nothing. That is not the same
-    /// as a zero: an absent `engine_delta` means no such engine, where
-    /// `engine_delta …=0` would mean an idle one.
-    ///
-    /// Takes the device because some of what a rail counts is held per device
-    /// rather than per process — the Vulkan rail's object caches live in this
-    /// device's own rail slot — and a census that could not name the device
-    /// would be reporting somebody else's levels.
-    fn emit_census(&self, _state: &DeviceState, _site: CensusSite) {}
 
     /// What this rail remembers drawing into one plane since this witness last
     /// asked, formatted as census fields.
@@ -1142,32 +1116,6 @@ pub enum PlaneDrawReader {
     PresentedPlane,
     /// A full-screen layer a draw sampled.
     SampledLayer,
-}
-
-/// A point in the drain's per-second census window at which a rail may
-/// contribute lines — the vocabulary of [`Backend::emit_census`].
-///
-/// The **order** of these points is the drain's and not a rail's, which is why
-/// they are named for the drain's reason rather than for any rail's tables:
-/// several of the neutral lines emitted between them are only interpretable
-/// read against a rail line that must come first. Ordering *within* a site is
-/// the rail's own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CensusSite {
-    /// Beside `window_publish`, which it divides: `window_publish fresh` is
-    /// what the device offered the window and `host_window_cadence presents` is
-    /// what reached the screen, and when the two disagree the first candidate is
-    /// the rail's own serialization. Carries the window the drain measured.
-    Serialization { win_ms: u64 },
-    /// Beside the eviction routes: those say which cap fired and this says how
-    /// much the workload wanted, and neither is interpretable without the other.
-    WorkingSet,
-    /// Before the neutral `chain_phase`, which divides against it — reading them
-    /// in the other order invites treating a rail's phases as the whole draw.
-    Throughput,
-    /// After `chain_phase`. Levels, not per-interval deltas: entry counts of the
-    /// caches that hold one entry per distinct guest object.
-    Levels,
 }
 
 /// Who publishes a FIFO completion stamp word — the vocabulary of
@@ -1621,15 +1569,6 @@ impl Backend for SelectedBackend {
         }
     }
 
-    fn note_drain_thread(&self) {
-        match self {
-            #[cfg(feature = "backend-metal")]
-            Self::Metal(b) => b.note_drain_thread(),
-            #[cfg(feature = "backend-vulkan")]
-            Self::Vulkan(b) => b.note_drain_thread(),
-        }
-    }
-
     fn install_stamp_announce(&self, announce: StampAnnounce) {
         match self {
             #[cfg(feature = "backend-metal")]
@@ -1719,15 +1658,6 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.order_completion_stamp(state, host, index, value, site),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.order_completion_stamp(state, host, index, value, site),
-        }
-    }
-
-    fn emit_census(&self, state: &DeviceState, site: CensusSite) {
-        match self {
-            #[cfg(feature = "backend-metal")]
-            Self::Metal(b) => b.emit_census(state, site),
-            #[cfg(feature = "backend-vulkan")]
-            Self::Vulkan(b) => b.emit_census(state, site),
         }
     }
 
