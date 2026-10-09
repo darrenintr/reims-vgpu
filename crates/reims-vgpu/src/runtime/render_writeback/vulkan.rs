@@ -251,10 +251,12 @@ fn finish(
     } else {
         crate::runtime::drain::note_store_route("shared_store_registry_handoff_elided");
     }
-    crate::observe::line(format!(
-        "render_store mapping={mapping_id} bytes={frame_len} us={}",
-        started.elapsed().as_micros()
-    ));
+    crate::observe::verbose(|| {
+        format!(
+            "render_store mapping={mapping_id} bytes={frame_len} us={}",
+            started.elapsed().as_micros()
+        )
+    });
 }
 
 #[cfg(test)]

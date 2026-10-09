@@ -207,21 +207,25 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             Ok(M2vDrawSpan::Pixels { bytes, bgra }) => {
                 draw_rgba = Some(bytes);
                 draw_bgra = bgra;
-                crate::observe::line(format!(
-                    "linux_m2v_draw ok pipe={} {}x{} vtx={}",
-                    req.pipeline_ref, pass_w, pass_h, req.vertex_count
-                ));
+                crate::observe::verbose(|| {
+                    format!(
+                        "linux_m2v_draw ok pipe={} {}x{} vtx={}",
+                        req.pipeline_ref, pass_w, pass_h, req.vertex_count
+                    )
+                });
             }
             Ok(M2vDrawSpan::ResidentChain) => {
                 req.chain_resident_established = true;
-                crate::observe::line(format!(
-                    "linux_m2v_draw ok resident_chain pipe={} {}x{} mid={} gva={:#x}",
-                    req.pipeline_ref,
-                    pass_w,
-                    pass_h,
-                    req.colors.first().map(|c| c.mapping_id).unwrap_or(0),
-                    req.colors.first().map(|c| c.target_gva).unwrap_or(0)
-                ));
+                crate::observe::verbose(|| {
+                    format!(
+                        "linux_m2v_draw ok resident_chain pipe={} {}x{} mid={} gva={:#x}",
+                        req.pipeline_ref,
+                        pass_w,
+                        pass_h,
+                        req.colors.first().map(|c| c.mapping_id).unwrap_or(0),
+                        req.colors.first().map(|c| c.target_gva).unwrap_or(0)
+                    )
+                });
             }
             Ok(M2vDrawSpan::ResidentGvaStore { identity }) => {
                 note_mapper_ref_texture_store_route("gva_flush");
@@ -252,14 +256,16 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     // readback. `read_resident_chain` fail-logs a lost resident.
                     note_mapper_ref_texture_store_route("gva_store_sync");
                     draw_rgba = read_resident_chain(req, &identity);
-                    crate::observe::line(format!(
-                        "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x} rgba={}",
-                        req.pipeline_ref,
-                        pass_w,
-                        pass_h,
-                        req.colors.first().map(|c| c.target_gva).unwrap_or(0),
-                        draw_rgba.is_some() as u8
-                    ));
+                    crate::observe::verbose(|| {
+                        format!(
+                            "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x} rgba={}",
+                            req.pipeline_ref,
+                            pass_w,
+                            pass_h,
+                            req.colors.first().map(|c| c.target_gva).unwrap_or(0),
+                            draw_rgba.is_some() as u8
+                        )
+                    });
                 }
             }
             Ok(M2vDrawSpan::ResidentSurfaceStore {
@@ -292,10 +298,12 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             publish_surface_store(state, host, mid, cw, ch, fmt);
                         }
                         surface_store_armed = true;
-                        crate::observe::line(format!(
-                            "linux_m2v_draw ok resident_surface_store pipe={} {}x{} mid={mid}",
-                            req.pipeline_ref, pass_w, pass_h
-                        ));
+                        crate::observe::verbose(|| {
+                            format!(
+                                "linux_m2v_draw ok resident_surface_store pipe={} {}x{} mid={mid}",
+                                req.pipeline_ref, pass_w, pass_h
+                            )
+                        });
                     }
                     _ => {
                         // The arm refused (its typed decline says which gate), so
@@ -307,22 +315,26 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         // the fallback is a cost, never a lost frame.
                         note_mapper_ref_texture_store_route("surface_resident_sync");
                         draw_rgba = read_resident_chain(req, &identity);
-                        crate::observe::line(format!(
+                        crate::observe::verbose(|| {
+                            format!(
                             "linux_m2v_draw ok resident_surface_store_sync_fallback pipe={} {}x{} mid={} rgba={}",
                             req.pipeline_ref,
                             pass_w,
                             pass_h,
                             req.colors.first().map(|c| c.mapping_id).unwrap_or(0),
                             draw_rgba.is_some() as u8
-                        ));
+                        )
+                        });
                     }
                 }
             }
             Ok(M2vDrawSpan::None) => {
-                crate::observe::line(format!(
-                    "linux_m2v_draw skip pipe={} (no color0 geom)",
-                    req.pipeline_ref
-                ));
+                crate::observe::verbose(|| {
+                    format!(
+                        "linux_m2v_draw skip pipe={} (no color0 geom)",
+                        req.pipeline_ref
+                    )
+                });
             }
             Err(e) => {
                 // Always-on + latched: a rejected engine draw falls to the
@@ -495,7 +507,8 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             // Order-independent: both fields reduce over the three
                             // colour channels, so an R/B exchange cannot move them.
                             let (rgb_nz, max_rgb, mean_rgb) = rgb_stats(&bgra);
-                            crate::observe::line(format!(
+                            crate::observe::verbose(|| {
+                                format!(
                                 "linux_m2v_store mid={} {}x{} pipe={} import=0 reason=cpu_portability pages=1 rgb_nz={} max={} mean_rgb={}",
                                 c0.mapping_id,
                                 c0.width,
@@ -504,7 +517,8 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                                 rgb_nz,
                                 max_rgb,
                                 mean_rgb
-                            ));
+                            )
+                            });
                         });
                     } else {
                         let (rgb_nz, max_rgb, mean_rgb) = rgb_stats(&bgra);
@@ -1302,10 +1316,12 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     // which is the always-on signal; keep the per-bind detail
                     // for deep debugging behind REIMS_VGPU_DRAW_LOG (observe::line)
                     // rather than flooding the always-on fail sink.
-                    crate::observe::line(format!(
+                    crate::observe::verbose(|| {
+                        format!(
                         "ref_texture_view_zc ref={texture_ref} sid={mid} view={}x{} fmt={:#x} plane={}",
                         view.width, view.height, view.pixel_format, view.plane_index
-                    ));
+                    )
+                    });
                     return Some((view.width, view.height, mid, src));
                 }
                 let (w, h, rgba, identity, byte_format) =
@@ -2658,12 +2674,14 @@ pub(super) fn load_ref_texture_view_rgba<M: HostMemory + HostOps>(
         crate::observe::when_verbose(|| {
             let s = crate::observe::rgba_rgb_stats(rgba);
             let (nz, max) = (s.rgb_nz, s.max_rgb);
-            crate::observe::line(format!(
+            crate::observe::verbose(|| {
+                format!(
             "ref_texture_draw_view ok task={task_id} ref={texture_ref} sid={mapping_id} map_gen={map_gen} view={}x{} fmt={:#x} bpp={bpp} base={base_w}x{base_h} base_fmt={base_fmt:#x} off={base_off} bpr={surface_bpr} span_end={span_end} src={generation_source} rgb_nz={nz} max_rgb={max}",
             view.width,
             view.height,
             view.pixel_format,
-        ));
+        )
+            });
         });
     };
     if let Some(m) = state.ref_texture_view_memo.get_touch(&memo_key) {
@@ -9267,7 +9285,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 })
                 .collect::<Vec<_>>()
                 .join(";");
-            crate::observe::line(format!(
+            crate::observe::verbose(|| {
+                format!(
                 "linux_m2v_resources pipe={} {}x{} vtx={} attrs={} ssbo={} img={} smp={} rt_n={} rt=[{}] fixed_gap=[{}] seed={} idx={} idx_n={} meta=[{}] ssbo=[{}] sampler=[{}]",
                 req.pipeline_ref,
                 w,
@@ -9286,7 +9305,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 attr_meta,
                 ssbo_meta,
                 sampler_meta
-            ));
+            )
+            });
         });
         resources.vert_spirv = v_words;
         resources.frag_spirv = f_words;
@@ -9402,10 +9422,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // only consumer, so it runs only when that sink is open.
         crate::observe::when_verbose(|| {
             if out.pixels.is_empty() {
-                crate::observe::line(format!(
+                crate::observe::verbose(|| {
+                    format!(
                     "linux_m2v_pixels pipe={} {}x{} skip_readback=1 (no CPU pixels; see import_content)",
                     req.pipeline_ref, w, h
-                ));
+                )
+                });
             } else {
                 let mut rgb_nz = 0usize;
                 let mut max_rgb = 0u8;
@@ -9418,18 +9440,20 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         max_rgb = m;
                     }
                 }
-                crate::observe::line(format!(
-                    "linux_m2v_pixels pipe={} {}x{} rgb_nz={} max_rgb={} px0=[{},{},{},{}]",
-                    req.pipeline_ref,
-                    w,
-                    h,
-                    rgb_nz,
-                    max_rgb,
-                    out.pixels.first().copied().unwrap_or(0),
-                    out.pixels.get(1).copied().unwrap_or(0),
-                    out.pixels.get(2).copied().unwrap_or(0),
-                    out.pixels.get(3).copied().unwrap_or(0),
-                ));
+                crate::observe::verbose(|| {
+                    format!(
+                        "linux_m2v_pixels pipe={} {}x{} rgb_nz={} max_rgb={} px0=[{},{},{},{}]",
+                        req.pipeline_ref,
+                        w,
+                        h,
+                        rgb_nz,
+                        max_rgb,
+                        out.pixels.first().copied().unwrap_or(0),
+                        out.pixels.get(1).copied().unwrap_or(0),
+                        out.pixels.get(2).copied().unwrap_or(0),
+                        out.pixels.get(3).copied().unwrap_or(0),
+                    )
+                });
             }
         });
         // No content-gated CPU composites: premultiplied One/OneMinusSourceAlpha

@@ -4946,10 +4946,12 @@ fn present_named_mapping<H: HostMemory + HostOps>(
                 // was lost. `present_black` below is the alarm. Wherever the
                 // window presents from the engine's own device this is the
                 // normal outcome of every present.
-                crate::observe::line(format!(
-                    "present_content_unsampled mid={mapping} {w}x{h} gen={gen} \
+                crate::observe::verbose(|| {
+                    format!(
+                        "present_content_unsampled mid={mapping} {w}x{h} gen={gen} \
                      (a resident carried the frame; no CPU pixels to judge)"
-                ));
+                    )
+                });
             } else if verdict == PresentContentVerdict::Black {
                 // Both lines name the mapping the guest asked us to show and say
                 // it came out black. They deliberately do not go looking for a
@@ -4984,12 +4986,14 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // not.
         // One line per accepted present, verbose-only. `present_enqueue` carried
         // the same fields through the always-on sink alongside it.
-        crate::observe::line(format!(
-            "present paint mid={mapping} {w}x{h} gen={gen} encoded={} retain={} unpainted={}",
-            encoded as u8,
-            state.present.frame_valid as u8,
-            state.present.unpainted_presents.saturating_add(1)
-        ));
+        crate::observe::verbose(|| {
+            format!(
+                "present paint mid={mapping} {w}x{h} gen={gen} encoded={} retain={} unpainted={}",
+                encoded as u8,
+                state.present.frame_valid as u8,
+                state.present.unpainted_presents.saturating_add(1)
+            )
+        });
         // Account the accepted present. The retain-vs-DisplaySwap (mapping,
         // generation) choice that used to be computed here addressed
         // `copy_to_bgra8`'s Unchanged/expected_generation checks on the QEMU
@@ -5834,14 +5838,16 @@ fn process_child_packet<H: HostMemory + HostOps>(
             let task = decoded
                 .task
                 .map_or_else(|| "-".to_string(), |task| format!("{task:#x}"));
-            crate::observe::line(format!(
-                "present_txn op={opcode:#x} ch={channel_id} pipe={} sid={mapping} task={task} \
+            crate::observe::verbose(|| {
+                format!(
+                    "present_txn op={opcode:#x} ch={channel_id} pipe={} sid={mapping} task={task} \
                  plen={} unpainted={} prior_present_mapping={}",
-                decoded.pipe,
-                packet.payload.len(),
-                state.present.unpainted_presents,
-                state.present.present_mapping
-            ));
+                    decoded.pipe,
+                    packet.payload.len(),
+                    state.present.unpainted_presents,
+                    state.present.present_mapping
+                )
+            });
             if present_named_mapping(state, host, channel_id, mapping)
                 == ChildPacketDisposition::Deferred
             {

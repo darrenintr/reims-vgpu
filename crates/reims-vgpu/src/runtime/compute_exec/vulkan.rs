@@ -862,10 +862,12 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
             &kernel_shader.reflection,
             t.index,
         ) else {
-            crate::observe::line(format!(
-                "compute_linux texture_unused pipe={} i={} ref={}",
-                acc.pipeline_ref, t.index, t.texture_ref
-            ));
+            crate::observe::verbose(|| {
+                format!(
+                    "compute_linux texture_unused pipe={} i={} ref={}",
+                    acc.pipeline_ref, t.index, t.texture_ref
+                )
+            });
             continue;
         };
         let binding = descriptor.binding;
@@ -908,10 +910,12 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 // Metal permits unused bound resources. If reflection lists no
                 // texture shape at this binding, the shader does not sample/write
                 // it — do not stage or invent access/writeback semantics for it.
-                crate::observe::line(format!(
-                    "compute_linux texture_unused pipe={} i={} ref={} bind={}",
-                    acc.pipeline_ref, t.index, t.texture_ref, binding
-                ));
+                crate::observe::verbose(|| {
+                    format!(
+                        "compute_linux texture_unused pipe={} i={} ref={} bind={}",
+                        acc.pipeline_ref, t.index, t.texture_ref, binding
+                    )
+                });
                 continue;
             }
             ReflectedComputeTexture::UnstageableShape { axis } => {
@@ -1006,7 +1010,8 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     }
     // A dispatch that staged its resources is expected control flow; the
     // refusals on this path each emit their own typed decline.
-    crate::observe::line(format!(
+    crate::observe::verbose(|| {
+        format!(
         "compute_linux stage_ok pipe={} nbuf={} bro={} brw={} bunused={} babsent={} bunknown={} ntex={} sampled={} storage={} swo={} grid=[{grid_x},{grid_y},{grid_z}] tg=[{tg_x},{tg_y},{tg_z}] encode=engine",
         acc.pipeline_ref,
         staged_bufs.len(),
@@ -1019,7 +1024,8 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         sampled_count,
         storage_count,
         storage_writeonly_count,
-    ));
+    )
+    });
 
     let mut storage_buffers = Vec::with_capacity(buffer_accesses.len());
     for s in &mut staged_bufs {
@@ -1549,7 +1555,8 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     // shape — process-cumulative engine totals belong to the parity tests that
     // take a snapshot around a known workload, not to a per-dispatch line that
     // would pay a global engine lock to print them.
-    crate::observe::line(format!(
+    crate::observe::verbose(|| {
+        format!(
         "compute_linux ok pipe={} wg=[{wg_x},{wg_y},{wg_z}] nbuf={} bro={} brw={} bunused={} ntex={}",
         acc.pipeline_ref,
         staged_bufs.len(),
@@ -1557,7 +1564,8 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         buffer_writable_count,
         buffer_unused_count,
         staged_tex.len(),
-    ));
+    )
+    });
     ComputeStatus::Ok
 }
 

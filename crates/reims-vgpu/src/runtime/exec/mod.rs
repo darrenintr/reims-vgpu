@@ -3811,17 +3811,19 @@ fn handle_render_draw<M: HostMemory + HostOps>(
     // said this row is a draw.
     if kind.is_wide_encoding() {
         if let DrawRecord::Indexed(d) = &record {
-            crate::observe::line(format!(
-                "render_wide_indexed task={task_id} target_refs={:?} pipeline={} prim={} \
+            crate::observe::verbose(|| {
+                format!(
+                    "render_wide_indexed task={task_id} target_refs={:?} pipeline={} prim={} \
                  index_type={} index_ref={} count={} offset={:#x}",
-                acc.color_targets,
-                acc.pipeline_ref,
-                d.primitive,
-                d.index.index_type.ordinal(),
-                d.index.buffer_ref,
-                d.index_count,
-                d.index.offset
-            ));
+                    acc.color_targets,
+                    acc.pipeline_ref,
+                    d.primitive,
+                    d.index.index_type.ordinal(),
+                    d.index.buffer_ref,
+                    d.index_count,
+                    d.index.offset
+                )
+            });
         }
     }
 
