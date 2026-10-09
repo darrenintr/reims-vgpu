@@ -5326,6 +5326,7 @@ pub fn warm_guest_ram_imports(
     };
     let mut warmed = 0usize;
     let mut bytes = 0u64;
+    let mut refused_backing = None;
     for import in imports {
         match unsafe { pools.warm_guest_ram(ctx, import) } {
             Ok(true) => {
@@ -5334,10 +5335,32 @@ pub fn warm_guest_ram_imports(
             }
             Ok(false) => {}
             // The draw path asks again and declines there with the same reason,
-            // so this is reported and not propagated: a warm that could not
-            // import must not be the thing that decides the rail is off.
-            Err(inner) => crate::observe::Emit::decline("vk_guest_ram_warm", &inner).fail_once(0),
+            // so a decline here is reported and not propagated: a warm that
+            // could not import must not by itself decide the rail is off.
+            Err(inner) => {
+                crate::observe::Emit::decline("vk_guest_ram_warm", &inner).fail_once(0);
+                if import.gpa_base().is_some() && inner.refuses_the_backing() {
+                    refused_backing = Some(inner);
+                }
+            }
         }
+    }
+    drop(guard);
+    // The one decline that does decide it. A RAMBlock whose backing the driver
+    // refuses outright leaves the map holding references into an import that
+    // will never exist, beside others (the BAR) that do: the partial import
+    // `guest_ram_map` documents as a hard error at the writeback sites rather
+    // than a fallback. On RADV with memfd-backed guest RAM that was a compute
+    // storage output the engine reported as landed in guest pages and the guest
+    // read as zeros — an iOS Simulator whose every pixel stayed transparent.
+    // Withdrawing the limits this backend published, and the map built on them,
+    // puts the boot on the copying rails, the state `REIMS_VGPU_GUEST_IMPORT=off`
+    // reaches by hand.
+    if let Some(inner) = refused_backing {
+        crate::runtime::guest_ram::forget_import_limits();
+        crate::runtime::guest_ram_map::reset();
+        crate::observe::Emit::decline("vk_guest_import_withdrawn", &inner).fail();
+        return (0, 0);
     }
     (warmed, bytes)
 }

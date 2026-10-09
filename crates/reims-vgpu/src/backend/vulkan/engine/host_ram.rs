@@ -143,6 +143,21 @@ pub enum HostRamDecline {
     Bound { inner: GuestRamError },
 }
 
+impl HostRamDecline {
+    /// Whether the driver refused the *kind* of memory behind the pointer rather
+    /// than this one attempt: `VK_ERROR_INVALID_EXTERNAL_HANDLE` from the import
+    /// allocation is the specification's answer for a host pointer the
+    /// implementation cannot import at all. Asked of a RAMBlock it is a property
+    /// of how this machine backs guest RAM — `memory-backend-memfd,share=on` on
+    /// RADV answers it for every block — and asking again cannot change it.
+    pub(crate) fn refuses_the_backing(&self) -> bool {
+        matches!(
+            self,
+            Self::AllocateMemory { result } if *result == vk::Result::ERROR_INVALID_EXTERNAL_HANDLE
+        )
+    }
+}
+
 impl Decline for HostRamDecline {
     fn slug(&self) -> &'static str {
         match self {
@@ -800,6 +815,38 @@ mod tests {
     use super::*;
     use crate::backend::vulkan::caps::memory_topology::MemoryTypeRefusal;
     use crate::backend::vulkan::caps::HostPointerImport;
+
+    /// Only the driver refusing the pointer's kind of memory withdraws the rail.
+    /// Running out of memory, or a refusal about one bound or one buffer, is a
+    /// statement about that attempt, and turning the whole boot over to the
+    /// copying rails for it would be the warm deciding the rail is off.
+    #[test]
+    fn only_an_invalid_external_handle_refuses_the_backing() {
+        assert!(HostRamDecline::AllocateMemory {
+            result: vk::Result::ERROR_INVALID_EXTERNAL_HANDLE
+        }
+        .refuses_the_backing());
+        for transient in [
+            HostRamDecline::AllocateMemory {
+                result: vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            },
+            HostRamDecline::AllocateMemory {
+                result: vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+            },
+            HostRamDecline::CreateBuffer {
+                result: vk::Result::ERROR_INVALID_EXTERNAL_HANDLE,
+            },
+            HostRamDecline::BindBuffer {
+                result: vk::Result::ERROR_INVALID_EXTERNAL_HANDLE,
+            },
+            HostRamDecline::TooSmall {
+                required: 2,
+                available: 1,
+            },
+        ] {
+            assert!(!transient.refuses_the_backing(), "{transient:?}");
+        }
+    }
 
     /// One slug per check. Two sharing one would mean watching a slug fire and
     /// still not knowing whether the driver refused the pointer or the memory

@@ -447,6 +447,18 @@ pub fn imports() -> Vec<Arc<GuestRamImport>> {
 /// half: the Metal-direct arm builds a `newBufferWithBytesNoCopy` per call
 /// against unified memory and holds no per-RAMBlock import to warm.
 pub fn warm<H: HostOps + ?Sized>(host: &mut H) {
+    warm_with(host, |imports| {
+        crate::backend::selected().warm_guest_ram_imports(imports)
+    });
+}
+
+/// [`warm`] with the backend's half passed in, so the map's half can be tested
+/// without asking a real driver to import a test's made-up addresses — which it
+/// refuses, and which a backend is right to read as the host refusing guest RAM.
+fn warm_with<H: HostOps + ?Sized>(
+    host: &mut H,
+    backend_warm: impl FnOnce(&[Arc<GuestRamImport>]) -> (usize, u64),
+) {
     if granularity().is_none() {
         return;
     }
@@ -456,7 +468,7 @@ pub fn warm<H: HostOps + ?Sized>(host: &mut H) {
     }
     let imports = imports();
     if !imports.is_empty() {
-        let (warmed, bytes) = crate::backend::selected().warm_guest_ram_imports(&imports);
+        let (warmed, bytes) = backend_warm(&imports);
         if warmed > 0 {
             crate::observe::off(format!(
                 "guest_ram_warm blocks={warmed} bytes={bytes} spans={}",
@@ -1326,7 +1338,7 @@ mod tests {
     fn warming_before_the_backend_publishes_a_granularity_latches_nothing() {
         with_granularity(None, || {
             let mut host = two_spans();
-            warm(&mut host);
+            warm_with(&mut host, |_| (0, 0));
             assert!(
                 MAP.lock().unwrap_or_else(|p| p.into_inner()).is_none(),
                 "a warm with no granularity must not latch a refusal"
@@ -1334,7 +1346,7 @@ mod tests {
 
             // The backend comes up late; the import must still be available.
             latch_granularity(0x1000);
-            warm(&mut host);
+            warm_with(&mut host, |_| (0, 0));
             assert_eq!(
                 standing_refusal(&mut host),
                 None,
@@ -1356,8 +1368,8 @@ mod tests {
         });
         let warmed = with_granularity(Some(0x1000), || {
             let mut host = two_spans();
-            warm(&mut host);
-            warm(&mut host);
+            warm_with(&mut host, |_| (0, 0));
+            warm_with(&mut host, |_| (0, 0));
             let refusal = standing_refusal(&mut host);
             (refusal, imports().len())
         });
