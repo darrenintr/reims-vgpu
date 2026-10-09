@@ -262,7 +262,64 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     crate::backend::selected().install_stamp_announce(std::sync::Arc::new(move |index: u32| {
         announce_stamp_interrupt(id, index)
     }));
+    if ops.is_some() {
+        spawn_vblank_timer(id);
+    }
     Some(id)
+}
+
+/// Start the thread that delivers display VBL at its deadlines.
+///
+/// The poll heartbeat (`REIMS_VGPU_PCI_HEARTBEAT_MS`, 4 ms) can only claim a
+/// VBL on one of its ticks, so a cadence it does not divide is delivered as a
+/// pattern of its multiples: a 100 Hz panel's 10 ms became 8, 12, 8, 12 ms. The
+/// guest takes its frame clock from those interrupts, so an even refresh became
+/// an uneven one — the judder that matching the host rate was meant to remove.
+/// This thread sleeps to each deadline on the shared grid and claims it through
+/// the same lock-free pulse the heartbeat's contended arm uses, so the one
+/// limiter still decides, whichever path gets there first.
+///
+/// Holds the id, not the device: each tick looks it up, so a destroyed device
+/// ends the thread instead of being kept alive by it.
+fn spawn_vblank_timer(id: u64) {
+    let spawned = std::thread::Builder::new()
+        .name("reims-vgpu-vblank".to_string())
+        .spawn(move || loop {
+            let wait_us = {
+                let Some(slot) = device_slot(id) else {
+                    return;
+                };
+                vblank_wait_us(
+                    slot.vbl_last_us.load(Ordering::Acquire),
+                    slot.vbl_interval_us.load(Ordering::Acquire),
+                    crate::observe::elapsed_us(),
+                )
+            };
+            std::thread::sleep(std::time::Duration::from_micros(wait_us));
+            let Some(slot) = device_slot(id) else {
+                return;
+            };
+            vbl_contended_pulse(&slot);
+        });
+    if let Err(error) = spawned {
+        // The heartbeat still paces VBL, on its own coarser grid.
+        crate::observe::fail(format!("vblank_timer_unavailable id={id} error={error}"));
+    }
+}
+
+/// How long the VBL timer sleeps before its next claim: to the next deadline on
+/// the grid (`last + interval`), and at most one interval. Before the guest's
+/// display is online there is no interval yet, and the timer idles at the
+/// heartbeat's own period.
+fn vblank_wait_us(last_us: u64, interval_us: u64, now_us: u64) -> u64 {
+    const IDLE_US: u64 = 4_000;
+    if interval_us == 0 {
+        return IDLE_US;
+    }
+    last_us
+        .saturating_add(interval_us)
+        .saturating_sub(now_us)
+        .min(interval_us)
 }
 
 /// Raise the gfx interrupt for a stamp whose word the GPU has written.

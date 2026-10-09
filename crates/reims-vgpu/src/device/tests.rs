@@ -593,3 +593,24 @@ fn present_action_owns_worker_boundary_until_scanout_copy() {
     assert_eq!(slot.gfx_ingress.lock().len(), 0);
     assert!(device_destroy(id));
 }
+
+/// The VBL timer wakes at the grid's next deadline and never sleeps longer than
+/// one interval, so a late claim by the heartbeat cannot push it a whole period
+/// out; before the display has an interval it idles at the heartbeat's period.
+#[test]
+fn vblank_timer_sleeps_to_the_next_grid_deadline() {
+    let interval = 10_000;
+    assert_eq!(vblank_wait_us(50_000, interval, 53_000), 7_000);
+    assert_eq!(vblank_wait_us(50_000, interval, 60_000), 0, "due now");
+    assert_eq!(
+        vblank_wait_us(50_000, interval, 75_000),
+        0,
+        "overdue claims at once"
+    );
+    assert_eq!(
+        vblank_wait_us(90_000, interval, 50_000),
+        interval,
+        "a grid ahead of the clock waits one interval, not the gap"
+    );
+    assert_eq!(vblank_wait_us(0, 0, 123), 4_000);
+}
