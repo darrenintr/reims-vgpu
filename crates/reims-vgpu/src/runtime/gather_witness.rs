@@ -307,29 +307,14 @@
 //!
 //! **What it does not do, and why the rest was left alone.**
 //!
-//! - *A synchronous baseline.* Audited against the shim
-//!   (`reims-vgpu-dirty.c`, submodule `bd88218`), and not possible inside
-//!   `track_guest_writes`. A set armed only in `reims_vgpu_dirty_harvest`, which
-//!   was called from the guest-doorbell MMIO handlers and nowhere else, and only
-//!   when a generation read had followed the previous harvest. There was no
-//!   bottom half: a set tracked while the guest was quiet, or inside one long
-//!   drain tranche (the work of one doorbell), read 0 until the guest next rang
-//!   the device — the 8.24 s `gather_storm_ready` tail.
-//!
-//!   A baseline cannot be taken in the call itself. `track_guest_writes` runs on
-//!   the drain thread, which must not take the BQL that the accelerator's
-//!   dirty-log sync needs; and a generation made readable *without* a harvest
-//!   would leave every bit that predates the set in the bitmap, so the first
-//!   real harvest would report all of them as guest stores. `guest_written_pages`
-//!   hands those to the writeback rail, which drops the GPU's store for pages it
-//!   believes the guest wrote. (The vouch itself would survive: over-reporting
-//!   is the safe direction for a reuse decision, and the wrong one for a
-//!   writeback.) The shim now schedules the harvest on the main loop when a set
-//!   is tracked and on every generation read that returns 0, so the window is a
-//!   main-loop turn rather than the guest's next doorbell. The model check in
-//!   the shim's `reims-vgpu-dirty-test/` covers every interleaving of guest
-//!   writes, harvests, reads, copies and vouches to a bounded length, and fails
-//!   a mutant that arms at track.
+//! - *A synchronous baseline.* Reading a generation immediately after
+//!   `track_guest_writes` cannot cover the writes made before logging was on,
+//!   and `HostOps::track_guest_writes` states that enabling logging is deferred
+//!   to a bottom half under the BQL. The shim's arming rule lives in the QEMU
+//!   submodule, which this checkout does not carry, so a change there was not
+//!   audited and none is made. The Rust-side conclusion stands on its own: until
+//!   the shim can say *at which harvest* logging became active, the first
+//!   gather after arming is the earliest the baseline can describe.
 //! - *Reusing one gathered image inside the arming window.* No half of the
 //!   witness can vouch there, and "unarmed means unchanged" is exactly the
 //!   inference this module exists to refuse. A content compare is the one other
@@ -340,10 +325,10 @@
 //! - *More cache.* `sampled_gather_unretained` bounds what capacity could buy at
 //!   3 gathers of 628.
 //!
-//! The `gather_storm` lines (see [`crate::runtime::gather_storm`]) are the instrument for
-//! what remains: whether the repeats sit inside one drain tranche, how many binds
-//! a window takes to read its first generation, whether any host is refusing
-//! tokens, and which windows carry the volume.
+//! The `gather_storm` lines (see [`crate::runtime::gather_storm`]) are the
+//! instrument for what remains: how many binds a window takes to read its first
+//! generation, whether any host is refusing tokens, and which windows carry the
+//! volume.
 //!
 //! # The content fold is now an audit, not the decision
 //!
@@ -541,8 +526,6 @@ struct Entry {
     born: BindClock,
     /// Binds of this entry, this one included once recorded.
     binds_alive: u32,
-    /// Tranche of the previous bind.
-    last_tranche: u64,
     /// Consecutive [`GatherVerdict::Unarmed`] binds ending at the previous one.
     unarmed_run: u32,
     /// Whether any bind of this entry has read a generation.
@@ -721,7 +704,6 @@ impl GatherWitness {
                 generation: 0,
                 born: BindClock::default(),
                 binds_alive: 0,
-                last_tranche: 0,
                 unarmed_run: 0,
                 ever_readable: false,
                 shadow_fold: None,
@@ -1014,17 +996,10 @@ pub struct Rearm {
     pub interrupted_arming: bool,
 }
 
-/// Where a bind sits in the device's own timeline: which drain tranche and when.
-///
-/// The dirty tracker only answers at harvest points. Harvests run at the guest
-/// doorbells, and a tracked set that is not yet armed also asks the main loop
-/// for one, so two binds in one tranche can still have no harvest *the drain
-/// thread could see* between them. Carried as a value into
+/// When a bind landed in the device's own timeline. Carried as a value into
 /// [`observe`] rather than read there so a test can state it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct BindClock {
-    /// [`crate::runtime::drain::tranche_seq`].
-    pub tranche: u64,
     /// [`crate::observe::elapsed_us`].
     pub us: u64,
 }
@@ -1032,20 +1007,13 @@ pub struct BindClock {
 /// One bind placed in the life of its window's entry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct EntryLife {
-    /// The tranche this bind ran in, as [`BindClock::tranche`].
-    pub tranche: u64,
     /// Binds of this entry so far, this one included: 1 on the bind that created
     /// it.
     pub binds: u32,
-    /// Drain tranches since the entry was created; 0 when this is still the
-    /// tranche that created it.
-    pub tranches: u64,
     /// Microseconds since the entry was created.
     pub us: u64,
     /// Consecutive [`GatherVerdict::Unarmed`] binds immediately before this one.
     pub unarmed_run_before: u32,
-    /// The previous bind of this window was in this same tranche.
-    pub same_tranche_as_previous: bool,
     /// The host answered with a readable generation at this bind.
     pub readable: bool,
     /// This is the first bind of the entry that read one.
@@ -1346,7 +1314,6 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
         },
         pending: PendingWrites::over(window.gpas),
         clock: BindClock {
-            tranche: crate::runtime::drain::tranche_seq(),
             us: crate::observe::elapsed_us(),
         },
     };
@@ -1664,7 +1631,6 @@ fn observe<M: crate::runtime::host::HostOps>(
                 generation: fresh_generation,
                 born: clock,
                 binds_alive: 1,
-                last_tranche: clock.tranche,
                 unarmed_run: 0,
                 ever_readable: gen != 0,
                 shadow_fold,
@@ -1688,7 +1654,6 @@ fn observe<M: crate::runtime::host::HostOps>(
                 unarmed: None,
                 rearm: Some(rearm),
                 life: EntryLife {
-                    tranche: clock.tranche,
                     binds: 1,
                     readable: gen != 0,
                     first_readable: gen != 0,
@@ -1750,17 +1715,13 @@ fn observe<M: crate::runtime::host::HostOps>(
     let vouched = matches!(verdict, GatherVerdict::Vouched);
     let readable = gen != 0;
     let life = EntryLife {
-        tranche: clock.tranche,
         binds: entry.binds_alive.saturating_add(1),
-        tranches: clock.tranche.saturating_sub(entry.born.tranche),
         us: clock.us.saturating_sub(entry.born.us),
         unarmed_run_before: entry.unarmed_run,
-        same_tranche_as_previous: entry.last_tranche == clock.tranche,
         readable,
         first_readable: readable && !entry.ever_readable,
     };
     entry.binds_alive = life.binds;
-    entry.last_tranche = clock.tranche;
     entry.ever_readable |= readable;
     entry.unarmed_run = if unarmed.is_some() {
         entry.unarmed_run.saturating_add(1)
@@ -1969,7 +1930,7 @@ mod tests {
         pages_wrote: Some(crate::runtime::host_writes::HostWriteVerdict::Quiet),
         pending: PendingWrites::Disjoint,
         stated_gen: None,
-        clock: BindClock { tranche: 1, us: 0 },
+        clock: BindClock { us: 0 },
     };
 
     /// One bind, discarding the audit — for the tests that are about the verdict.
@@ -2869,12 +2830,12 @@ mod tests {
     }
 
     /// One bind of the window under test, on a host whose arming window the test
-    /// controls, in tranche `tranche`.
+    /// controls, at `ms` milliseconds into the device's life.
     fn bind_in(
         w: &mut GatherWitness,
         host: &mut crate::runtime::host::FakeHost,
         runs: &[GuestRun],
-        tranche: u64,
+        ms: u64,
     ) -> GatherObservation {
         observe(
             w,
@@ -2882,10 +2843,7 @@ mod tests {
             KEY,
             one_page(&GPAS, runs),
             WitnessReadings {
-                clock: BindClock {
-                    tranche,
-                    us: tranche * 1000,
-                },
+                clock: BindClock { us: ms * 1000 },
                 ..QUIET
             },
             next_gen(),
@@ -2920,7 +2878,6 @@ mod tests {
             let arming = bind_in(&mut w, &mut host, &runs, 1);
             assert_eq!(arming.verdict, GatherVerdict::Unarmed, "repeat {n}");
             assert_eq!(arming.detail.unarmed, Some(UnarmedCause::Arming));
-            assert!(arming.detail.life.same_tranche_as_previous);
             assert_eq!(arming.detail.life.unarmed_run_before, n);
             assert!(!arming.detail.life.first_readable);
         }
@@ -2931,9 +2888,7 @@ mod tests {
         assert_eq!(baseline.detail.unarmed, Some(UnarmedCause::NoBaseline));
         assert!(baseline.detail.life.first_readable);
         assert_eq!(baseline.detail.life.binds, 5);
-        assert_eq!(baseline.detail.life.tranches, 1);
         assert_eq!(baseline.detail.life.us, 1000);
-        assert!(!baseline.detail.life.same_tranche_as_previous);
 
         let vouched = bind_in(&mut w, &mut host, &runs, 2);
         assert_eq!(vouched.verdict, GatherVerdict::Vouched);
@@ -2993,7 +2948,6 @@ mod tests {
             assert_eq!(arming.verdict, GatherVerdict::Unarmed, "repeat {n}");
             assert_eq!(arming.detail.unarmed, Some(UnarmedCause::Arming));
             assert_eq!(arming.vouch, GatherVouch::Unreachable);
-            assert!(arming.detail.life.same_tranche_as_previous);
             assert_eq!(arming.detail.life.unarmed_run_before, n);
         }
 
@@ -3008,9 +2962,7 @@ mod tests {
         );
         assert!(baseline.detail.life.first_readable);
         assert_eq!(baseline.detail.life.binds, 5);
-        assert_eq!(baseline.detail.life.tranches, 1);
         assert_eq!(baseline.detail.life.us, 1000);
-        assert!(!baseline.detail.life.same_tranche_as_previous);
 
         let vouched = bind_in(&mut w, &mut host, &runs, 2);
         assert_eq!(vouched.verdict, GatherVerdict::Vouched);
@@ -3082,10 +3034,7 @@ mod tests {
                     } else {
                         HostWriteVerdict::Quiet
                     }),
-                    clock: BindClock {
-                        tranche: step / 3,
-                        us: step * 10,
-                    },
+                    clock: BindClock { us: step * 10 },
                     ..QUIET
                 };
                 let seen = observe(

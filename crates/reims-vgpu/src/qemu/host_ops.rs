@@ -306,34 +306,6 @@ impl QemuHostDecline {
 
 /// Production host bridge: GPA/KVA via C callbacks, actions queued for the BH.
 ///
-/// One QEMU shim callback that changes the host's view of guest RAM, charged
-/// to the running drain tranche when dropped.
-///
-/// Measured here, at the boundary, because these are the drain's only calls
-/// into QEMU whose cost the device cannot bound: an alias map/unmap and a
-/// dirty-log token (un)track can each reach a memory-region update on the
-/// QEMU side, and a tranche whose time vanished into one would otherwise read
-/// as whichever span happened to be open around it.
-struct HostCallCost {
-    cost: crate::runtime::drain::TrancheCost,
-    started: std::time::Instant,
-}
-
-impl HostCallCost {
-    fn start(cost: crate::runtime::drain::TrancheCost) -> Self {
-        Self {
-            cost,
-            started: std::time::Instant::now(),
-        }
-    }
-}
-
-impl Drop for HostCallCost {
-    fn drop(&mut self) {
-        crate::runtime::drain::note_tranche_since(self.cost, self.started);
-    }
-}
-
 /// Two action rails:
 /// - `actions` (inside the device lock): scanout / cursor-glyph / trace —
 ///   delivered by the BH after the drain tranche releases the lock (the
@@ -470,35 +442,17 @@ impl HostOps for QemuHost<'_> {
                 // does not hold for an event the guest **timestamps**: a VBL
                 // pulse that coalesces into an undelivered one is a vblank the
                 // guest never sees, so the interval it measures between vblanks
-                // is two grid periods rather than one. This counter says how
-                // often it happens; `note_irq_coalesced`'s doc says why that
-                // number decides a boot's frame rate.
-                let coalesced = q.iter().any(|a| a.kind == action.kind);
-                if !coalesced {
-                    // Arm the delivery clock while the queue lock is held, so
-                    // the stamp cannot be taken after the BH has already popped
-                    // this action on another thread. See `irq_wait_us`: the
-                    // guest cannot doorbell the drain worker until this pulse
-                    // reaches it, so this hop is the one candidate for
-                    // `gap_idle_us` that is ours.
-                    if q.is_empty() {
-                        crate::runtime::drain::note_irq_armed();
-                    }
+                // is two grid periods rather than one.
+                if !q.iter().any(|a| a.kind == action.kind) {
                     q.push_back(action);
                 }
                 drop(q);
-                if coalesced {
-                    crate::runtime::drain::note_irq_coalesced(action.kind);
-                }
                 self.notify_actions();
                 return;
             }
             HostActionKind::CursorUpdate => {
                 let mut q = prompt.lock();
                 q.retain(|a| a.kind != HostActionKind::CursorUpdate);
-                if q.is_empty() {
-                    crate::runtime::drain::note_irq_armed();
-                }
                 q.push_back(action);
                 drop(q);
                 self.notify_actions();
@@ -592,7 +546,6 @@ impl HostOps for QemuHost<'_> {
     }
 
     fn map_pages(&mut self, gpas: &[u64], page_size: usize) -> Option<usize> {
-        let _cost = HostCallCost::start(crate::runtime::drain::TrancheCost::HostMap);
         if gpas.is_empty() {
             return None;
         }
@@ -719,7 +672,6 @@ impl HostOps for QemuHost<'_> {
     }
 
     fn unmap_pages(&mut self, ptr: usize, len: usize) {
-        let _cost = HostCallCost::start(crate::runtime::drain::TrancheCost::HostUnmap);
         if ptr == 0 || len == 0 {
             return;
         }
@@ -743,7 +695,6 @@ impl HostOps for QemuHost<'_> {
     }
 
     fn track_guest_writes(&mut self, gpas: &[u64], page_size: usize) -> Option<u64> {
-        let _cost = HostCallCost::start(crate::runtime::drain::TrancheCost::HostTrack);
         if gpas.is_empty() || page_size == 0 {
             return None;
         }
@@ -758,7 +709,6 @@ impl HostOps for QemuHost<'_> {
     }
 
     fn untrack_guest_writes(&mut self, token: u64) {
-        let _cost = HostCallCost::start(crate::runtime::drain::TrancheCost::HostUntrack);
         if token == 0 {
             return;
         }

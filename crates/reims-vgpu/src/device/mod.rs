@@ -418,7 +418,6 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
             if crate::model::accept_child_channel(channel, "lock_free_child_doorbell") {
                 slot.child_doorbell_rung
                     .fetch_or(1u32 << channel, Ordering::AcqRel);
-                crate::runtime::drain::note_doorbell_lock_free();
                 schedule_device(&slot);
             }
             return true;
@@ -638,9 +637,7 @@ pub fn device_poll(id: u64) -> bool {
 /// than dropping ~90% of VBLs, which is the pre-fix behaviour under load.
 fn vbl_contended_pulse(slot: &BoundDevice) {
     let gpa = slot.vbl_shared_gpa.load(Ordering::Acquire);
-    let now = crate::observe::elapsed_ms() as u64;
     if gpa == 0 || !slot.vbl_online.load(Ordering::Acquire) {
-        crate::runtime::drain::note_vbl(crate::runtime::drain::VBL_NOT_ONLINE, now);
         return;
     }
     let Some(ops) = slot.ops else {
@@ -650,7 +647,6 @@ fn vbl_contended_pulse(slot: &BoundDevice) {
     if page_size == 0 {
         // The locked poll publishes this with the rest of the snapshot, so a
         // zero means no locked poll has run since bind. Nothing is owed yet.
-        crate::runtime::drain::note_vbl(crate::runtime::drain::VBL_NOT_ONLINE, now);
         return;
     }
     let mut scratch = VecDeque::new();
@@ -658,10 +654,10 @@ fn vbl_contended_pulse(slot: &BoundDevice) {
     // One body decides what a refresh tick writes, and both poll arms call it.
     // This arm used to carry its own copy, and the copy had already lost a term:
     // it never read the enable word at all, so it set a pending bit the guest's
-    // ISR would never clear and counted the write as `delivered`.
+    // ISR would never clear.
     //
-    // The shared limiter lives in there too, so both arms report into one census
-    // and neither can spend a grid slot on a tick that found the guest disarmed.
+    // The shared limiter lives in there too, so neither arm can spend a grid
+    // slot on a tick that found the guest disarmed.
     crate::runtime::drain::signal_display_refresh_classes(
         &mut host,
         gpa,
@@ -683,13 +679,6 @@ pub fn device_pop_action(id: u64) -> Option<HostAction> {
     {
         let mut q = slot.prompt_actions.lock();
         if let Some(a) = q.pop_front() {
-            // The hop this closes is enqueue-to-BH, so it is banked when the
-            // queue empties rather than per action: an IRQ pulse behind a cursor
-            // move waited for the same BH and would double-count. See
-            // `irq_wait_us`.
-            if q.is_empty() {
-                crate::runtime::drain::note_irq_delivered();
-            }
             return Some(a);
         }
     }

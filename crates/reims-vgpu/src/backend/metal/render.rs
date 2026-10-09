@@ -1752,7 +1752,7 @@ mod attachment_decline_tests {
 /// This paragraph used to say the three costs could not be sized because "this
 /// repository has no Apple host to boot", and ranked them by argument:
 /// `waitUntilCompleted` first, the per-draw command buffer second, the per-draw
-/// pass third. The six [`crate::runtime::chain_phase::CostSpan`]s below divide
+/// pass third. The six `crate::runtime::chain_phase::CostSpan`s below divide
 /// the bar, and on a driven macos-13 Metal boot (2 480 chains, pointer-driven at
 /// the login window) they read:
 ///

@@ -14,7 +14,7 @@
 //! [`host_window_publish`] emits one line per window and stays silent while its
 //! counters are zero. It is named for the side it measures: this is the *host
 //! window's* accept-or-drop decision, whereas
-//! [`crate::runtime::drain::census::WindowPublish`] classifies what the drain
+//! `crate::runtime::drain::census::WindowPublish` classifies what the drain
 //! offered. They are deliberately not duplicates and must not share a tag —
 //! see that type's doc.
 

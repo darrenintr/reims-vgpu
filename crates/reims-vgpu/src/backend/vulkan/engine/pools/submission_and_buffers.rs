@@ -1355,13 +1355,6 @@ impl ResourcePools {
         let fence = self.slots[index].fence;
         let wait_started = std::time::Instant::now();
         let waited = ctx.device.wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS);
-        // Charged to the tranche that blocked, success or not: a ring wait is
-        // the GPU still running work queued earlier, and a hitch line has to be
-        // able to tell that from host-side cost.
-        crate::runtime::drain::note_tranche_since(
-            crate::runtime::drain::TrancheCost::RingWait,
-            wait_started,
-        );
         crate::runtime::drain::stall::note_stall_since(
             crate::runtime::drain::stall::Stall::RingWait,
             wait_started,
@@ -2014,10 +2007,6 @@ impl ResourcePools {
         }
         let wait_started = std::time::Instant::now();
         let waited = ctx.device.wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS);
-        crate::runtime::drain::note_tranche_since(
-            crate::runtime::drain::TrancheCost::EntryWait,
-            wait_started,
-        );
         crate::runtime::drain::stall::note_stall_since(
             crate::runtime::drain::stall::Stall::EntryWait,
             wait_started,

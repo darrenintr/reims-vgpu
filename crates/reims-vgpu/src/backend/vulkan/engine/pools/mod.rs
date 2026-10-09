@@ -3463,10 +3463,6 @@ pub(crate) unsafe fn allocate_memory_timed(
     let result = ctx.device.allocate_memory(info, None);
     let elapsed = started.elapsed();
     let us = elapsed.as_micros() as u64;
-    crate::runtime::drain::note_tranche_cost(
-        crate::runtime::drain::TrancheCost::Alloc,
-        elapsed.as_nanos() as u64,
-    );
     let i = site.idx();
     ALLOC_SITE_COUNT[i].fetch_add(1, Ordering::Relaxed);
     ALLOC_SITE_BYTES[i].fetch_add(info.allocation_size, Ordering::Relaxed);

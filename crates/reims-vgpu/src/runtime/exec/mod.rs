@@ -1019,7 +1019,7 @@ fn execute_submission<M: HostMemory + HostOps>(
 ///
 /// # The tiling closes over two clocks, and it has to
 ///
-/// [`ExecPhase::Header`] is a leftover — a span's worth of time minus the
+/// `ExecPhase::Header` is a leftover — a span's worth of time minus the
 /// phases that measured themselves — and it used to be derived from one clock
 /// because reading and running were one call. They are not: a parked packet is
 /// read when it arrives and run when the model releases it, and a single clock
@@ -5208,7 +5208,6 @@ fn finish_stream<M: HostMemory + HostOps>(
                 if do_writeback {
                     out.render_guest_stores = out.render_guest_stores.saturating_add(1);
                 }
-                let draw_started = std::time::Instant::now();
                 let encode = crate::backend::selected().encode_draw_chain(
                     state,
                     host,
@@ -5252,10 +5251,6 @@ fn finish_stream<M: HostMemory + HostOps>(
                     }
                     (None, _) => {}
                 }
-                crate::runtime::drain::note_drain_phase(
-                    crate::runtime::drain::DrainPhase::Draw,
-                    draw_started,
-                );
                 match encode {
                     (EncodeStatus::Ok, Some(rgba)) => {
                         out.metal_draws_ok += 1;

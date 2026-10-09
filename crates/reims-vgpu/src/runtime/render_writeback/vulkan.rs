@@ -66,7 +66,6 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
     // owned copy is its home, so a non-BGRA resident takes the copy rather than
     // teaching the lease to rewrite memory it does not own.
     let bpr = width.saturating_mul(4);
-    let write_started = std::time::Instant::now();
     // A refused lease is a *routing* answer, never a loss. The lease is an
     // elision of one whole-frame copy and nothing else, so whatever it declines
     // for, the copying rail below can still serve — and it is strictly the
@@ -177,10 +176,6 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
             }
         }
     };
-    crate::runtime::drain::note_readback_phase(
-        crate::runtime::drain::ReadbackPhase::Write,
-        write_started.elapsed().as_micros() as u64,
-    );
     if !ok {
         crate::observe::fail(format!(
             "render_store_lost mapping={mapping_id} {width}x{height} reason=write_refused"
@@ -256,10 +251,6 @@ fn finish(
     } else {
         crate::runtime::drain::note_store_route("shared_store_registry_handoff_elided");
     }
-    crate::runtime::drain::note_drain_phase(
-        crate::runtime::drain::DrainPhase::Flush(crate::runtime::drain::FlushRail::Render),
-        started,
-    );
     crate::observe::line(format!(
         "render_store mapping={mapping_id} bytes={frame_len} us={}",
         started.elapsed().as_micros()

@@ -1359,35 +1359,13 @@ fn list_entry<M: HostMemory>(
 ) -> Option<ListObjectEntry> {
     let found = list_entry_or_miss(state, host, task_id, ref_, lookup);
     match found {
-        Ok(entry) => {
-            // Only a ref the guest named: a probe's success is the search
-            // finding an owner, which says nothing about what this task's own
-            // list once held.
-            if lookup == ListLookup::Named {
-                // The control for the banding below, and the reason it is worth
-                // reading: a miss skewing late says nothing unless the hits do
-                // not. See `census::note_list_lookup_age`.
-                crate::runtime::drain::note_list_lookup_age(
-                    true,
-                    crate::runtime::drain::tranche_elapsed_us(),
-                );
-            }
-            Some(entry)
-        }
+        Ok(entry) => Some(entry),
         Err(miss) => {
             // Only for a ref the guest named. A probe misses on every task that
             // does not own the ref, which is how it finds the one that does —
             // counting those would bury the named misses under the search.
             if lookup == ListLookup::Named {
                 crate::runtime::drain::note_store_route(miss.route());
-                // How late in its tranche this lookup happened. The guest clears
-                // a slot by writing its own memory, so a slot found cleared
-                // should be one read late — if these band like the hits do, that
-                // story is wrong however good the totals look.
-                crate::runtime::drain::note_list_lookup_age(
-                    false,
-                    crate::runtime::drain::tranche_elapsed_us(),
-                );
             }
             None
         }

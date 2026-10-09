@@ -864,7 +864,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // The two halves of this rail's `seed_us`, which a driven macos-13 boot put
     // at 4.79 ms a draw — the largest bar on the rail. They are counters beside
     // the bar rather than a finer cut of it, so the bar keeps comparing across
-    // boots; see [`chain_phase::CostSpan`].
+    // boots; see `chain_phase::CostSpan`.
     let mut color_outs: Vec<Vec<u8>> = { (0..color_list.len()).map(|_| vec![0u8; need]).collect() };
 
     // For indexed draws, pass index_count as vertex_count for the early gate.

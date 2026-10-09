@@ -1965,9 +1965,6 @@ impl ObjectCaches {
         // can end the process on a module this device assembled — the other two
         // being the compute and graphics pipeline compiles below. See
         // `driver_breadcrumb` for why the words go to disk across it.
-        // Driver compile time, breadcrumb and cache persist included, charged
-        // to the running tranche below: a first-seen pipeline is a hitch.
-        let create_started = std::time::Instant::now();
         let breadcrumb = match super::driver_breadcrumb::DriverBreadcrumb::arm(
             "create_shader_module",
             &[("module", words)],
@@ -1989,10 +1986,6 @@ impl ObjectCaches {
             err
         })?;
         counters.note_create(CreateSite::ShaderModule);
-        crate::runtime::drain::note_tranche_since(
-            crate::runtime::drain::TrancheCost::PipeCreate,
-            create_started,
-        );
         if let Some(old) = self.shaders.insert(key, module) {
             pools.dispose(&ctx.device, DeferredHandle::ShaderModule(old));
         }
@@ -2853,9 +2846,6 @@ impl ObjectCaches {
         // uber fragment shader has been observed keeping NVIDIA's compiler in
         // here for over ten minutes with the device lock held; see
         // `crate::observe::driver_watch`, which this arming also starts.
-        // Driver compile time, breadcrumb and cache persist included, charged
-        // to the running tranche below: a first-seen pipeline is a hitch.
-        let create_started = std::time::Instant::now();
         let breadcrumb = match super::driver_breadcrumb::DriverBreadcrumb::arm(
             &format!(
                 "create_graphics_pipelines vert_words={} frag_words={}",
@@ -2885,10 +2875,6 @@ impl ObjectCaches {
         // the maintenance heartbeat once compiles go quiet, not here: see
         // `DeviceContext::note_pipeline_cache_grew`.
         ctx.note_pipeline_cache_grew();
-        crate::runtime::drain::note_tranche_since(
-            crate::runtime::drain::TrancheCost::PipeCreate,
-            create_started,
-        );
         if let Some(old) = self.pipelines.insert(key.clone(), pipe) {
             pools.dispose(&ctx.device, DeferredHandle::Pipeline(old));
         }
@@ -2965,9 +2951,6 @@ impl ObjectCaches {
             .layout(pipeline_layout);
         // The other call that compiles the module, and the one an NVIDIA driver
         // has been observed dying inside on a macos-14 guest's first dispatch.
-        // Driver compile time, breadcrumb and cache persist included, charged
-        // to the running tranche below: a first-seen pipeline is a hitch.
-        let create_started = std::time::Instant::now();
         let breadcrumb = match super::driver_breadcrumb::DriverBreadcrumb::arm(
             &format!("create_compute_pipelines entry={}", key.entry),
             &[("kernel", shader.spirv)],
@@ -2993,10 +2976,6 @@ impl ObjectCaches {
         counters.note_create(CreateSite::ComputePipeline);
         // Same warm-start persistence as the graphics path.
         ctx.note_pipeline_cache_grew();
-        crate::runtime::drain::note_tranche_since(
-            crate::runtime::drain::TrancheCost::PipeCreate,
-            create_started,
-        );
         if let Some(old) = self.compute_pipelines.insert(key.clone(), pipe) {
             pools.dispose(&ctx.device, DeferredHandle::Pipeline(old));
         }

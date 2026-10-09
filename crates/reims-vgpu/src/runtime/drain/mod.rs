@@ -2111,7 +2111,6 @@ fn arrival_work<H: HostMemory + HostOps>(
     fifo: crate::runtime::ingress::Fifo,
     packet: &Packet,
 ) -> Arrived {
-    let _span = census::tranche_span(census::TrancheCost::AdmitArrival);
     let mut arrived = Arrived {
         submission: None,
         exec: crate::runtime::exec::ExecResult::default(),
@@ -2122,10 +2121,8 @@ fn arrival_work<H: HostMemory + HostOps>(
     }
     match packet.opcode {
         CHILD_OP_EXEC_INDIRECT2 => {
-            let (submission, exec) = {
-                let _span = census::tranche_span(census::TrancheCost::AdmitReadExec);
-                crate::runtime::exec::read_exec_submission(state, host, &packet.payload)
-            };
+            let (submission, exec) =
+                { crate::runtime::exec::read_exec_submission(state, host, &packet.payload) };
             arrived.exec = exec;
             arrived.submission = submission;
         }
@@ -2193,15 +2190,8 @@ fn admit_and_park<H: HostMemory + HostOps>(
 ) {
     use reims_vgpu_core::identity::StampSlot;
 
-    // Each step below is its own exclusive tiling span, so the admission
-    // record and the tranche line both say which step a slow admission spent
-    // its time in; `Admit` keeps only what falls between them. See
-    // `census::AdmissionAnatomy`.
-    use census::{tranche_span, TrancheCost};
-
     let arrived = arrival_work(state, host, fifo, &packet);
     let built = {
-        let _span = tranche_span(TrancheCost::AdmitBuildPacket);
         let session = state.session_generation();
         crate::runtime::ingress::device_packet(
             state,
@@ -2242,7 +2232,6 @@ fn admit_and_park<H: HostMemory + HostOps>(
     // a wait nothing can satisfy loses the guest. So the wait is dropped and
     // named, here rather than in the bridge — which slot numbers exist is a
     // property of this device's page and not of the packet.
-    let wait_filter = tranche_span(TrancheCost::AdmitWaitFilter);
     let page_size = state.page_size();
     built.stamp_waits.retain(|wait| {
         if stamp_slot_offset(wait.slot.0, page_size).is_some() {
@@ -2261,9 +2250,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
         }
         false
     });
-    drop(wait_filter);
     {
-        let _span = tranche_span(TrancheCost::AdmitAccessModes);
         note_access_modes(state, &built);
     }
     // The pipelines the records bind, told to the model before it is asked
@@ -2293,7 +2280,6 @@ fn admit_and_park<H: HostMemory + HostOps>(
     // step is the guest's fact and the walk's own list; taking it earlier
     // states the same thing at the first moment it is known.
     {
-        let _span = tranche_span(TrancheCost::AdmitPipelineDeclare);
         for &lease in leases {
             note_store_route(if state.declare_pipeline(lease) {
                 "pipeline_declared"
@@ -2304,13 +2290,11 @@ fn admit_and_park<H: HostMemory + HostOps>(
     }
     let translating = match (arrived.submission.as_ref(), built.payload.exec()) {
         (Some(submission), Some(resolved)) => {
-            let _span = tranche_span(TrancheCost::AdmitPreflight);
             crate::runtime::exec::preflight_submission(state, host, submission, resolved)
         }
         _ => Vec::new(),
     };
     {
-        let _span = tranche_span(TrancheCost::AdmitPipelineState);
         for &lease in leases {
             if translating.contains(&lease.slot.0) {
                 withdraw_lease(state, lease);
@@ -2320,15 +2304,9 @@ fn admit_and_park<H: HostMemory + HostOps>(
         }
     }
 
-    let admitted = {
-        let _span = tranche_span(TrancheCost::AdmitModel);
-        state.admit_packet(&built)
-    };
+    let admitted = { state.admit_packet(&built) };
     let admission = match admitted {
-        Ok(admission) => {
-            census::note_hazard_scan(admission.hazard_scan);
-            admission
-        }
+        Ok(admission) => admission,
         Err(refusal) => {
             note_unadmitted(
                 state,
@@ -2342,7 +2320,6 @@ fn admit_and_park<H: HostMemory + HostOps>(
             return;
         }
     };
-    let build_parked = tranche_span(TrancheCost::AdmitBuildParked);
     let mut transaction = admission.admitted.transaction;
     let ingress = transaction.identity.ingress;
     // The resolved records move out of the transaction the model just handed
@@ -2370,8 +2347,6 @@ fn admit_and_park<H: HostMemory + HostOps>(
         ),
         _ => crate::runtime::parked::ParkedWork::new(fifo.domain().0, admission.epoch, packet),
     };
-    drop(build_parked);
-    let _span = tranche_span(TrancheCost::AdmitPark);
     state.parked.park(ingress, work);
 }
 
@@ -2470,7 +2445,6 @@ pub(crate) fn note_access_modes(state: &DeviceState, built: &reims_vgpu_core::se
 /// into the model and this takes work out of it, and neither is a function of
 /// where a ring's head happens to be.
 fn settle_model_work<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
-    let _span = census::tranche_span(census::TrancheCost::Settle);
     // **Until nothing more runs, not once.** Running a position publishes its
     // channel's completion words, and a published word discharges the stamp
     // waits other positions were admitted with — so one pass over what was
@@ -2568,7 +2542,6 @@ fn declined_by_the_device(
 /// forever. So the slots parked work is watching are read every pass, which is
 /// the same observation at the moment it has become the only one.
 fn observe_awaited_stamps<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
-    let _span = census::tranche_span(census::TrancheCost::SettleStamps);
     if state.gfx.fifo_base_page == 0 {
         return;
     }
@@ -2576,7 +2549,6 @@ fn observe_awaited_stamps<H: HostMemory + HostOps>(state: &mut DeviceState, host
     if waiting.is_empty() {
         return;
     }
-    census::note_tranche_count(census::TrancheCost::SettleWalk, 0, waiting.len() as u64);
     let mut seen: Vec<u32> = Vec::new();
     for ingress in waiting {
         for index in state.parked.awaited_slots(ingress) {
@@ -2615,9 +2587,7 @@ fn observe_awaited_stamps<H: HostMemory + HostOps>(state: &mut DeviceState, host
 /// Nothing here runs anything. It moves pipelines to `Ready`, and readying a
 /// pipeline is what the model turns into released work.
 fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
-    let _span = census::tranche_span(census::TrancheCost::SettlePump);
     let waiting = state.parked.waiting_in_order();
-    census::note_tranche_count(census::TrancheCost::SettleWalk, 0, waiting.len() as u64);
     for ingress in waiting {
         let Some((submission, resolved)) = state.parked.planning(ingress) else {
             continue;
@@ -2676,7 +2646,6 @@ fn run_parked<H: HostMemory + HostOps>(
 ) {
     let domain = work.domain();
     if domain == crate::runtime::ingress::Fifo::ROOT.domain().0 {
-        let _span = census::tranche_span(census::TrancheCost::RootProc);
         process_root_packet(state, host, work.packet());
     } else {
         // The re-entry guard this packet used to be run under. A child packet's
@@ -2690,17 +2659,12 @@ fn run_parked<H: HostMemory + HostOps>(
         let prev_channel = state.draining_channel;
         state.draining_channel = domain;
         state.draining_mask |= bit;
-        // Exclusive `proc`: a drain this packet enters (a present's rescue) is
-        // charged under its own names, not a second time as this packet's.
-        let packet_span = census::packet_span(work.packet().opcode);
         let _ = process_child_packet(state, host, domain, work.packet(), work.retained());
-        drop(packet_span);
         if was_draining == 0 {
             state.draining_mask &= !bit;
         }
         state.draining_channel = prev_channel;
     }
-    let _complete = census::tranche_span(census::TrancheCost::Complete);
     match state.complete_transaction(work.epoch(), ingress) {
         Ok(released) => {
             for release in released {
@@ -4112,7 +4076,6 @@ fn process_root_packet<H: HostMemory + HostOps>(
 
 /// Drain the main (root) FIFO while producer != consumer.
 pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
-    let _span = census::tranche_span(census::TrancheCost::MainFifo);
     let ring_size = main_ring_data_size(state.gfx.fifo_length, state.gfx.fifo_start);
     if ring_size == 0 || state.gfx.fifo_base_page == 0 {
         state.pending.main_drain = false;
@@ -4146,13 +4109,7 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                 // tears down a task whose work has not been drained — which is
                 // exactly the ordering `admit` now holds, on a position rather
                 // than on this ring's consumer pointer.
-                // One admission record across both halves, so the stamp census
-                // and `admit_and_park`'s steps land on the same packet.
-                let admission = census::admission_scope(packet.opcode, None);
-                {
-                    let _admit = census::tranche_span(census::TrancheCost::AdmitStampWaits);
-                    note_packet_stamp_waits(state, host, None, &packet);
-                }
+                note_packet_stamp_waits(state, host, None, &packet);
 
                 // The head advances first and unconditionally; see the child
                 // drain's copy for why that is the whole of the switch.
@@ -4161,17 +4118,13 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                     .fifo_read
                     .store(packet.next_head, std::sync::atomic::Ordering::Release);
 
-                {
-                    let _admit = census::tranche_span(census::TrancheCost::Admit);
-                    admit_and_park(
-                        state,
-                        host,
-                        crate::runtime::ingress::Fifo::ROOT,
-                        ROOT_STAMP_SLOT,
-                        packet,
-                    );
-                }
-                drop(admission);
+                admit_and_park(
+                    state,
+                    host,
+                    crate::runtime::ingress::Fifo::ROOT,
+                    ROOT_STAMP_SLOT,
+                    packet,
+                );
                 settle_model_work(state, host);
             }
         }
@@ -4320,7 +4273,7 @@ fn shared_w32<H: HostMemory + HostOps>(host: &mut H, gpa: u64, off: u64, v: u32,
 ///
 /// That leaves the cause downstream of mode selection, in what the guest's
 /// compositor does with a 120 Hz link it has correctly acquired. `VBL_REPORT_
-/// EARLY` beside [`census::VblCensus`] records what else has been ruled out.
+/// EARLY` beside `census::VblCensus` records what else has been ruled out.
 /// Element 0 (1920×1080) stays the native/preferred format (+0x210/+0x212 double
 /// as NativeFormat*Pixels), so boot resolution is unchanged and 4K is an
 /// additional selectable mode; the dynamic scanout/present/host-window geometry
@@ -4758,11 +4711,6 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     if mapping == 0 {
         return ChildPacketDisposition::Complete;
     }
-    // The present's own record for the tranche ledger: every step below is
-    // timed inclusive, nested drains beside it, so a long present names the
-    // step that owned it (`present_long`). Inert outside a drain tranche.
-    let _present = census::present_scope(channel_id, mapping);
-    use census::{present_phase, PresentPhase};
     // Archive apple_pv_gpu_display_swap:
     //   render_wait_surface(s, false, swap->mapping_id);
     //   scanout_present_boundary(...);
@@ -4781,7 +4729,6 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         channel_id
     };
     {
-        let _phase = present_phase(PresentPhase::RescueChildFirst);
         drain_pending_other_child_fifos(state, host, skip);
     }
     // This used to run a second child rescue immediately after the first.
@@ -4808,11 +4755,9 @@ fn present_named_mapping<H: HostMemory + HostOps>(
             != state.gfx.fifo_written
     {
         {
-            let _phase = present_phase(PresentPhase::RescueMain);
             drain_main_fifo(state, host);
         }
         // Body-layer child work may be doorbell'd from main packets.
-        let _phase = present_phase(PresentPhase::RescueChildAfterMain);
         drain_pending_other_child_fifos(state, host, skip);
     }
 
@@ -4855,14 +4800,12 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     // unannounced, to fill the next back buffer. Its frame has to be in its
     // pages before anything after this swap can reach the guest.
     {
-        let _phase = present_phase(PresentPhase::PayCpuShared);
         crate::runtime::writeback_debt::pay_cpu_shared_mapping(state, host, mapping);
     }
     // x86: present surface_id → backing object-list slot (heap index =
     // IOSurface getSurfaceID). Arm: MappingInternal page-table resolve.
     // Always attempt backing when pages empty; then iosfc/mapper path.
     {
-        let _phase = present_phase(PresentPhase::EnsureSurface);
         let _ = crate::runtime::objects::ensure_surface_for_present(state, host, mapping);
     }
     let force = state
@@ -4871,7 +4814,6 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         .map(|m| m.mapping_internal != 0)
         .unwrap_or(false);
     if force {
-        let _phase = present_phase(PresentPhase::ResolveBacking);
         let _ = crate::runtime::mapper::resolve_mapping_backing(state, host, mapping);
     }
     // Paint only from the presented surface's own geom — never the
@@ -4892,7 +4834,6 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // Independent of everything below: the guest's own copy of the plane
         // this present names, sampled where the desktop background belongs.
         {
-            let _phase = present_phase(PresentPhase::FieldWitness);
             crate::runtime::scanout::note_present_field_witness(state, &*host, mapping, w, h);
         }
         // Every present takes one route: capture the surface the transaction
@@ -4954,10 +4895,8 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // the arm, so only on a present the structural gate has already refused —
         // four times in that boot, not 60 times a second.
         if let Some(backing) = state.note_present_backing(mapping) {
-            let carried = {
-                let _phase = present_phase(PresentPhase::ResidentCarries);
-                crate::backend::selected().present_resident_carries(state, mapping, w, h)
-            };
+            let carried =
+                { crate::backend::selected().present_resident_carries(state, mapping, w, h) };
             let emit = crate::observe::Emit::decline("present_unbacked", &backing)
                 .field("mid", mapping)
                 .field("geom", format!("{w}x{h}"))
@@ -4976,10 +4915,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // rotation step behind the one the guest asked for — residue when a
         // window closed in between, a stale region when one moved, thrash as
         // the choice oscillates.
-        let encoded = {
-            let _phase = present_phase(PresentPhase::Capture);
-            crate::runtime::scanout::capture_present_frame(state, mapping, w, h, gen)
-        };
+        let encoded = { crate::runtime::scanout::capture_present_frame(state, mapping, w, h, gen) };
         if !encoded {
             // Retry encode at first host paint. Do **not** clear
             // frame_valid: PGDisplay keeps the prior presentFrame
@@ -5002,7 +4938,6 @@ fn present_named_mapping<H: HostMemory + HostOps>(
             // `px[0].max(px[1]).max(px[2])` per pixel, so a separate scan for
             // `max_rgb` was a second full 8 MiB walk of the frame, under the
             // device lock, for a value this call already returns.
-            let _phase = present_phase(PresentPhase::ContentStats);
             let (rgb_nz, max_rgb, px0) = crate::observe::bgra_rgb_stats(&state.present.frame_bgra);
             let verdict = present_content_verdict(&state.present.frame_bgra, max_rgb);
             if verdict == PresentContentVerdict::Unsampled {
@@ -5061,7 +4996,6 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // paint; with no paint action produced, the window resolves the frame
         // from `state.present` directly and the distinction has no consumer.
         {
-            let _phase = present_phase(PresentPhase::EnqueueScanout);
             enqueue_present_scanout(state, host, w, h);
         }
         // Entry-side waitForPendingFrames / apple-gfx pending_frames:
@@ -5080,7 +5014,6 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     // +0x188 retain (also when geometry held the paint): display
     // shared-page present bit + conditional display IRQ.
     {
-        let _phase = present_phase(PresentPhase::SignalComplete);
         signal_display_present_complete(state, host);
     }
     ChildPacketDisposition::Complete
@@ -6428,7 +6361,6 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
 ) {
     // A drain, for the tranche ledger: entered from inside a packet it is a
     // nested drain, and what it runs is charged under its own names once.
-    let _span = census::tranche_span(census::TrancheCost::ChildFifo);
     if state.gfx.root_page == 0 {
         return;
     }
@@ -6528,14 +6460,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 // the reading and not for a verdict: a wait that is not yet met
                 // is an ordering position in `admit`, not a ring head this loop
                 // refuses to move.
-                // One admission record across both halves, so the stamp census
-                // and `admit_and_park`'s steps land on the same packet. The head
-                // write between them is `regs`, and is in neither.
-                let admission = census::admission_scope(packet.opcode, Some(channel_id));
-                {
-                    let _admit = census::tranche_span(census::TrancheCost::AdmitStampWaits);
-                    note_packet_stamp_waits(state, host, Some(channel_id), &packet);
-                }
+                note_packet_stamp_waits(state, host, Some(channel_id), &packet);
 
                 // **The head advances first, and unconditionally.** Everything
                 // this packet needs has been taken out of the ring — the
@@ -6563,11 +6488,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     });
                 }
 
-                {
-                    let _admit = census::tranche_span(census::TrancheCost::Admit);
-                    admit_and_park(state, host, fifo, stamp_index, packet);
-                }
-                drop(admission);
+                admit_and_park(state, host, fifo, stamp_index, packet);
                 settle_model_work(state, host);
 
                 if state.pending.host_action_yield {
@@ -6598,7 +6519,6 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
 /// with `cpu_memory_rw_debug(first_cpu)` deadlocks against MMIO holding
 /// `DEVICES` (see reims-vgpu-mmio.c `read_kva`).
 pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
-    let _span = census::tranche_span(census::TrancheCost::Iosfc);
     let producer = state.iosfc.producer;
     let mut consumer = state.iosfc.consumer;
     if producer == consumer {
@@ -6713,7 +6633,6 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
 ) {
     let gpa = state.display.shared_gpa;
     if gpa == 0 {
-        note_display_present_signal(DISPLAY_PRESENT_NO_GPA);
         return;
     }
     // The mask gates the pending write and not just the interrupt. It used to
@@ -6721,10 +6640,8 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     // the class and could therefore never clear it — see
     // [`display_event_enabled`] for why that residue is not inert.
     if !display_event_enabled(host, gpa, DISPLAY_PRESENT_EVENT_MASK) {
-        note_display_present_signal(DISPLAY_PRESENT_NOT_ENABLED);
         return;
     }
-    note_display_present_signal(DISPLAY_PRESENT_DELIVERED);
     // Pending word is atomic read-and-clear (ldclral) on the guest side; OR
     // the present bit so a not-yet-consumed ONLINE event is preserved.
     let mut pending_le = [0u8; 4];
@@ -6977,11 +6894,7 @@ pub(crate) fn display_event_enabled<H: HostMemory>(host: &H, gpa: u64, event_mas
     {
         return false;
     }
-    let mask = ld32(&mask_le);
-    // Every signal path passes through here, so this is where the guest's own
-    // statement of what it wants is observable without stopping the world.
-    crate::runtime::drain::census::note_display_enable_mask(mask);
-    mask & event_mask != 0
+    ld32(&mask_le) & event_mask != 0
 }
 
 /// Signal every display-completion class the guest has armed, for one tick of
@@ -7043,7 +6956,7 @@ pub(crate) fn display_event_enabled<H: HostMemory>(host: &H, gpa: u64, event_mas
 /// switch), quiesced host. Delivered rate is taken from the gap between
 /// consecutive `arm=delivered` census lines, which are exactly 1024 deliveries
 /// apart — the `delivered=` field on the last line is quantised to that cadence
-/// and `window_hz` is unusable here, see [`census::VblCensus`].
+/// and `window_hz` is unusable here, see `census::VblCensus`.
 ///
 /// ```text
 ///            presented frames/s   delivered Hz (final window)
@@ -7070,7 +6983,7 @@ pub(crate) fn display_event_enabled<H: HostMemory>(host: &H, gpa: u64, event_mas
 /// The split is a property of the boot, not of the workload: a boot presents
 /// either ~60 or ~95-117 frames a second for its whole life, with nothing in
 /// between. What decides it is still open — see `VBL_REPORT_EARLY` beside
-/// [`census::VblCensus`], which also records the plausible-looking early-window
+/// `census::VblCensus`, which also records the plausible-looking early-window
 /// explanation that twenty boots killed. So the outcome to rank this ordering
 /// against is a probability over boots and not a rate.
 ///
@@ -7125,10 +7038,6 @@ pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
     last_us: &std::sync::atomic::AtomicU64,
     now_us: u64,
 ) {
-    // The limiter paces in microseconds because 120 Hz is not expressible in
-    // whole milliseconds; the census windows in milliseconds so its `t=` stays
-    // on the same scale as every other always-on line.
-    let now_ms = now_us / 1_000;
     let mut mask_le = [0u8; 4];
     if host
         .read_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &mut mask_le)
@@ -7136,12 +7045,10 @@ pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
     {
         // The guest published this page's address itself; a read of it the host
         // cannot perform is not a reason to start signalling classes nobody
-        // asked for. Counted as not-enabled, which is what it is from here.
-        note_vbl(VBL_NOT_ENABLED, now_ms);
+        // asked for.
         return;
     }
     let mask = ld32(&mask_le);
-    crate::runtime::drain::census::note_display_enable_mask(mask);
 
     let vbl = mask & DISPLAY_VBL_EVENT_MASK != 0;
     let transaction = mask & DISPLAY_PRESENT_EVENT_MASK != 0;
@@ -7150,21 +7057,10 @@ pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
     // This ordering is the whole of the one-shot fix; see the section on it in
     // this function's doc.
     if !vbl && !transaction {
-        note_vbl(VBL_NOT_ENABLED, now_ms);
         return;
     }
     if !claim_display_vbl(last_us, now_us) {
-        note_vbl(VBL_NOT_CLAIMED, now_ms);
         return;
-    }
-
-    // Counted after the limiter so the arm is on the same grid as `delivered`
-    // and the two are directly comparable. A guest that arms only the
-    // transaction class still reports `not_enabled` here, because this arm names
-    // the VBL class and not "did the tick do anything".
-    note_vbl(if vbl { VBL_DELIVERED } else { VBL_NOT_ENABLED }, now_ms);
-    if transaction {
-        note_display_present_signal(DISPLAY_PRESENT_REFRESH);
     }
 
     let mut pending_le = [0u8; 4];
@@ -7209,12 +7105,7 @@ fn signal_display_vbl_at<H: HostMemory + HostOps>(
     last_us: &std::sync::atomic::AtomicU64,
     now_us: u64,
 ) {
-    // The limiter paces in microseconds because 120 Hz is not expressible in
-    // whole milliseconds; the census windows in milliseconds so its `t=` stays
-    // on the same scale as every other always-on line.
-    let now_ms = now_us / 1_000;
     if state.display.shared_gpa == 0 || !state.display.online_acked {
-        note_vbl(VBL_NOT_ONLINE, now_ms);
         return;
     }
     let page_size = state.page_size() as usize;
@@ -7236,7 +7127,6 @@ fn signal_display_vbl_at<H: HostMemory + HostOps>(
 /// `enable()` sets `+0x104` bit 2 — earlier IRQs wedge an unregistered display.
 /// createDisplayAttributes then consumes TimingElements (incl. 1440 mode).
 pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
-    let _span = census::tranche_span(census::TrancheCost::DisplayOnline);
     if state.display.shared_gpa == 0 || state.display.online_acked {
         return;
     }
@@ -7453,7 +7343,6 @@ fn drain_other_child_fifos_mask<H: HostMemory + HostOps>(
     skip_channel: u32,
     mask: u32,
 ) {
-    let _span = census::tranche_span(census::TrancheCost::Resweep);
     let nested = state.draining_mask;
 
     // A cold-translation EXEC is already the oldest accepted item in the host
@@ -7615,7 +7504,7 @@ pub fn publish_stranded_fifos<H: HostMemory + HostOps>(
 /// # What that refutation does *not* cover, and the measurement that separates them
 ///
 /// Read as "the doorbell delay is the flush rail's cost, so shrink the flush",
-/// the paragraph above overstates itself, and [`DoorbellCensus`] now says by how
+/// the paragraph above overstates itself, and `DoorbellCensus` now says by how
 /// much. `max_age_us` tracks `max_tranche_us` to within 3 % across a driven
 /// boot — 41711/42563, 40627/42117, 103619/105308 — and one of those windows
 /// read `duty=0.147`. The worker was idle for 85 % of that second and still held
@@ -7680,14 +7569,12 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
     // The tranche's outermost exclusive span: what is left of it once every
     // phase below has claimed its own time is this function's control flow —
     // the child sweep and its refills.
-    let _sweep = census::tranche_span(census::TrancheCost::Sweep);
     // A queued present action is part of the ordered device timeline. QEMU
     // cannot paint it while this worker owns the device lock, so later worker
     // wakeups must leave guest work queued until scanout consumes the action.
     if state.pending.host_action_yield {
         return;
     }
-    let xlate = census::tranche_span(census::TrancheCost::XlateRetry);
     release_translation_order_holds(state);
     // Retry an already translation-held EXEC before allowing either the root
     // FIFO or a sibling child FIFO to overtake it. The guest is free to queue
@@ -7715,7 +7602,6 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
         }
         release_translation_order_holds(state);
     }
-    drop(xlate);
     if state.pending.main_drain {
         drain_main_fifo(state, host);
     }
