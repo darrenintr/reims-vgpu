@@ -807,7 +807,6 @@ fn note_publish_latency(elapsed: std::time::Duration) {
         64_000..=499_999 => "stamp_publish_lt500ms",
         _ => "stamp_publish_ge500ms",
     });
-    crate::runtime::drain::census::note_store_route_us("stamp_publish_us", us);
 }
 
 #[cfg(test)]

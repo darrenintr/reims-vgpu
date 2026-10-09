@@ -744,13 +744,8 @@ pub fn settle_guest_writes(site: SettleSite) {
     if !backend.guest_writes_outstanding() {
         return;
     }
-    let started = std::time::Instant::now();
     backend.quiesce_guest_writes();
     crate::runtime::drain::note_store_route(site.route());
-    crate::runtime::drain::note_store_route_us(
-        site.route_us(),
-        started.elapsed().as_micros() as u64,
-    );
 }
 
 /// [`settle_guest_writes`], skipped when the outstanding writeback lands nowhere

@@ -1329,17 +1329,12 @@ fn walk_segment_records(
     mut handle: impl FnMut(u32, &[u8]),
 ) {
     let mut records = 0u64;
-    let (route, route_us) = match kind {
-        SegmentKind::Render => ("walk_records_render", "walk_render_us"),
-        SegmentKind::Blit => ("walk_records_blit", "walk_blit_us"),
-        SegmentKind::Compute => ("walk_records_compute", "walk_compute_us"),
-        SegmentKind::Event | SegmentKind::Info => ("walk_records_other", "walk_other_us"),
+    let route = match kind {
+        SegmentKind::Render => "walk_records_render",
+        SegmentKind::Blit => "walk_records_blit",
+        SegmentKind::Compute => "walk_records_compute",
+        SegmentKind::Event | SegmentKind::Info => "walk_records_other",
     };
-    // One clock pair per *segment*, not per record. A stream carries at most a
-    // handful of segments and tens of thousands of records, so this splits
-    // `exec_phase walk_us` by family for a cost that does not show up, where
-    // per-record timing would cost more than the handlers it measured.
-    let started = std::time::Instant::now();
     let mut ops = reims_vgpu_wire::op::OpStream::new(commands);
     let mut refusal = None;
     for next in ops.by_ref() {
@@ -1355,7 +1350,6 @@ fn walk_segment_records(
         }
     }
     crate::runtime::drain::note_store_route_n(route, records);
-    crate::runtime::drain::note_store_route_us(route_us, started.elapsed().as_micros() as u64);
     if let Some(status) = refusal {
         if let Some(e) = crate::observe::Emit::refusal("stream_record_fail", &status) {
             // Latch per segment family: a guest re-submitting a malformed
@@ -2303,17 +2297,6 @@ fn handle_blit_record<M: HostMemory + HostOps>(
     opcode: u32,
     cmd_bytes: &[u8],
 ) {
-    // `walk_blit_us` charges this rail 33.3 s of a 45 s driven Maps window and
-    // every clock inside `execute_blit` accounts for 0.14 s of it. The gap has
-    // to be in this function, and only two things here are outside that call:
-    // the decode above, and the `Fence` arm, which reaches
-    // `execute_blit_fence` directly rather than through `execute_blit`. A
-    // blocking fence wait costs exactly what is missing and does no work while
-    // it costs it, which is why no copy clock can see it.
-    //
-    // Timed at the closure `walk_segment_records` calls, so decode is inside the
-    // span and no arm can leave without being charged.
-    let record_started = std::time::Instant::now();
     // **Which class of record this is, is the closure ledger's answer.** The
     // blit *rail* carries five: transfers, fences, indirect-command mutations,
     // content-representation directives, and the mipmap generation that sits
@@ -2458,15 +2441,9 @@ fn handle_blit_record<M: HostMemory + HostOps>(
         // The transfers. Nine records lifted by the protocol decoder that owns
         // their layouts, and executed from the enum — the record's class and
         // its field offsets are no longer one verdict.
-        Some(OperationClass::Blit) => handle_blit_transfer_record(
-            state,
-            host,
-            task_id,
-            opcode,
-            &framed,
-            cmd_bytes.len(),
-            record_started,
-        ),
+        Some(OperationClass::Blit) => {
+            handle_blit_transfer_record(state, host, task_id, opcode, &framed, cmd_bytes.len())
+        }
         // The rows the ledger has **not settled**.
         //
         // `classify` answers `None` for an unresolved row, because a model that
@@ -2493,18 +2470,6 @@ fn handle_blit_record<M: HostMemory + HostOps>(
         }
     }
     if !matches!(record_class, Some(OperationClass::Blit)) {
-        // The transfer arm charges its own clock inside
-        // `handle_blit_transfer_record`, which is the only arm whose bucket
-        // depends on which record it lifted.
-        let route = match record_class {
-            Some(OperationClass::Fence) => "blitrec_fence_us",
-            Some(OperationClass::ResourceState) => "blitrec_noop_us",
-            _ => "blitrec_other_us",
-        };
-        crate::runtime::drain::note_store_route_us(
-            route,
-            record_started.elapsed().as_micros() as u64,
-        );
         crate::runtime::drain::note_store_route(match record_class {
             Some(OperationClass::Fence) => "blitrec_fence_n",
             Some(OperationClass::ResourceState) => "blitrec_noop_n",
@@ -2574,7 +2539,6 @@ fn handle_blit_transfer_record<M: HostMemory + HostOps>(
     opcode: u32,
     framed: &reims_vgpu_wire::op::Op<'_>,
     cmd_len: usize,
-    record_started: std::time::Instant,
 ) {
     let record = match reims_vgpu_protocol::decode::blit::decode(framed) {
         Ok(record) => record,
@@ -2630,10 +2594,6 @@ fn handle_blit_transfer_record<M: HostMemory + HostOps>(
             }
         }
     }
-    crate::runtime::drain::note_store_route_us(
-        transfer_route(record.kind(), "us"),
-        record_started.elapsed().as_micros() as u64,
-    );
     crate::runtime::drain::note_store_route(transfer_route(record.kind(), "n"));
 }
 

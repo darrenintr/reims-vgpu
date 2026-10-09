@@ -33,17 +33,6 @@ pub fn note_store_route_n(route: &'static str, n: u64) {
     let _ = (route, n);
 }
 
-#[inline(always)]
-pub fn note_store_route_us(name: &'static str, us: u64) {
-    #[cfg(test)]
-    {
-        let mut routes = STORE_ROUTES.lock().unwrap_or_else(|e| e.into_inner());
-        *routes.entry(name).or_default() += us;
-    }
-    #[cfg(not(test))]
-    let _ = (name, us);
-}
-
 #[cfg(test)]
 pub(crate) fn store_route_count(route: &str) -> u64 {
     STORE_ROUTES

@@ -3361,20 +3361,7 @@ impl ResourcePools {
             // exists so the transformation can be a plain function with a test
             // rather than pointer arithmetic no test can reach.
             //
-            // Timed on its own, because `draw_phase`'s `stage_us` also carries
-            // vertex, index and storage staging: dividing that by
-            // `seed_upload_bytes` gives a rate contaminated by whatever else the
-            // draw staged, which is enough to see the seed path is slow and not
-            // enough to say what limits it. `swap_rb_us` against `swap_rb_kb` is
-            // this write and nothing else, so it can be read against the memcpy
-            // rate `write_staging_from_runs` gets into the same memory class and
-            // convict either the loop or the memory.
-            let started = std::time::Instant::now();
             exchange_rb_into(rgba, std::slice::from_raw_parts_mut(ptr, rgba.len()));
-            crate::runtime::drain::note_store_route_us(
-                "swap_rb_us",
-                started.elapsed().as_micros() as u64,
-            );
             crate::runtime::drain::note_store_route_n("swap_rb_kb", (rgba.len() / 1024) as u64);
         }
         Ok(())

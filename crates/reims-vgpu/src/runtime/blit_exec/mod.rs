@@ -58,7 +58,6 @@ use crate::runtime::mapper::RectStride;
 use crate::runtime::mapping_write;
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
-use reims_vgpu_protocol::blit::BlitKind as WireBlitKind;
 use reims_vgpu_protocol::decode::blit::{
     BlitRecord, BufferToBuffer, BufferToTexture, FillBuffer, FillPattern, GenerateMipmaps,
     Origin as Point, TextureRegion, TextureSlices, TextureToBuffer,
@@ -1873,18 +1872,7 @@ fn copy_row_region<M: HostMemory + HostOps>(
         image_count,
     )
     .ok_or_else(|| br(BlitFailure::Capacity, "copy_region_dst_span_overflow"))?;
-    // The window is built once and the rows run against it, so a single total
-    // over the pair cannot say which is the cost. `dest_window` walks the whole
-    // destination span's guest page table into a `HashSet`, which is per-record
-    // work that does not shrink with the copy; the row loop is per-row work that
-    // does. Timed apart because the repair differs.
-    let window_started = std::time::Instant::now();
     let allowed = dest_window(state, host, task_id, dst_base, dst_span);
-    crate::runtime::drain::note_store_route_us(
-        "blit_window_us",
-        window_started.elapsed().as_micros() as u64,
-    );
-    let rows_started = std::time::Instant::now();
     crate::runtime::drain::note_store_route_n("blit_rows_n", row_count.saturating_mul(image_count));
     let mut row_buf = vec![0u8; row_len];
     for z in 0..image_count {
@@ -1941,10 +1929,6 @@ fn copy_row_region<M: HostMemory + HostOps>(
             }
         }
     }
-    crate::runtime::drain::note_store_route_us(
-        "blit_rows_us",
-        rows_started.elapsed().as_micros() as u64,
-    );
     Ok(())
 }
 
@@ -2358,12 +2342,6 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
         .ok_or(br(BlitFailure::Capacity, "bt_dest_span_overflow"))?;
         dest_window(state, host, task_id, buf_base_gva, span)
     };
-    // The half `blit_rows_us` cannot see. That counter sits in `copy_row_region`,
-    // which only the linear-to-linear fast path reaches; every mapper-ref-texture and
-    // ref-texture endpoint stages through this loop instead, and each of its rows
-    // re-vouches the mapping's guest page table. `mapw_pages_vouched` reads over
-    // a million on a driven Maps leg and nothing timed the loop that spends them.
-    let bt_rows_started = std::time::Instant::now();
     for z in 0..copy_d {
         for y in 0..copy_h {
             let buf_gva = buf_base_gva
@@ -2516,10 +2494,6 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
             }
         }
     }
-    crate::runtime::drain::note_store_route_us(
-        "blit_bt_rows_us",
-        bt_rows_started.elapsed().as_micros() as u64,
-    );
     Ok(())
 }
 
@@ -2973,11 +2947,6 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
         dst_base,
         dst_span.saturating_sub(cmd.dest_offset),
     );
-    // `blit_rows_us` lives in `copy_row_region`, which only the linear-to-linear
-    // fast path reaches. A texture-to-buffer copy stages every row through
-    // `read_texture_row` instead, and for a mapper-ref-texture or ref-texture source that
-    // re-vouches the mapping's guest page table per row.
-    let stage_rows_started = std::time::Instant::now();
     let mut row = vec![0u8; row_bytes as usize];
     for z in 0..copy_d {
         for y in 0..copy_h {
@@ -3018,10 +2987,6 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
             }
         }
     }
-    crate::runtime::drain::note_store_route_us(
-        "blit_t2b_stage_us",
-        stage_rows_started.elapsed().as_micros() as u64,
-    );
     crate::runtime::drain::note_store_route_n("blit_t2b_stage_rows", copy_h.saturating_mul(copy_d));
     BlitStatus::Ok
 }
@@ -3032,12 +2997,6 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     task_id: u32,
     cmd: &TextureRegion,
 ) -> BlitStatus {
-    // `walk_blit_us` says this call costs ~1.1 ms and `blit_t2t_bytes` says it
-    // moves ~800 of them, so the cost is not in the copy and a single total
-    // cannot say where it is instead. The three phases below are the whole body:
-    // resolving both endpoints, arming the destination's page window, and the
-    // row loop. Whichever of them holds the millisecond is the one to repair.
-    let phase_started = std::time::Instant::now();
     let src = match resolve_texture_backing(
         state,
         host,
@@ -3135,10 +3094,6 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         return BlitStatus::ZeroExtent;
     }
     note_t2t_shape(&src, &dst, copy_w, copy_h, copy_d, copy_bpp);
-    crate::runtime::drain::note_store_route_us(
-        "blit_t2t_resolve_us",
-        phase_started.elapsed().as_micros() as u64,
-    );
     // From here down the coordinates are in units of `copy_bpp`, and for a
     // block-compressed format that unit is a 4x4 **block**.
     //
@@ -3595,7 +3550,6 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
             }
         }
     }
-    let t2t_stage_started = std::time::Instant::now();
     let mut staged = vec![0u8; row_bytes.saturating_mul(copy_h) as usize];
     for z in 0..copy_d {
         if let Err(st) = read_texture_rect(
@@ -3632,10 +3586,6 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
             return st;
         }
     }
-    crate::runtime::drain::note_store_route_us(
-        "blit_t2t_stage_us",
-        t2t_stage_started.elapsed().as_micros() as u64,
-    );
     crate::runtime::drain::note_store_route_n("blit_t2t_stage_rows", copy_h.saturating_mul(copy_d));
     BlitStatus::Ok
 }
@@ -3880,7 +3830,6 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
         // multiplier nobody has measured. `sl_levels_n` is the denominator that
         // says whether a level loop of two or of twelve is being paid for.
         crate::runtime::drain::note_store_route("sl_levels_n");
-        let sl_resolve_started = std::time::Instant::now();
         // Resolve the starting slice at this level for geometry / format.
         // Volume (depth>1) forms use slice 0 only; non-zero source_slice on a
         // depth-1 packing fails at resolve (Bounds). For volumes we require
@@ -3922,10 +3871,6 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
         if src0.depth() != dst0.depth() {
             return br(BlitFailure::Bounds, "sl_depth_mismatch");
         }
-        crate::runtime::drain::note_store_route_us(
-            "sl_resolve_us",
-            sl_resolve_started.elapsed().as_micros() as u64,
-        );
         let w = src0.width();
         let h = src0.height();
         let d = src0.depth();
@@ -4066,7 +4011,6 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
         // and 0.22 s for every strided guest-RAM copy in the device. The bytes
         // were never the cost — re-entering the mapping rail per row was. It
         // stages the slice whole now; see [`read_texture_rect`].
-        let sl_mixed_started = std::time::Instant::now();
         let mut staged = vec![0u8; (row_bytes.saturating_mul(rows)) as usize];
         for si in 0..cmd.slice_count {
             let ss = match cmd.source_slice.checked_add(si) {
@@ -4136,10 +4080,6 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
                 return st;
             }
         }
-        crate::runtime::drain::note_store_route_us(
-            "sl_mixed_us",
-            sl_mixed_started.elapsed().as_micros() as u64,
-        );
     }
     BlitStatus::Ok
 }
@@ -4205,33 +4145,7 @@ pub fn execute_blit<M: HostMemory + HostOps>(
     task_id: u32,
     record: &BlitRecord,
 ) -> BlitStatus {
-    // One clock over the whole dispatch, attributed by the arm that ran.
-    //
-    // The per-loop clocks added alongside this are the ones that say *why* an
-    // arm is slow, but each of them had to be placed by hand and between them
-    // they accounted for 0.7 % of `walk_blit_us`. Being exhaustive by
-    // construction is what this one buys: every record entering `execute_blit`
-    // leaves through exactly one arm and is charged to it, so the sum of
-    // `blit_kind_*_us` cannot be less than the rail's cost the way a hand-placed
-    // set can. A family that turns out to hold the wall clock and has no inner
-    // clock yet is then a known gap rather than an invisible one.
-    //
-    // The route and the arm both come from the record's own shape, so a record
-    // charged to one family and executed by another is no longer expressible —
-    // it used to be two independent reads of a `kind` tag and a `copy_kind` tag
-    // that a decoder set separately.
-    let kind_started = std::time::Instant::now();
-    let kind_route = match record.kind() {
-        WireBlitKind::FillBuffer => "blit_kind_fill_us",
-        WireBlitKind::FillBufferPattern4 => "blit_kind_fill4_us",
-        WireBlitKind::BufferToBuffer => "blit_kind_b2b_us",
-        WireBlitKind::BufferToTexture => "blit_kind_b2t_us",
-        WireBlitKind::TextureToBuffer => "blit_kind_t2b_us",
-        WireBlitKind::TextureRegion | WireBlitKind::TextureRegionOptions => "blit_kind_t2t_us",
-        WireBlitKind::TextureSlices => "blit_kind_t2t_sl_us",
-        WireBlitKind::GenerateMipmaps => "blit_kind_mipmap_us",
-    };
-    let status = match record {
+    match record {
         BlitRecord::FillBuffer(fill) => match fill.pattern {
             // Which fill this is decides which write path runs *and* which of
             // the two refusal families the arm reports under, so the pattern is
@@ -4255,12 +4169,7 @@ pub fn execute_blit<M: HostMemory + HostOps>(
         BlitRecord::GenerateMipmaps(GenerateMipmaps { .. }) => {
             br(BlitFailure::Unsupported, "blit_kind_mipmap_misrouted")
         }
-    };
-    crate::runtime::drain::note_store_route_us(
-        kind_route,
-        kind_started.elapsed().as_micros() as u64,
-    );
-    status
+    }
 }
 
 #[cfg(test)]

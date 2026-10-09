@@ -387,22 +387,6 @@ pub(crate) fn try_copy_t11_plane_to_linear_on_gpu<M: HostMemory + HostOps>(
 /// there — an absent reading, not a `blit_t11_resident_not_ready` this rail
 /// would have to read as a real one.
 pub(crate) fn note_blit_t11_resident(state: &DeviceState, mapping_id: u32) {
-    // This census asks the engine a question, and asking takes the engine
-    // lock — the same lock the draw rail holds while it encodes and submits.
-    // A probe that blocks is not a probe, so time it: if this reads anywhere
-    // near `walk_blit_us`, the blit rail's cost is this instrument waiting
-    // for the renderer rather than anything the blit itself does.
-    let probe_started = std::time::Instant::now();
-    let _probe = ProbeClock(probe_started);
-    struct ProbeClock(std::time::Instant);
-    impl Drop for ProbeClock {
-        fn drop(&mut self) {
-            crate::runtime::drain::note_store_route_us(
-                "blit_resident_probe_us",
-                self.0.elapsed().as_micros() as u64,
-            );
-        }
-    }
     let Some(m) = state.mappings.get(&mapping_id) else {
         return;
     };
