@@ -28,7 +28,7 @@
 
 #[cfg(target_os = "macos")]
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -520,6 +520,12 @@ struct PendingGuestResize {
 /// Vulkan objects tear down before the join returns.
 pub type StopFlag = Arc<AtomicBool>;
 
+/// The refresh of the monitor the window is on, in millihertz, published by the
+/// window for the device to advertise to the guest; 0 until the window system
+/// has named a monitor. See [`crate::model::DisplayRefresh`] for why the guest's
+/// rate has to follow it.
+pub type HostRefresh = Arc<AtomicU32>;
+
 /// Set after the native window and all of its Vulkan objects have torn down.
 /// QEMU's backend teardown waits for this before destroying shared GPU state.
 ///
@@ -662,10 +668,11 @@ pub fn spawn(
     frames: FrameSlot,
     stop: StopFlag,
     wake: WindowWakeHandle,
+    refresh: HostRefresh,
 ) -> std::thread::JoinHandle<Result<(), WindowError>> {
     std::thread::Builder::new()
         .name("reims-vgpu-window".to_string())
-        .spawn(move || run(config, on_input, frames, stop, wake))
+        .spawn(move || run(config, on_input, frames, stop, wake, refresh))
         .expect("spawn reims-vgpu-window thread")
 }
 
@@ -678,10 +685,11 @@ pub fn run(
     frames: FrameSlot,
     stop: StopFlag,
     wake: WindowWakeHandle,
+    refresh: HostRefresh,
 ) -> Result<(), WindowError> {
     let event_loop = build_event_loop()?;
     wake.arm(event_loop.create_proxy());
-    let mut app = App::new(config, on_input, frames, stop, wake);
+    let mut app = App::new(config, on_input, frames, stop, wake, refresh);
     event_loop
         .run_app(&mut app)
         .map_err(|e| WindowError::RunApp(e.to_string()))
@@ -716,6 +724,7 @@ pub fn start_main_thread(
     stop: StopFlag,
     exited: ExitedFlag,
     wake: WindowWakeHandle,
+    refresh: HostRefresh,
 ) -> Result<(), WindowError> {
     MAIN_THREAD_WINDOW.with(|cell| {
         let mut slot = cell.borrow_mut();
@@ -728,7 +737,7 @@ pub fn start_main_thread(
         }
         let event_loop = build_event_loop()?;
         wake.arm(event_loop.create_proxy());
-        let app = App::new(config, on_input, frames, stop, wake);
+        let app = App::new(config, on_input, frames, stop, wake, refresh);
         *slot = Some(MainThreadWindow {
             id,
             event_loop,
@@ -802,6 +811,8 @@ struct App {
     frames: FrameSlot,
     /// Set by the device to request teardown; polled in `about_to_wait`.
     stop: StopFlag,
+    /// Where this window publishes its monitor's refresh. See [`HostRefresh`].
+    refresh: HostRefresh,
     /// True once a `WindowClosed` action has been emitted (UI close), so the
     /// shutdown request is sent exactly once.
     closed_sent: bool,
@@ -1004,6 +1015,7 @@ impl ApplicationHandler<WindowWake> for App {
                 // one, so without this the window would never draw.
                 window.request_redraw();
                 self.window = Some(window);
+                self.note_monitor_refresh();
                 // The device may have published its cursor before this window
                 // existed; the slot kept it.
                 self.sync_cursor_from_slot(event_loop);
@@ -1054,6 +1066,7 @@ impl ApplicationHandler<WindowWake> for App {
             }
             WindowEvent::Resized(size) => {
                 self.trace_window_event("resized", format!("size={}x{}", size.width, size.height));
+                self.note_monitor_refresh();
                 self.note_resized((size.width.max(1), size.height.max(1)));
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -1064,6 +1077,8 @@ impl ApplicationHandler<WindowWake> for App {
                     "scale_factor_changed",
                     format!("new_scale={scale_factor:.3}"),
                 );
+                // A new scale is the window entering another output.
+                self.note_monitor_refresh();
             }
             WindowEvent::Occluded(occluded) => {
                 self.trace_window_event("occluded", format!("occluded={}", u8::from(occluded)));
@@ -1164,6 +1179,11 @@ impl ApplicationHandler<WindowWake> for App {
         if self.stop.load(Ordering::Relaxed) {
             event_loop.exit();
         }
+        // Until the window system names an output, keep asking. Wayland does so
+        // only once the surface is mapped, after `resumed` has returned.
+        if self.refresh.load(Ordering::Relaxed) == 0 {
+            self.note_monitor_refresh();
+        }
         // Pacing: ask for a redraw when the device says it published one, and
         // otherwise sleep to the backstop. Two earlier shapes are what this has
         // to stay clear of. Re-requesting a redraw from inside `RedrawRequested`
@@ -1242,12 +1262,14 @@ impl App {
         frames: FrameSlot,
         stop: StopFlag,
         wake: WindowWakeHandle,
+        refresh: HostRefresh,
     ) -> Self {
         Self {
             config,
             on_input,
             frames,
             stop,
+            refresh,
             closed_sent: false,
             window: None,
             cursor: (0, 0),
@@ -1275,6 +1297,22 @@ impl App {
             cursor_policy: CursorPolicy::new(),
             custom_cursor: None,
             cursor_trace: crate::observe::LineBudget::new(std::time::Instant::now()),
+        }
+    }
+
+    /// Publish the refresh of the monitor this window is on, if the window
+    /// system can name it yet. Asked again on every event that can change the
+    /// answer; the device latches whichever value is current when the guest
+    /// reads its display descriptor.
+    fn note_monitor_refresh(&self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        if let Some(millihertz) = window
+            .current_monitor()
+            .and_then(|monitor| monitor.refresh_rate_millihertz())
+        {
+            self.refresh.store(millihertz, Ordering::Release);
         }
     }
 
@@ -2181,6 +2219,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
             Arc::new(AtomicBool::new(false)),
             WindowWaker::new(),
+            Arc::new(AtomicU32::new(0)),
         )
     }
 

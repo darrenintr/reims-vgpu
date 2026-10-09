@@ -936,11 +936,14 @@ fn bounded_entry_offset_from_base(
     }
 }
 
-pub fn display_refresh_hz_1616(refresh_hz: u32) -> Option<u32> {
-    if refresh_hz > (u32::MAX >> DISPLAY_TIMING_REFRESH_FRAC_BITS) {
-        return None;
-    }
-    Some(refresh_hz << DISPLAY_TIMING_REFRESH_FRAC_BITS)
+/// A timing entry's refresh field, 16.16 fixed-point hertz, from a rate in
+/// millihertz — the unit hosts report a display's refresh in, and the one that
+/// keeps a fractional rate such as 59.94 Hz or 100.047 Hz exact to the field's
+/// resolution. Rounded to the nearest representable value; `None` when the rate
+/// does not fit the field.
+pub fn display_refresh_millihertz_1616(refresh_mhz: u32) -> Option<u32> {
+    let scaled = ((u64::from(refresh_mhz) << DISPLAY_TIMING_REFRESH_FRAC_BITS) + 500) / 1000;
+    u32::try_from(scaled).ok()
 }
 
 pub fn encode_display_timing_entry(entry: &DisplayTimingEntry, dst: &mut [u8]) -> bool {
@@ -1539,6 +1542,20 @@ mod cursor_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whole rates encode exactly, and a fractional host rate keeps its
+    /// fraction rather than rounding to the next hertz — the guest paces to
+    /// what this field says, so 100.047 Hz written as 100 would drift a frame
+    /// every twenty seconds against the host display it is meant to match.
+    #[test]
+    fn refresh_millihertz_encodes_whole_and_fractional_rates() {
+        assert_eq!(display_refresh_millihertz_1616(120_000), Some(120 << 16));
+        assert_eq!(display_refresh_millihertz_1616(60_000), Some(60 << 16));
+        let fractional = display_refresh_millihertz_1616(100_047).unwrap();
+        assert_eq!(fractional >> 16, 100);
+        assert_eq!(fractional & 0xffff, 3080, "0.047 * 65536 = 3080.19");
+        assert_eq!(display_refresh_millihertz_1616(u32::MAX), None);
+    }
     use crate::endian::st32;
 
     /// The header's three words, and a payload one byte short of them refuses

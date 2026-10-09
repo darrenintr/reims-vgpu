@@ -275,7 +275,14 @@ fn display_descriptor_advertises_four_modes_incl_4k() {
     let gpa = 0x7a000000u64;
     host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
     let generation = 7u32;
-    fill_display_descriptor(&mut host, gpa, 0, generation, PAGE_SIZE_ARM64E);
+    fill_display_descriptor(
+        &mut host,
+        gpa,
+        0,
+        generation,
+        PAGE_SIZE_ARM64E,
+        crate::model::DisplayRefresh::DEFAULT,
+    );
     let mut count = [0u8; 2];
     host.read_gpa(gpa + DISPLAY_DESC_TIMING_COUNT, &mut count)
         .unwrap();
@@ -301,6 +308,73 @@ fn display_descriptor_advertises_four_modes_incl_4k() {
     let mut refresh = [0u8; 4];
     host.read_gpa(gpa + 0x244, &mut refresh).unwrap();
     assert_eq!(u32::from_le_bytes(refresh), DISPLAY_REFRESH_HZ << 16);
+}
+
+/// The VBL interval every limiter test below paces to: the default refresh's.
+const DEFAULT_VBL_INTERVAL_US: u64 = crate::model::DisplayRefresh::DEFAULT.interval_us();
+
+/// A descriptor filled at a host display's rate advertises that rate, fraction
+/// included, in every timing element — the guest paces its animation to the
+/// field, so a 100.047 Hz panel advertised as 120 Hz is the one-frame-in-six
+/// judder `DisplayRefresh` exists to remove.
+#[test]
+fn display_descriptor_advertises_the_host_display_rate() {
+    let mut host = FakeHost::new();
+    let gpa = 0x7a000000u64;
+    host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+    let panel = crate::model::DisplayRefresh::from_host(100_047).expect("a pacable rate");
+    fill_display_descriptor(&mut host, gpa, 0, 1, PAGE_SIZE_ARM64E, panel);
+    let expected = crate::protocol::fifo::display_refresh_millihertz_1616(100_047).unwrap();
+    for element in 0..4u64 {
+        let mut refresh = [0u8; 4];
+        host.read_gpa(gpa + 0x214 + element * 0x10, &mut refresh)
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(refresh), expected, "element {element}");
+    }
+}
+
+/// Display setup latches the host's rate, and VBL is then paced to the latched
+/// value: a later host report (the window moving to another panel) cannot move
+/// the cadence away from the timing table the guest already read.
+#[test]
+fn display_setup_latches_the_host_rate_and_vbl_paces_to_it() {
+    use crate::model::DisplayRefresh;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.display.host_refresh = DisplayRefresh::from_host(100_000);
+    let pfn = 0x7a000u32;
+    host.map_range(state.pfn_gpa(pfn), PAGE_SIZE_ARM64E as usize, 0);
+    // `CmdDisplaySetSharedStatePage`: `{u32 pipe index, u32 page PFN}`.
+    let mut payload = [0u8; 8];
+    payload[4..].copy_from_slice(&pfn.to_le_bytes());
+    apply_setup_shared_state(&mut state, &mut host, &payload, None);
+    assert_eq!(state.display.refresh.millihertz(), 100_000);
+    assert_eq!(state.display.refresh.interval_us(), 10_000);
+
+    state.display.host_refresh = DisplayRefresh::from_host(60_000);
+    assert_eq!(
+        state.display.refresh.millihertz(),
+        100_000,
+        "a host report after setup does not move the advertised contract"
+    );
+}
+
+/// A host report the limiter cannot pace is not adopted: zero is "no monitor
+/// yet", and a rate above what the 4 ms heartbeat can deliver would advertise a
+/// cadence the guest never receives.
+#[test]
+fn an_unpacable_host_rate_falls_back_to_the_default() {
+    use crate::model::DisplayRefresh;
+    assert_eq!(DisplayRefresh::from_host(0), None);
+    assert_eq!(DisplayRefresh::from_host(360_000), None);
+    assert_eq!(
+        DisplayRefresh::from_host(240_000).map(DisplayRefresh::millihertz),
+        Some(240_000)
+    );
+    assert_eq!(
+        DisplayRefresh::from_host(59_940).map(DisplayRefresh::millihertz),
+        Some(59_940)
+    );
 }
 
 #[test]
@@ -3239,14 +3313,14 @@ fn signal_display_vbl_after_online_uses_shared_time_limiter() {
     signal_display_vbl_at(&mut state, &mut host, &last_ms, base);
     assert_eq!(host.actions.len(), 1);
     assert!(
-        !claim_display_vbl(&last_ms, base),
+        !claim_display_vbl(&last_ms, base, DEFAULT_VBL_INTERVAL_US),
         "the contended path cannot claim the locked path's interval"
     );
     signal_display_vbl_at(
         &mut state,
         &mut host,
         &last_ms,
-        base + DISPLAY_VBL_MIN_INTERVAL_US - 1,
+        base + DEFAULT_VBL_INTERVAL_US - 1,
     );
     assert_eq!(
         host.actions.len(),
@@ -3257,7 +3331,7 @@ fn signal_display_vbl_after_online_uses_shared_time_limiter() {
         &mut state,
         &mut host,
         &last_ms,
-        base + DISPLAY_VBL_MIN_INTERVAL_US,
+        base + DEFAULT_VBL_INTERVAL_US,
     );
     assert_eq!(
         host.actions.len(),
@@ -3396,18 +3470,18 @@ fn signal_display_vbl_declines_a_class_the_guest_did_not_enable() {
 /// the only form of this test that cannot itself go stale.
 #[test]
 fn delivered_vbl_cadence_equals_the_advertised_refresh_rate() {
-    let delivered_hz = 1_000_000.0 / DISPLAY_VBL_MIN_INTERVAL_US as f64;
+    let delivered_hz = 1_000_000.0 / DEFAULT_VBL_INTERVAL_US as f64;
     assert!(
         (delivered_hz - DISPLAY_REFRESH_HZ as f64).abs() < 0.5,
         "advertising {DISPLAY_REFRESH_HZ} Hz but delivering {delivered_hz:.1} Hz \
-         (interval {DISPLAY_VBL_MIN_INTERVAL_US} us)"
+         (interval {DEFAULT_VBL_INTERVAL_US} us)"
     );
 
     // The millisecond grid this replaced could not express the answer at all:
     // 120 Hz is 8333 us, and every whole-millisecond interval near it is wrong
     // by at least 4%. That is why the units changed rather than the number.
     assert_ne!(
-        DISPLAY_VBL_MIN_INTERVAL_US % 1000,
+        DEFAULT_VBL_INTERVAL_US % 1000,
         0,
         "a whole-millisecond interval cannot express {DISPLAY_REFRESH_HZ} Hz"
     );
@@ -3418,7 +3492,7 @@ fn delivered_vbl_cadence_equals_the_advertised_refresh_rate() {
 #[test]
 fn claim_display_vbl_phase_locks_grid_under_jittery_polls() {
     use std::sync::atomic::AtomicU64;
-    let interval = DISPLAY_VBL_MIN_INTERVAL_US;
+    let interval = DEFAULT_VBL_INTERVAL_US;
     // Legacy "reset to now" behaviour would need two of these ~(interval-1)ms
     // polls per claim -> half rate. Phase-locking must claim on (nearly) every
     // poll once warmed up, because a late poll advances the grid by exactly one
@@ -3428,7 +3502,7 @@ fn claim_display_vbl_phase_locks_grid_under_jittery_polls() {
     let polls = 64u64;
     let mut claims = 0u64;
     for i in 1..=polls {
-        if claim_display_vbl(&last, i * step) {
+        if claim_display_vbl(&last, i * step, DEFAULT_VBL_INTERVAL_US) {
             claims += 1;
         }
     }
@@ -3451,12 +3525,12 @@ fn claim_display_vbl_phase_locks_grid_under_jittery_polls() {
 #[test]
 fn claim_display_vbl_long_stall_resyncs_without_burst() {
     use std::sync::atomic::{AtomicU64, Ordering};
-    let interval = DISPLAY_VBL_MIN_INTERVAL_US;
+    let interval = DEFAULT_VBL_INTERVAL_US;
     let last = AtomicU64::new(1_000);
     // A single poll after a 10*interval stall claims exactly once and lands the
     // grid at `now` (no accumulated catch-up credit).
     let now = 1_000 + 10 * interval;
-    assert!(claim_display_vbl(&last, now));
+    assert!(claim_display_vbl(&last, now, DEFAULT_VBL_INTERVAL_US));
     assert_eq!(
         last.load(Ordering::Acquire),
         now,
@@ -3464,8 +3538,16 @@ fn claim_display_vbl_long_stall_resyncs_without_burst() {
     );
     // The immediately following poll one interval later claims once more — a
     // steady single-VBL cadence, not a burst.
-    assert!(claim_display_vbl(&last, now + interval));
-    assert!(!claim_display_vbl(&last, now + interval)); // same instant: no double
+    assert!(claim_display_vbl(
+        &last,
+        now + interval,
+        DEFAULT_VBL_INTERVAL_US
+    ));
+    assert!(!claim_display_vbl(
+        &last,
+        now + interval,
+        DEFAULT_VBL_INTERVAL_US
+    )); // same instant: no double
 }
 
 /// Stand up a display whose shared page is mapped and whose ONLINE is acked, so
@@ -3516,7 +3598,7 @@ fn took_vbl(host: &mut FakeHost, gpa: u64) -> bool {
 #[test]
 fn a_disarmed_tick_does_not_spend_the_grid_slot() {
     use std::sync::atomic::AtomicU64;
-    let interval = DISPLAY_VBL_MIN_INTERVAL_US;
+    let interval = DEFAULT_VBL_INTERVAL_US;
     let (mut state, mut host, gpa) = one_shot_display();
     let last = AtomicU64::new(0);
 
@@ -3561,7 +3643,7 @@ fn a_disarmed_tick_does_not_spend_the_grid_slot() {
 #[test]
 fn a_continuously_armed_guest_is_still_capped_at_the_advertised_rate() {
     use std::sync::atomic::AtomicU64;
-    let interval = DISPLAY_VBL_MIN_INTERVAL_US;
+    let interval = DEFAULT_VBL_INTERVAL_US;
     let (mut state, mut host, gpa) = one_shot_display();
     let last = AtomicU64::new(0);
     set_enable_mask(

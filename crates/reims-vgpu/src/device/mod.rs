@@ -112,6 +112,9 @@ struct BoundDevice {
     /// The refresh tick's pending write is page-bounded like every other write
     /// into the shared page, and this arm has no `DeviceState` to ask.
     vbl_page_size: AtomicU64,
+    /// VBL interval of the refresh the guest's descriptor advertised, published
+    /// with the rest of the snapshot; 0 until a locked poll has run.
+    vbl_interval_us: AtomicU64,
     /// Wall-clock ms of the last VBL claimed by either the locked or contended
     /// poll path. One shared limiter keeps guest pacing independent of which
     /// path happens to win the device lock.
@@ -240,6 +243,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             vbl_display_index: AtomicU32::new(0),
             vbl_online: AtomicBool::new(false),
             vbl_page_size: AtomicU64::new(0),
+            vbl_interval_us: AtomicU64::new(0),
             vbl_last_us: AtomicU64::new(0),
             ops,
             #[cfg(feature = "host-window")]
@@ -499,7 +503,16 @@ pub fn device_drain(id: u64) -> bool {
     // (see `enqueue_present_scanout` / the drain tail below).
     #[cfg(feature = "host-window")]
     {
-        device.state.present.window_active = slot.window.lock().is_some();
+        let link = slot.window.lock();
+        device.state.present.window_active = link.is_some();
+        // Read here, before the tranche, because display setup happens inside
+        // it and latches whatever this says. See `model::DisplayRefresh`.
+        if let Some(refresh) = link
+            .as_ref()
+            .and_then(window_publish::WindowLink::host_refresh)
+        {
+            device.state.display.host_refresh = Some(refresh);
+        }
     }
     #[cfg(not(feature = "host-window"))]
     {
@@ -603,6 +616,10 @@ pub fn device_poll(id: u64) -> bool {
         .store(device.state.display.online_acked, Ordering::Release);
     slot.vbl_page_size
         .store(device.state.page_size(), Ordering::Release);
+    slot.vbl_interval_us.store(
+        device.state.display.refresh.interval_us(),
+        Ordering::Release,
+    );
     // Census both source polls and the independently time-gated VBL rate.
     // Drive bounded maintenance from the poll heartbeat, which ticks even when
     // the guest stops publishing. The wall clock returns already-dead resources
@@ -644,8 +661,9 @@ fn vbl_contended_pulse(slot: &BoundDevice) {
         return;
     };
     let page_size = slot.vbl_page_size.load(Ordering::Acquire);
-    if page_size == 0 {
-        // The locked poll publishes this with the rest of the snapshot, so a
+    let interval_us = slot.vbl_interval_us.load(Ordering::Acquire);
+    if page_size == 0 || interval_us == 0 {
+        // The locked poll publishes these with the rest of the snapshot, so a
         // zero means no locked poll has run since bind. Nothing is owed yet.
         return;
     }
@@ -666,6 +684,7 @@ fn vbl_contended_pulse(slot: &BoundDevice) {
         page_size as usize,
         &slot.vbl_last_us,
         crate::observe::elapsed_us(),
+        interval_us,
     );
 }
 

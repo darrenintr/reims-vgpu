@@ -2642,6 +2642,14 @@ pub struct DisplayHandshake {
     /// re-registering the display can distinguish the new descriptor from the
     /// one it previously acknowledged.
     pub descriptor_generation: u32,
+    /// The host display's refresh, as the host window last reported it; `None`
+    /// until a window has named its monitor, and on a boot with no window.
+    pub host_refresh: Option<crate::model::DisplayRefresh>,
+    /// The refresh the current descriptor advertised, latched when it was
+    /// filled from [`Self::host_refresh`] (or the default). VBL is paced to this
+    /// and never to a later host report: the guest has already read its timing
+    /// table, and pacing to anything else is the mismatch this exists to remove.
+    pub refresh: crate::model::DisplayRefresh,
     /// Samples already logged per observed display-transaction wire shape,
     /// keyed by `(opcode, payload_len, pipe_index, task_field_is_set)`.
     ///

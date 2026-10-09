@@ -9,7 +9,7 @@ use crate::model::{DeviceState, ExecFault, FailEvent, PacketFault, Unimplemented
 use crate::observe::Emit;
 use crate::protocol::endian::{ld16, ld32, st16, st32};
 use crate::protocol::fifo::{
-    display_refresh_hz_1616, display_timing_entry_offset, encode_display_timing_entry,
+    display_refresh_millihertz_1616, display_timing_entry_offset, encode_display_timing_entry,
     DisplayTimingEntry, DISPLAY_DESC_TIMING_STRIDE,
 };
 use crate::protocol::info_reply::{self, ReplyBounds};
@@ -808,10 +808,20 @@ fn apply_setup_shared_state<H: HostMemory + HostOps>(
     state.display.online_acked = false;
     state.display.online_tries = 0;
     state.display.poll_ctr = 0;
+    // Latched here, with the descriptor that advertises it: the guest reads its
+    // timing table once per setup, and VBL must be paced to what it read.
+    state.display.refresh = state.display.host_refresh.unwrap_or_default();
     crate::observe::fail(format!(
-        "display_shared_state_setup index={index} gpa={:#x} reinit={reinit} ch={}",
+        "display_shared_state_setup index={index} gpa={:#x} reinit={reinit} ch={} \
+         refresh_mhz={} source={}",
         state.display.shared_gpa,
-        channel.map_or_else(|| "root".to_string(), |c| c.to_string())
+        channel.map_or_else(|| "root".to_string(), |c| c.to_string()),
+        state.display.refresh.millihertz(),
+        if state.display.host_refresh.is_some() {
+            "host_display"
+        } else {
+            "default"
+        },
     ));
     // Archive apple_pv_gpu_display_setup: fill descriptor + modes
     // before completion so createDisplayAttributes sees TimingElements.
@@ -823,6 +833,7 @@ fn apply_setup_shared_state<H: HostMemory + HostOps>(
         index,
         state.display.descriptor_generation,
         state.page_size(),
+        state.display.refresh,
     );
 }
 
@@ -4251,8 +4262,9 @@ fn shared_w32<H: HostMemory + HostOps>(host: &mut H, gpa: u64, off: u64, v: u32,
 ///
 ///: `+0x208` is the timing-element **count**, not a
 /// pixel width. Modes are 1920×1080, 1440×1080, 1280×1024 (apple-gfx A/B
-/// reference geometry) plus 3840×2160 (4K UHD), each advertised at
-/// `DISPLAY_REFRESH_HZ` (120 Hz), so the guest always latches the 120 Hz mode.
+/// reference geometry) plus 3840×2160 (4K UHD), each advertised at `refresh`
+/// — the host display's rate when the host window has reported one, otherwise
+/// `DISPLAY_REFRESH_HZ` (120 Hz) — so the guest always latches that one rate.
 ///
 /// # "Always" is measured, and it holds on the boots that look like it does not
 ///
@@ -4284,11 +4296,12 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
     index: u32,
     generation: u32,
     page_size: u64,
+    refresh: crate::model::DisplayRefresh,
 ) {
     if gpa == 0 {
         return;
     }
-    let Some(refresh) = display_refresh_hz_1616(DISPLAY_REFRESH_HZ) else {
+    let Some(refresh) = display_refresh_millihertz_1616(refresh.millihertz()) else {
         return;
     };
     let psz = page_size as usize;
@@ -6693,27 +6706,13 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     host.enqueue(HostAction::irq_gfx());
 }
 
-/// Minimum wall-clock interval shared by both display VBL signal paths, in
-/// microseconds.
-///
-/// The x86 QEMU heartbeat oversamples this interval every
-/// `REIMS_VGPU_PCI_HEARTBEAT_MS` (4 ms). The shared limiter caps heartbeat and
-/// active-console polls at the rate we advertise, without aliasing a
-/// heartbeat-only workload down to half rate.
-///
-/// **Derived from [`DISPLAY_REFRESH_HZ`], not written down.** This was a
-/// millisecond grid with a hardcoded `8`, which is 125 Hz — so the device
-/// advertised 120 Hz in its timing table and then delivered VBL 4.2% faster.
-/// The guest honours what is delivered, not what is advertised: a driven
-/// Safari measured its own `requestAnimationFrame` at exactly 125 Hz. 120 Hz is
-/// 8333 µs and is simply not expressible on an integer-millisecond grid, so the
-/// units are part of the fix rather than incidental to it.
-pub(crate) const DISPLAY_VBL_MIN_INTERVAL_US: u64 =
-    1_000_000 / crate::model::DISPLAY_REFRESH_HZ as u64;
-
 /// Atomically claim the next display VBL for either the locked or lock-free
 /// poll path. A single shared timestamp makes the cadence independent of device
 /// lock contention and prevents both paths from signaling the same interval.
+///
+/// `interval_us` is the latched [`crate::model::DisplayRefresh`]'s, the one the
+/// guest's timing table advertised. The x86 heartbeat (`REIMS_VGPU_PCI_
+/// HEARTBEAT_MS`, 4 ms) oversamples it, and this caps those polls at that rate.
 ///
 /// The claimed timestamp advances on a **fixed interval grid** (`last +
 /// INTERVAL`), not to `now_ms`. Resetting to `now` lets poll jitter shift the
@@ -6730,16 +6729,20 @@ pub(crate) const DISPLAY_VBL_MIN_INTERVAL_US: u64 =
 /// at rather than latching 60. A long stall (≥2 intervals, e.g. the drain worker
 /// held the lock) resyncs the phase to `now_ms` so we never unleash a burst of
 /// back-dated VBLs.
-pub(crate) fn claim_display_vbl(last_us: &std::sync::atomic::AtomicU64, now_us: u64) -> bool {
+pub(crate) fn claim_display_vbl(
+    last_us: &std::sync::atomic::AtomicU64,
+    now_us: u64,
+    interval_us: u64,
+) -> bool {
     let last = last_us.load(std::sync::atomic::Ordering::Acquire);
     let gap = now_us.saturating_sub(last);
-    if gap < DISPLAY_VBL_MIN_INTERVAL_US {
+    if gap < interval_us {
         return false;
     }
-    let next = if gap >= 2 * DISPLAY_VBL_MIN_INTERVAL_US {
+    let next = if gap >= 2 * interval_us {
         now_us
     } else {
-        last + DISPLAY_VBL_MIN_INTERVAL_US
+        last + interval_us
     };
     last_us
         .compare_exchange(
@@ -6751,8 +6754,8 @@ pub(crate) fn claim_display_vbl(last_us: &std::sync::atomic::AtomicU64, now_us: 
         .is_ok()
 }
 
-/// Pulse VBL at the phase-locked ~120 Hz cadence (grid interval
-/// [`DISPLAY_VBL_MIN_INTERVAL_US`]; see [`claim_display_vbl`]).
+/// Pulse VBL on the phase-locked grid of the latched
+/// [`crate::model::DisplayRefresh`]; see [`claim_display_vbl`].
 ///
 /// Writes pending bit 0, sets 0x1014 display bit, and raises MSI after ONLINE
 /// has been acked. The limiter is owned outside `DeviceState` so this locked
@@ -7043,6 +7046,7 @@ pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
     page_size: usize,
     last_us: &std::sync::atomic::AtomicU64,
     now_us: u64,
+    interval_us: u64,
 ) {
     let mut mask_le = [0u8; 4];
     if host
@@ -7065,7 +7069,7 @@ pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
     if !vbl && !transaction {
         return;
     }
-    if !claim_display_vbl(last_us, now_us) {
+    if !claim_display_vbl(last_us, now_us, interval_us) {
         return;
     }
 
@@ -7123,6 +7127,7 @@ fn signal_display_vbl_at<H: HostMemory + HostOps>(
         page_size,
         last_us,
         now_us,
+        state.display.refresh.interval_us(),
     );
 }
 

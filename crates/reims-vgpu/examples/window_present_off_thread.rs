@@ -172,6 +172,9 @@ fn main() {
         frames,
         stop,
         wake,
+        // Nothing here advertises a refresh to a guest; the window still
+        // publishes its monitor's rate into the cell.
+        Arc::new(std::sync::atomic::AtomicU32::new(0)),
     );
 
     let _ = probe.join();

@@ -957,16 +957,70 @@ pub fn display_dimension_mm(millimetres: u16) -> (f32, u16) {
     let narrowed = millimetres as f32;
     (narrowed, (narrowed as f64 + 0.5) as u16)
 }
-/// Advertised refresh of every timing element. macOS paces CoreAnimation /
-/// rAF to the display's advertised rate, so 60 here caps the guest at 60 fps
-/// regardless of how fast VBL is signalled. 120 requests ProMotion-class
-/// pacing; it must be matched by the VBL limiter and enough poll opportunities
-/// (`REIMS_VGPU_PCI_HEARTBEAT_MS` = 4). The limiter now *derives* its interval
-/// from this constant (`DISPLAY_VBL_MIN_INTERVAL_US`) rather than restating it,
-/// because the two were allowed to drift apart: a hardcoded 8 ms delivered
-/// 125 Hz against the 120 advertised here, and the guest paces to what is
-/// delivered.
+/// Refresh advertised in every timing element, and paced by the VBL limiter,
+/// when the host has not reported its display's own rate — no host window, or
+/// a window that could not yet name its monitor when the guest read the
+/// descriptor. macOS paces CoreAnimation / rAF to the display's advertised
+/// rate, so 60 here would cap the guest at 60 fps regardless of how fast VBL is
+/// signalled; 120 requests ProMotion-class pacing.
 pub const DISPLAY_REFRESH_HZ: u32 = 120;
+
+/// The refresh one published display descriptor promised the guest: the rate in
+/// its timing table and the VBL interval the limiter paces to, as one value.
+///
+/// One value because the two were once allowed to drift apart: a hardcoded 8 ms
+/// interval delivered 125 Hz against 120 advertised, and the guest paces to what
+/// is delivered.
+///
+/// # Why it follows the host display
+///
+/// The guest animates on its own vsync clock and the host window shows its
+/// frames on the host display's. When those differ, frames are shown at a
+/// beat: 120 Hz into a 100 Hz panel drops one guest frame in six, every time,
+/// which reads as a regular judder in exactly the content that moves smoothly —
+/// animation — while a drag, which only ever shows the latest frame, looks
+/// fine. Advertising the panel's rate lets each guest frame land on one host
+/// refresh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayRefresh {
+    millihertz: u32,
+}
+
+impl DisplayRefresh {
+    pub const DEFAULT: Self = Self {
+        millihertz: DISPLAY_REFRESH_HZ * 1000,
+    };
+    /// Below this a host report is not a display refresh worth pacing a desktop
+    /// to; it is a stale or placeholder mode.
+    const MIN_MILLIHERTZ: u32 = 24_000;
+    /// The VBL poll heartbeat (`REIMS_VGPU_PCI_HEARTBEAT_MS`, 4 ms) claims at most
+    /// one VBL per poll, so an interval below it cannot be delivered at rate.
+    /// 240 Hz (4.17 ms) is the fastest panel class that still fits.
+    const MAX_MILLIHERTZ: u32 = 240_000;
+
+    /// The rate a host display reported, if it is one this device can pace.
+    pub fn from_host(millihertz: u32) -> Option<Self> {
+        (Self::MIN_MILLIHERTZ..=Self::MAX_MILLIHERTZ)
+            .contains(&millihertz)
+            .then_some(Self { millihertz })
+    }
+
+    pub const fn millihertz(self) -> u32 {
+        self.millihertz
+    }
+
+    /// The VBL interval this rate is delivered at, in microseconds. Microseconds
+    /// because 120 Hz (8333 us) is not expressible on a millisecond grid.
+    pub const fn interval_us(self) -> u64 {
+        1_000_000_000 / self.millihertz as u64
+    }
+}
+
+impl Default for DisplayRefresh {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 pub const DISPLAY_PRODUCT_NAME: &[u8] = b"QEMU display\0";
 /// How many unacked ONLINE pulses this device sends before it stops.
 ///

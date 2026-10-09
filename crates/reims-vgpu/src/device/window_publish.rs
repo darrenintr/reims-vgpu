@@ -89,6 +89,8 @@ pub(crate) struct WindowLink {
     bgra_short_geom: Option<(u32, u32)>,
     /// Set to ask the window thread to exit (VM teardown); the thread polls it.
     stop: crate::host_window::present::StopFlag,
+    /// The window's monitor refresh, as the window publishes it.
+    refresh: crate::host_window::present::HostRefresh,
     /// Window thread handle. `device_window_stop` sets `stop` and joins it, so
     /// the window's Vulkan objects tear down before QEMU teardown proceeds
     /// (avoids the driver-unload-during-exit crash class).
@@ -97,6 +99,17 @@ pub(crate) struct WindowLink {
     /// window and its Vulkan objects.
     #[cfg(target_os = "macos")]
     exited: crate::host_window::present::ExitedFlag,
+}
+
+#[cfg(feature = "host-window")]
+impl WindowLink {
+    /// The host display's refresh, once the window has named its monitor and
+    /// the rate is one this device can pace.
+    pub(crate) fn host_refresh(&self) -> Option<crate::model::DisplayRefresh> {
+        crate::model::DisplayRefresh::from_host(
+            self.refresh.load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
 }
 
 /// What the window has been sent of the guest's cursor, and how to tell what it
@@ -283,6 +296,8 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
     };
     let stop: crate::host_window::present::StopFlag =
         Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let refresh: crate::host_window::present::HostRefresh =
+        Arc::new(std::sync::atomic::AtomicU32::new(0));
     #[cfg(target_os = "macos")]
     let (thread, exited) = {
         let exited: crate::host_window::present::ExitedFlag =
@@ -295,6 +310,7 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
             Arc::clone(&stop),
             Arc::clone(&exited),
             Arc::clone(&wake),
+            Arc::clone(&refresh),
         ) {
             crate::observe::Emit::decline("host_window_start", &error)
                 .field("id", id)
@@ -310,6 +326,7 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         Arc::clone(&frames),
         Arc::clone(&stop),
         Arc::clone(&wake),
+        Arc::clone(&refresh),
     ));
     *link = Some(WindowLink {
         frames,
@@ -319,6 +336,7 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         seq: 0,
         bgra_short_geom: None,
         stop,
+        refresh,
         thread,
         #[cfg(target_os = "macos")]
         exited,
