@@ -600,17 +600,26 @@ fn present_action_owns_worker_boundary_until_scanout_copy() {
 #[test]
 fn vblank_timer_sleeps_to_the_next_grid_deadline() {
     let interval = 10_000;
-    assert_eq!(vblank_wait_us(50_000, interval, 53_000), 7_000);
-    assert_eq!(vblank_wait_us(50_000, interval, 60_000), 0, "due now");
+    assert_eq!(vblank_wait_us(50_000, interval, 53_000, true), 7_000);
+    assert_eq!(vblank_wait_us(50_000, interval, 60_000, true), 0, "due now");
     assert_eq!(
-        vblank_wait_us(50_000, interval, 75_000),
+        vblank_wait_us(50_000, interval, 75_000, true),
         0,
         "overdue claims at once"
     );
     assert_eq!(
-        vblank_wait_us(90_000, interval, 50_000),
+        vblank_wait_us(90_000, interval, 50_000, true),
         interval,
         "a grid ahead of the clock waits one interval, not the gap"
     );
-    assert_eq!(vblank_wait_us(0, 0, 123), 4_000);
+    assert_eq!(vblank_wait_us(0, 0, 123, true), 4_000);
+}
+
+/// A pulse that claimed nothing (the guest has VBL disarmed) leaves the grid's
+/// deadline in the past. Computing the wait from it again would answer zero on
+/// every turn — a thread spinning a host core for as long as the guest stays
+/// disarmed — so the timer backs off to the heartbeat period instead.
+#[test]
+fn vblank_timer_does_not_spin_while_the_guest_is_disarmed() {
+    assert_eq!(vblank_wait_us(50_000, 10_000, 75_000, false), 4_000);
 }

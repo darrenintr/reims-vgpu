@@ -284,22 +284,31 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
 fn spawn_vblank_timer(id: u64) {
     let spawned = std::thread::Builder::new()
         .name("reims-vgpu-vblank".to_string())
-        .spawn(move || loop {
-            let wait_us = {
+        .spawn(move || {
+            // Whether the last pulse claimed its slot. A guest that has not armed
+            // VBL makes the pulse decline without consuming one, so the grid's
+            // deadline stays in the past; waiting for it again would spin.
+            let mut claimed = true;
+            loop {
+                let wait_us = {
+                    let Some(slot) = device_slot(id) else {
+                        return;
+                    };
+                    vblank_wait_us(
+                        slot.vbl_last_us.load(Ordering::Acquire),
+                        slot.vbl_interval_us.load(Ordering::Acquire),
+                        crate::observe::elapsed_us(),
+                        claimed,
+                    )
+                };
+                std::thread::sleep(std::time::Duration::from_micros(wait_us));
                 let Some(slot) = device_slot(id) else {
                     return;
                 };
-                vblank_wait_us(
-                    slot.vbl_last_us.load(Ordering::Acquire),
-                    slot.vbl_interval_us.load(Ordering::Acquire),
-                    crate::observe::elapsed_us(),
-                )
-            };
-            std::thread::sleep(std::time::Duration::from_micros(wait_us));
-            let Some(slot) = device_slot(id) else {
-                return;
-            };
-            vbl_contended_pulse(&slot);
+                let before = slot.vbl_last_us.load(Ordering::Acquire);
+                vbl_contended_pulse(&slot);
+                claimed = slot.vbl_last_us.load(Ordering::Acquire) != before;
+            }
         });
     if let Err(error) = spawned {
         // The heartbeat still paces VBL, on its own coarser grid.
@@ -309,11 +318,12 @@ fn spawn_vblank_timer(id: u64) {
 
 /// How long the VBL timer sleeps before its next claim: to the next deadline on
 /// the grid (`last + interval`), and at most one interval. Before the guest's
-/// display is online there is no interval yet, and the timer idles at the
-/// heartbeat's own period.
-fn vblank_wait_us(last_us: u64, interval_us: u64, now_us: u64) -> u64 {
+/// display is online there is no interval yet, and after a pulse that claimed
+/// nothing — the guest has VBL disarmed, so the deadline never advances — the
+/// timer idles at the heartbeat's own period rather than retrying at once.
+fn vblank_wait_us(last_us: u64, interval_us: u64, now_us: u64, last_pulse_claimed: bool) -> u64 {
     const IDLE_US: u64 = 4_000;
-    if interval_us == 0 {
+    if interval_us == 0 || !last_pulse_claimed {
         return IDLE_US;
     }
     last_us
