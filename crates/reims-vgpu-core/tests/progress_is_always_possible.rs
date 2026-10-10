@@ -106,6 +106,7 @@ impl Rng {
 /// The identity a generated pipeline number resolves to.
 fn pipeline_id(n: u32) -> ResourceId {
     ResourceId {
+        task: reims_vgpu_core::identity::TaskId(0),
         slot: ObjectListRef(n),
         generation: SlotGeneration(1),
     }

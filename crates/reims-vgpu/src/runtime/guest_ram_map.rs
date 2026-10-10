@@ -255,7 +255,9 @@ impl RunResolver {
     }
 
     /// A complete operation whose backend will admit all required parents
-    /// before recording work. Currently used only by mapper-ref compute output.
+    /// before recording work. Currently used only by mapper-ref compute output,
+    /// which only the Vulkan rail writes through guest RAM.
+    #[cfg(any(feature = "backend-vulkan", test))]
     pub(crate) const fn complete_target() -> Self {
         Self {
             admission: RunAdmission::CompleteTarget,
@@ -263,6 +265,7 @@ impl RunResolver {
     }
 
     /// The standing refusal this resolver must obey, if any.
+    #[cfg(feature = "backend-vulkan")]
     pub(crate) fn standing_refusal<H: HostOps + ?Sized>(self, host: &mut H) -> Option<MapRefusal> {
         let refusal = standing_refusal(host)?;
         match (self.admission, refusal) {
@@ -410,6 +413,62 @@ pub fn imports() -> Vec<Arc<GuestRamImport>> {
         .filter(|r| r.refusal.is_none())
         .map(|r| r.imports.clone())
         .unwrap_or_default()
+}
+
+/// Where a run of guest pages sits in the files behind guest RAM, one range per
+/// stretch that is contiguous in its file, in page order.
+///
+/// This is what lets a packed alias — consecutive in this process, scattered in
+/// guest-physical space — be handed to a device as one dma-buf over the memfd
+/// QEMU allocated guest RAM from, instead of as a host pointer to a shared file
+/// mapping, which amdgpu's userptr refuses outright
+/// (`VK_ERROR_INVALID_EXTERNAL_HANDLE`).
+///
+/// `None` unless every page lies wholly inside a RAMBlock import whose file the
+/// host reported: a partial answer would describe a buffer missing some of its
+/// pages. Reads only what [`warm`] or the first [`reference`] already resolved,
+/// so a host that never built the map answers `None` rather than building it.
+pub fn fd_ranges_for_pages(
+    gpas: &[u64],
+    page_size: u64,
+) -> Option<Vec<crate::runtime::guest_ram::FdRange>> {
+    if page_size == 0 || gpas.is_empty() {
+        return None;
+    }
+    let map = MAP.lock().unwrap_or_else(|p| p.into_inner());
+    let resolved = map.as_ref().filter(|r| r.refusal.is_none())?;
+    file_ranges(&resolved.imports, gpas, page_size)
+}
+
+fn file_ranges(
+    imports: &[Arc<GuestRamImport>],
+    gpas: &[u64],
+    page_size: u64,
+) -> Option<Vec<crate::runtime::guest_ram::FdRange>> {
+    let mut out: Vec<crate::runtime::guest_ram::FdRange> = Vec::new();
+    for &gpa in gpas {
+        let end = gpa.checked_add(page_size)?;
+        let import = imports
+            .iter()
+            .find(|i| i.contains_gpa(gpa) && i.contains_gpa(end - 1))?;
+        let [file] = import.fd_ranges()? else {
+            return None;
+        };
+        let offset = file.offset.checked_add(gpa - import.gpa_base()?)?;
+        match out.last_mut() {
+            Some(last)
+                if last.fd == file.fd && last.offset.checked_add(last.len) == Some(offset) =>
+            {
+                last.len += page_size;
+            }
+            _ => out.push(crate::runtime::guest_ram::FdRange {
+                fd: file.fd,
+                offset,
+                len: page_size,
+            }),
+        }
+    }
+    Some(out)
 }
 
 /// Take the whole guest-RAM import now, so the guest's first draw does not pay
@@ -873,7 +932,15 @@ fn resolve<H: HostOps + ?Sized>(host: &mut H) -> Resolved {
     let mut imports: Vec<Arc<GuestRamImport>> = spans
         .into_iter()
         .flat_map(|span| chunk_span(span, span_max))
-        .filter_map(|span| GuestRamImport::new(span, align).ok().map(Arc::new))
+        .filter_map(|span| GuestRamImport::new(span, align).ok())
+        .map(|import| {
+            // The file behind exactly this import's bytes, asked after the trim
+            // so the offset names the import's first byte and not the span's.
+            match host.guest_ram_fd(import.host_base() as u64, import.len()) {
+                Some(backing) => Arc::new(import.with_fd_backing(backing)),
+                None => Arc::new(import),
+            }
+        })
         .collect();
     // `reference` binary-searches this, so the order is load-bearing rather than
     // cosmetic. The shim reports blocks in ascending GPA and `chunk_span` keeps
@@ -1005,6 +1072,135 @@ mod tests {
                 len: 0x8000_0000,
             },
         ])
+    }
+
+    /// A host whose second span lives in a file, at file offset `0x4000`.
+    struct FileBacked(Spans);
+
+    impl HostOps for FileBacked {
+        fn mono_ns(&self) -> u64 {
+            0
+        }
+        fn enqueue(&mut self, _action: crate::runtime::host::HostAction) {}
+        fn schedule_bh(&mut self) {}
+        fn guest_ram_regions(&mut self) -> Result<Vec<GuestRamRegion>, GuestRamRegionsError> {
+            self.0.guest_ram_regions()
+        }
+        fn guest_ram_fd(
+            &mut self,
+            host_va: u64,
+            len: u64,
+        ) -> Option<crate::runtime::guest_ram::FdBacking> {
+            let block = self.0 .0[1];
+            (host_va >= block.host_va && host_va + len <= block.host_va + block.len).then(|| {
+                crate::runtime::guest_ram::FdBacking {
+                    fd: 7,
+                    offset: 0x4000 + (host_va - block.host_va),
+                }
+            })
+        }
+    }
+
+    /// A scattered page list becomes one file range per stretch that is
+    /// contiguous *in the file*, in page order — not in GPA order — and any page
+    /// without a file refuses the whole list rather than describing a buffer
+    /// with a hole in it.
+    #[test]
+    fn a_page_list_names_its_bytes_in_the_file_in_page_order() {
+        use crate::runtime::guest_ram::{FdBacking, FdRange, GuestRamImport, GuestRamRegion};
+        let page = 0x1000;
+        let filed = Arc::new(
+            GuestRamImport::new(
+                GuestRamRegion {
+                    gpa_base: 0x10_0000,
+                    host_va: 0x7f00_0000_0000,
+                    len: 0x10_0000,
+                },
+                page,
+            )
+            .unwrap()
+            .with_fd_backing(FdBacking {
+                fd: 9,
+                offset: 0x20_0000,
+            }),
+        );
+        let bare = Arc::new(
+            GuestRamImport::new(
+                GuestRamRegion {
+                    gpa_base: 0x80_0000,
+                    host_va: 0x7f10_0000_0000,
+                    len: 0x10_0000,
+                },
+                page,
+            )
+            .unwrap(),
+        );
+        let imports = [filed, bare];
+        let ranges = file_ranges(&imports, &[0x10_3000, 0x10_4000, 0x10_1000], page);
+        assert_eq!(
+            ranges,
+            Some(vec![
+                FdRange {
+                    fd: 9,
+                    offset: 0x20_3000,
+                    len: 0x2000
+                },
+                FdRange {
+                    fd: 9,
+                    offset: 0x20_1000,
+                    len: 0x1000
+                },
+            ])
+        );
+        assert_eq!(
+            file_ranges(&imports, &[0x10_3000, 0x80_0000], page),
+            None,
+            "a page with no file refuses the list"
+        );
+        assert_eq!(
+            file_ranges(&imports, &[0x10_3000, 0x40_0000], page),
+            None,
+            "a page outside guest RAM refuses the list"
+        );
+    }
+
+    /// Every import carries the file the host names for exactly its own bytes —
+    /// asked per chunk, so a block split by the span ceiling gives each chunk
+    /// the offset of its own first byte — and a span with no file carries none.
+    #[test]
+    fn each_import_carries_the_file_behind_its_own_bytes() {
+        let chunk = 0x4000_0000;
+        let imports = with_span_max(0x1000, chunk, || {
+            let mut host = FileBacked(two_spans());
+            warm_with(&mut host, |_| (0, 0));
+            imports()
+        });
+        let second = 0x7f80_0000_0000u64;
+        let backed: Vec<_> = imports
+            .iter()
+            .map(|i| {
+                (
+                    i.host_base() as u64,
+                    i.len(),
+                    i.fd_ranges().map(<[_]>::to_vec),
+                )
+            })
+            .collect();
+        assert_eq!(backed.len(), 4, "two spans of two chunks each: {backed:?}");
+        for (base, len, ranges) in backed {
+            if base < second {
+                assert_eq!(ranges, None, "the first span has no file");
+            } else {
+                assert_eq!(
+                    ranges,
+                    Some(vec![crate::runtime::guest_ram::FdRange {
+                        fd: 7,
+                        offset: 0x4000 + (base - second),
+                        len,
+                    }])
+                );
+            }
+        }
     }
 
     fn with_granularity<R>(align: Option<u64>, body: impl FnOnce() -> R) -> R {

@@ -610,6 +610,12 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
                 function_ref: pipeline.vertex_func_ref,
             });
         };
+        // See `draw::metal::mod`: a nil fragment function is legal Metal that
+        // this rail does not build yet, refused under its own name.
+        if !pipeline.has_fragment_function() {
+            refuse("fragment_function_absent");
+            return Err(MetalIcbInheritanceDecline::FragmentMtlbMissing { function_ref: 0 });
+        }
         let Some(frag) = load_mtlb(
             state,
             host,

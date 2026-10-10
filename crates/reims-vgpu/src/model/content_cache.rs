@@ -164,6 +164,10 @@ impl<E: CacheEntry> ContentCache<E> {
     /// reading that can falsify the module header's argument: a count still
     /// climbing minutes into a boot means some key is carrying per-frame state
     /// rather than guest state.
+    ///
+    /// Only the tests read it today: the Metal rail, the one rail that holds
+    /// these caches, does not yet publish `object_cache_levels` from them.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.buckets.values().map(Vec::len).sum()
     }

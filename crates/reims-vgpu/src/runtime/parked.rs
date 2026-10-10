@@ -631,6 +631,7 @@ mod tests {
             pipeline_leases: refs
                 .iter()
                 .map(|&r| ResourceId {
+                    task: reims_vgpu_core::identity::TaskId(0),
                     slot: reims_vgpu_core::identity::ObjectListRef(r),
                     generation: reims_vgpu_core::identity::SlotGeneration(1),
                 })

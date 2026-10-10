@@ -1123,6 +1123,7 @@ mod tests {
     /// disagrees with the opcode.
     fn res(slot: u32) -> ResourceId {
         ResourceId {
+            task: crate::identity::TaskId(0),
             slot: ObjectListRef(slot),
             generation: SlotGeneration(1),
         }
@@ -1226,6 +1227,7 @@ mod tests {
         let mut s = SessionModel::new(SessionId(1));
         s.open_channel(ChannelId(2)).expect("fresh");
         let pipe = ResourceId {
+            task: crate::identity::TaskId(0),
             slot: ObjectListRef(9),
             generation: SlotGeneration(1),
         };
@@ -1249,6 +1251,7 @@ mod tests {
         // And a lease list that refuses part way charges nothing for the part
         // ahead of the refusal.
         let absent = ResourceId {
+            task: crate::identity::TaskId(0),
             slot: ObjectListRef(10),
             generation: SlotGeneration(1),
         };
@@ -1372,6 +1375,7 @@ mod tests {
                         .map(|a| {
                             (
                                 ResourceId {
+                                    task: crate::identity::TaskId(0),
                                     slot: ObjectListRef(0),
                                     generation: SlotGeneration(1),
                                 },
@@ -1477,6 +1481,7 @@ mod tests {
     fn a_transactions_pipeline_waits_are_the_pipelines_it_binds() {
         let mut s = session();
         let pipeline = ResourceId {
+            task: crate::identity::TaskId(0),
             slot: ObjectListRef(9),
             generation: SlotGeneration(1),
         };
@@ -1512,6 +1517,7 @@ mod tests {
     fn a_pipeline_finishing_releases_the_work_that_was_held_for_it() {
         let mut s = session();
         let pipeline = ResourceId {
+            task: crate::identity::TaskId(0),
             slot: ObjectListRef(9),
             generation: SlotGeneration(1),
         };
@@ -1558,6 +1564,7 @@ mod tests {
     fn a_deleted_pipeline_names_the_work_it_left_waiting() {
         let mut s = session();
         let pipeline = ResourceId {
+            task: crate::identity::TaskId(0),
             slot: ObjectListRef(9),
             generation: SlotGeneration(1),
         };
@@ -1608,10 +1615,12 @@ mod tests {
         // which it does not — the waiter is stranded either way, and scoping
         // the answer to the destroyable ones is what missed the second.
         let building = ResourceId {
+            task: crate::identity::TaskId(0),
             slot: ObjectListRef(9),
             generation: SlotGeneration(1),
         };
         let declared = ResourceId {
+            task: crate::identity::TaskId(0),
             slot: ObjectListRef(10),
             generation: SlotGeneration(1),
         };
@@ -1670,6 +1679,7 @@ mod tests {
         let mut leases = Vec::new();
         for slot in [11, 12] {
             let id = ResourceId {
+                task: crate::identity::TaskId(0),
                 slot: ObjectListRef(slot),
                 generation: SlotGeneration(1),
             };
@@ -1699,6 +1709,7 @@ mod tests {
     fn a_pipeline_that_will_never_build_names_the_work_it_stranded() {
         let mut s = session();
         let pipeline = ResourceId {
+            task: crate::identity::TaskId(0),
             slot: ObjectListRef(9),
             generation: SlotGeneration(1),
         };
@@ -1735,6 +1746,7 @@ mod tests {
     fn work_binding_an_undeclared_pipeline_is_refused_as_absent() {
         let mut s = session();
         let pipeline = ResourceId {
+            task: crate::identity::TaskId(0),
             slot: ObjectListRef(9),
             generation: SlotGeneration(1),
         };

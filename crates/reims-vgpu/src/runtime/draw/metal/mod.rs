@@ -312,6 +312,27 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         );
         return (EncodeStatus::MissingMtlb("draw_mtl_vertex_mtlb_load"), None);
     };
+    // Metal accepts a nil `fragmentFunction` (depth/stencil-only passes), and
+    // the Vulkan rail realizes it; this rail does not build one yet. Refused
+    // under its own name rather than reaching the loader below with ref 0 and
+    // reading as a missing container.
+    if !pipeline.has_fragment_function() {
+        crate::observe::fail(format!(
+            "metal_draw fragment_function_absent pipe={}",
+            req.pipeline_ref
+        ));
+        crate::runtime::draw::refuse_pipeline(
+            state,
+            host,
+            req.task_id,
+            req.pipeline_ref,
+            reims_vgpu_core::pipeline::RefusalReason::CompilationFailed("fragment_function_absent"),
+        );
+        return (
+            EncodeStatus::MissingMtlb("draw_mtl_fragment_function_absent"),
+            None,
+        );
+    }
     let Some(frag) = load_mtlb(
         state,
         host,

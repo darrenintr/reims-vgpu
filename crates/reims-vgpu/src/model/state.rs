@@ -210,7 +210,9 @@ fn packet_echo_fields(
     // the packet layout. A trailing sub-word tail is reported by `plen` rather
     // than zero-padded into a word that the guest never wrote.
     let words = payload
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .take(UNKNOWN_OPCODE_ECHO_WORDS_MAX)
         .map(|word| format!("{:#010x}", crate::protocol::endian::ld32(word)))
         .collect::<Vec<_>>()
@@ -787,7 +789,7 @@ struct TaskResourceLifetime {
 impl TaskResourceLifetime {
     fn new() -> Self {
         let id = NEXT_TASK_RESOURCE_LIFETIME
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
                 |id| id.checked_add(1),
@@ -4497,6 +4499,21 @@ impl DeviceState {
             .map(|entry| entry.state.name())
     }
 
+    /// The pipeline table's state for `pipeline`, typed, or `None` when the
+    /// table holds no entry for it.
+    #[must_use]
+    pub fn pipeline_state_of(
+        &self,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+    ) -> Option<reims_vgpu_core::pipeline::PipelineState> {
+        self.session
+            .lock()
+            .expect("session")
+            .pipelines()
+            .get(pipeline)
+            .map(|entry| entry.state)
+    }
+
     #[must_use]
     pub fn pipeline_is_ready(&self, pipeline: reims_vgpu_core::identity::ResourceId) -> bool {
         self.session
@@ -6287,6 +6304,7 @@ mod device_access_tests {
         let mut access = state.task_access(TaskId(TASK), DOMAIN);
 
         let stranger = ResourceId {
+            task: resource.task,
             slot: reims_vgpu_core::identity::ObjectListRef(9),
             generation: resource.generation,
         };
@@ -6709,6 +6727,7 @@ mod pipeline_door_tests {
 
     fn name(slot: u32) -> ResourceId {
         ResourceId {
+            task: reims_vgpu_core::identity::TaskId(0),
             slot: ObjectListRef(slot),
             generation: SlotGeneration(1),
         }
@@ -6741,6 +6760,7 @@ mod pipeline_door_tests {
         // the same slot is too, which is the whole reason the name carries one.
         assert!(state.declare_pipeline(name(10)));
         assert!(state.declare_pipeline(ResourceId {
+            task: reims_vgpu_core::identity::TaskId(0),
             slot: ObjectListRef(9),
             generation: SlotGeneration(2),
         }));
@@ -6773,6 +6793,33 @@ mod pipeline_door_tests {
             reims_vgpu_core::session::Ended::default()
         );
         assert_eq!(state.pipeline_census().retired, 1);
+    }
+
+    #[test]
+    fn retiring_one_tasks_pipeline_does_not_retire_another_tasks_same_slot() {
+        use reims_vgpu_core::lifecycle::Storage;
+        use reims_vgpu_core::pipeline::PipelineState;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.define_task(14, 0x1000, 2);
+        state.define_task(15, 0x2000, 3);
+        let first = state.declare_object(14, 11, Storage::NoBytes).unwrap().id;
+        let second = state.declare_object(15, 11, Storage::NoBytes).unwrap().id;
+        state.declare_pipeline(first);
+        state.advance_pipeline(first, PipelineState::Translating);
+        state.advance_pipeline(first, PipelineState::Compiling);
+        assert!(state.ready_pipeline(first));
+        let ended = state.retire_pipeline(first);
+        assert!(ended.took);
+        assert!(ended.stranded.is_empty());
+
+        assert!(
+            state.declare_pipeline(second),
+            "another task owns a distinct pipeline"
+        );
+        assert_eq!(state.pipeline_state(second), Some("declared"));
+        assert!(!state.pipeline_is_ready(second));
+        assert_eq!(state.pipeline_state(first), Some("retired"));
     }
 
     /// A declared pipeline reaches `Ready` only through the rail's three steps,

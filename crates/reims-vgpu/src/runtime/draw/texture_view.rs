@@ -394,12 +394,26 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
 /// the chain exceeds the max depth without a non-view base, a base ref is zero,
 /// or swizzle selectors are malformed. See [`resolve_texture_view_reasoned`] for
 /// the specific reason on the fail path.
-pub(super) fn resolve_texture_view<M: HostMemory + HostOps>(
+///
+/// "Is this a view at all" is asked of the slot's type first, exactly as the
+/// walk asks it of every inner hop. Callers use this as that question — a
+/// render target or sampled texture that is not a view takes its own ref — so a
+/// slot holding a ref texture or a plain texture is the expected answer, not a
+/// refusal. Sending it through the strict resolver instead made every such bind
+/// an always-on `memo_wrong_type` line (654 on one macOS 13 Simulator session,
+/// every one with the guest's list agreeing with the memo).
+pub(crate) fn resolve_texture_view<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     texture_ref: u32,
 ) -> Option<ViewResolve> {
+    use crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VIEW;
+
+    let resource = objects::resolve_resource(state, host, task_id, texture_ref).ok()?;
+    if resource.entry.object_type != OBJECT_TYPE_TEXTURE_VIEW {
+        return None;
+    }
     resolve_texture_view_reasoned(state, host, task_id, texture_ref).ok()
 }
 
@@ -554,7 +568,7 @@ pub(super) fn apply_view_swizzle_rgba8(
         return None;
     }
     crate::runtime::census::view_swizzle_census::note_cpu_remap(texture_ref);
-    for px in rgba.chunks_exact_mut(4) {
+    for px in rgba.as_chunks_mut::<4>().0 {
         let input = [px[0], px[1], px[2], px[3]];
         let out = pixel_format::apply_swizzle_rgba8(plan, input);
         px.copy_from_slice(&out);
@@ -1238,7 +1252,7 @@ where
     {
         // A channel exchange, which moves no value across the transfer
         // function: the bytes stay encoded exactly as the guest stored them.
-        for pixel in bytes.chunks_exact_mut(RGBA8_BPP as usize) {
+        for pixel in bytes.as_chunks_mut::<{ RGBA8_BPP as usize }>().0 {
             pixel.swap(0, 2);
         }
         return Ok((

@@ -1503,7 +1503,7 @@ mod cursor_tests {
     #[test]
     fn a_glyph_payload_one_byte_short_is_refused() {
         assert_eq!(
-            decode_cursor_glyph(&vec![0u8; CURSOR_GLYPH_LEN - 1]),
+            decode_cursor_glyph(&[0u8; CURSOR_GLYPH_LEN - 1]),
             Err(ShortPayload {
                 plen: CURSOR_GLYPH_LEN - 1,
                 need: CURSOR_GLYPH_LEN,
@@ -1530,7 +1530,7 @@ mod cursor_tests {
     #[test]
     fn a_show_payload_one_byte_short_is_refused() {
         assert_eq!(
-            decode_cursor_show(&vec![0u8; CURSOR_SHOW_LEN - 1]),
+            decode_cursor_show(&[0u8; CURSOR_SHOW_LEN - 1]),
             Err(ShortPayload {
                 plen: CURSOR_SHOW_LEN - 1,
                 need: CURSOR_SHOW_LEN,

@@ -532,6 +532,7 @@ mod tests {
 
     fn id(slot: u32, generation: u64) -> ResourceId {
         ResourceId {
+            task: reims_vgpu_core::identity::TaskId(0),
             slot: ObjectListRef(slot),
             generation: SlotGeneration(generation),
         }

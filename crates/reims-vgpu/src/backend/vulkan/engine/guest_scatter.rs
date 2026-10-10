@@ -332,7 +332,7 @@ pub(crate) fn build_gather_run_tables(
         .collect();
     let mut tables = build_run_tables(&exchanged, bind_align, max_range, dst_have)?;
     for table in &mut tables {
-        for run in table.words.chunks_exact_mut(WORDS_PER_RUN) {
+        for run in table.words.as_chunks_mut::<WORDS_PER_RUN>().0 {
             run.swap(0, 1);
         }
     }
@@ -661,8 +661,10 @@ mod tests {
         assert_eq!(g.run_count, w.run_count);
         for (gr, wr) in g
             .words
-            .chunks_exact(WORDS_PER_RUN)
-            .zip(w.words.chunks_exact(WORDS_PER_RUN))
+            .as_chunks::<WORDS_PER_RUN>()
+            .0
+            .iter()
+            .zip(w.words.as_chunks::<WORDS_PER_RUN>().0)
         {
             assert_eq!(gr[0], wr[1], "src index is the writeback's dst index");
             assert_eq!(gr[1], wr[0], "and the other way round");
@@ -801,7 +803,9 @@ mod tests {
             .iter()
             .flat_map(|t| {
                 t.words
-                    .chunks_exact(WORDS_PER_RUN)
+                    .as_chunks::<WORDS_PER_RUN>()
+                    .0
+                    .iter()
                     .map(move |w| t.bind_offset + u64::from(w[1]) * SCATTER_WORD)
             })
             .collect();
@@ -849,7 +853,9 @@ mod tests {
         want.sort_unstable();
         let got: Vec<_> = t
             .words
-            .chunks_exact(WORDS_PER_RUN)
+            .as_chunks::<WORDS_PER_RUN>()
+            .0
+            .iter()
             .map(|w| {
                 (
                     t.bind_offset + u64::from(w[1]) * SCATTER_WORD,

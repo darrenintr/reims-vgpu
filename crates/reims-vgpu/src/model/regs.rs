@@ -747,12 +747,14 @@ pub const DISPLAY_ONLINE_EVENT_MASK: u32 = 1 << 2;
 /// A real hot-unplug would set it. This device has no such event: the scanout is
 /// created once and lives for the VM, so the honest state of this bit is always
 /// clear.
+#[cfg(test)]
 pub const DISPLAY_OFFLINE_EVENT_MASK: u32 = 1 << 3;
 
 /// The event classes the guest's display ISR dispatches, as one word.
 ///
 /// Every bit the guest can claim, and therefore every bit it can *clear*. A bit
 /// outside this mask that reached the pending word would never be consumed.
+#[cfg(test)]
 pub const DISPLAY_EVENT_MASK_ALL: u32 = DISPLAY_VBL_EVENT_MASK
     | DISPLAY_PRESENT_EVENT_MASK
     | DISPLAY_ONLINE_EVENT_MASK

@@ -3511,7 +3511,7 @@ pub(crate) unsafe fn execute_draw_inner(
         let mut semantic;
         let src = if matches!(req.target_seed_order, SeedOrder::Bgra8) {
             semantic = rgba8.to_vec();
-            for px in semantic.chunks_exact_mut(4) {
+            for px in semantic.as_chunks_mut::<4>().0 {
                 px.swap(0, 2);
             }
             &semantic[..]

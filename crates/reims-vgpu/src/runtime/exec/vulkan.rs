@@ -66,24 +66,33 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
         // A container whose AIR will not extract is the same "deterministic
         // missing plan input" as one that would not load: normal execution
         // reports it precisely, and there is no asynchronous work to await.
+        // A pipeline with no fragment function has only its vertex AIR to
+        // extract and translate; its fragment stage is the rail's fixed no-op.
         let (Ok(v_air), Ok(f_air)) = (
             crate::runtime::mtlb::extract_air(&v_mtlb),
-            crate::runtime::mtlb::extract_air(&f_mtlb),
+            f_mtlb
+                .as_deref()
+                .map(crate::runtime::mtlb::extract_air)
+                .transpose(),
         ) else {
             crate::runtime::drain::note_store_route("preflight_air_unextractable");
             continue;
         };
-        // `|` and not `||`: both stages must be *started*, so they translate in
+        // `&` and not `&&`: both stages must be *started*, so they translate in
         // parallel and the packet is retried once rather than once per stage.
         let translated = crate::runtime::m2v_cache::ensure_cached_async(
             v_air,
             metal2vulkan::passes::Stage::Vertex,
+            task_id,
             pipeline_ref,
-        ) & crate::runtime::m2v_cache::ensure_cached_async(
-            f_air,
-            metal2vulkan::passes::Stage::Fragment,
-            pipeline_ref,
-        );
+        ) & f_air.is_none_or(|f_air| {
+            crate::runtime::m2v_cache::ensure_cached_async(
+                f_air,
+                metal2vulkan::passes::Stage::Fragment,
+                task_id,
+                pipeline_ref,
+            )
+        });
         if !translated {
             if !pending.contains(&pipeline_ref) {
                 pending.push(pipeline_ref);
@@ -121,7 +130,7 @@ fn publish_render_usage<M: HostMemory + HostOps>(
     task_id: u32,
     pipeline_ref: u32,
     v_air: &[u8],
-    f_air: &[u8],
+    f_air: Option<&[u8]>,
 ) {
     use crate::backend::vulkan::pipeline_resolve::VertexBindPlan;
 
@@ -148,11 +157,14 @@ fn publish_render_usage<M: HostMemory + HostOps>(
             metal2vulkan::passes::Stage::Vertex,
             pipeline_ref,
         ),
-        crate::runtime::m2v_cache::translate_cached_reflected(
-            f_air,
-            metal2vulkan::passes::Stage::Fragment,
-            pipeline_ref,
-        ),
+        match f_air {
+            Some(f_air) => crate::runtime::m2v_cache::translate_cached_reflected(
+                f_air,
+                metal2vulkan::passes::Stage::Fragment,
+                pipeline_ref,
+            ),
+            None => Ok(crate::backend::vulkan::pipeline_resolve::no_fragment_shader()),
+        },
     ) else {
         // Cached a moment ago and not now: the entry failed or was forgotten
         // between the two calls. Nothing is owed — the draw path reports the
@@ -208,8 +220,12 @@ pub(crate) fn preflight_compute_translations<M: HostMemory + HostOps>(
         let Ok(air) = crate::runtime::mtlb::extract_air(&mtlb) else {
             continue;
         };
-        let cached =
-            crate::runtime::m2v_cache::ensure_cached_kernel_async(air, local_size, pipeline_ref);
+        let cached = crate::runtime::m2v_cache::ensure_cached_kernel_async(
+            air,
+            local_size,
+            task_id,
+            pipeline_ref,
+        );
         if !cached {
             if !pending.contains(&pipeline_ref) {
                 pending.push(pipeline_ref);

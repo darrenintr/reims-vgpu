@@ -1103,6 +1103,7 @@ mod usage_census_tests {
     #[test]
     fn the_reason_a_draws_slots_stayed_unknown_is_counted_and_not_summed() {
         let id = ResourceId {
+            task: crate::identity::TaskId(0),
             slot: crate::identity::ObjectListRef(9),
             generation: crate::identity::SlotGeneration::default(),
         };
@@ -1143,6 +1144,7 @@ mod usage_census_tests {
 
         let part = |mode| Participation {
             resource: ResourceId {
+                task: crate::identity::TaskId(0),
                 slot: ObjectListRef(1),
                 generation: SlotGeneration::default(),
             },
@@ -1174,6 +1176,7 @@ mod usage_census_tests {
     #[test]
     fn a_dispatch_is_answered_or_not_and_never_half() {
         let id = ResourceId {
+            task: crate::identity::TaskId(0),
             slot: crate::identity::ObjectListRef(4),
             generation: crate::identity::SlotGeneration::default(),
         };
@@ -1298,6 +1301,7 @@ mod tests {
 
     fn res(slot: u32) -> ResourceId {
         ResourceId {
+            task: crate::identity::TaskId(0),
             slot: ObjectListRef(slot),
             generation: SlotGeneration(1),
         }

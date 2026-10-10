@@ -367,8 +367,20 @@ mod tests {
 
         let mut b = builder();
         let mut source = StubRegistry(DOMAIN);
-        command_buffer(&first, &Everything, &mut source, &mut b).expect("first buffer");
-        command_buffer(&second, &Everything, &mut source, &mut b).expect("second buffer");
+        command_buffer(
+            &first,
+            &Everything(crate::identity::TaskId(0)),
+            &mut source,
+            &mut b,
+        )
+        .expect("first buffer");
+        command_buffer(
+            &second,
+            &Everything(crate::identity::TaskId(0)),
+            &mut source,
+            &mut b,
+        )
+        .expect("second buffer");
         let tx = b.finish().expect("both buffers ended their encoders");
 
         let named: Vec<u64> = tx
@@ -393,8 +405,13 @@ mod tests {
 
         // The same two buffers walked separately are two transactions, which is
         // what this exists to stop being the only option.
-        let alone = exec(&first, &Everything, &mut StubRegistry(DOMAIN), builder())
-            .expect("a well-framed stream");
+        let alone = exec(
+            &first,
+            &Everything(crate::identity::TaskId(0)),
+            &mut StubRegistry(DOMAIN),
+            builder(),
+        )
+        .expect("a well-framed stream");
         assert!(
             alone.accesses.len() < tx.accesses.len(),
             "one buffer alone is a smaller transaction than the two together"
@@ -418,8 +435,13 @@ mod tests {
                 draw_primitives(),
             ],
         );
-        let tx = exec(&bytes, &Everything, &mut StubRegistry(DOMAIN), builder())
-            .expect("a well-framed stream");
+        let tx = exec(
+            &bytes,
+            &Everything(crate::identity::TaskId(0)),
+            &mut StubRegistry(DOMAIN),
+            builder(),
+        )
+        .expect("a well-framed stream");
 
         let mut named: Vec<u64> = tx
             .accesses
@@ -443,8 +465,13 @@ mod tests {
             SegmentKind::Render.wire_type(),
             &[bind_vertex_buffers(0, &[5151, 6262])],
         );
-        let tx = exec(&bytes, &Everything, &mut StubRegistry(DOMAIN), builder())
-            .expect("a well-framed stream");
+        let tx = exec(
+            &bytes,
+            &Everything(crate::identity::TaskId(0)),
+            &mut StubRegistry(DOMAIN),
+            builder(),
+        )
+        .expect("a well-framed stream");
         assert!(tx.accesses.is_empty());
     }
 
@@ -461,8 +488,13 @@ mod tests {
             &[generate_mipmaps(4242)],
         ));
 
-        let tx = exec(&bytes, &Everything, &mut StubRegistry(DOMAIN), builder())
-            .expect("a well-framed stream");
+        let tx = exec(
+            &bytes,
+            &Everything(crate::identity::TaskId(0)),
+            &mut StubRegistry(DOMAIN),
+            builder(),
+        )
+        .expect("a well-framed stream");
 
         assert_eq!(tx.streams.len(), 2);
         assert_eq!(tx.record_count(), 3);
@@ -504,7 +536,7 @@ mod tests {
         assert_eq!(
             exec(
                 &inside_blit,
-                &Everything,
+                &Everything(crate::identity::TaskId(0)),
                 &mut StubRegistry(DOMAIN),
                 builder()
             )
@@ -515,7 +547,7 @@ mod tests {
 
         let refused = exec(
             &inside_render,
-            &Everything,
+            &Everything(crate::identity::TaskId(0)),
             &mut StubRegistry(DOMAIN),
             builder(),
         )
@@ -545,8 +577,13 @@ mod tests {
             &[generate_mipmaps(7)],
         ));
 
-        let tx = exec(&bytes, &Everything, &mut StubRegistry(DOMAIN), builder())
-            .expect("an envelope and the segment it arms");
+        let tx = exec(
+            &bytes,
+            &Everything(crate::identity::TaskId(0)),
+            &mut StubRegistry(DOMAIN),
+            builder(),
+        )
+        .expect("an envelope and the segment it arms");
         assert_eq!(tx.streams.len(), 1);
         assert_eq!(
             tx.streams[0].begin.protection,
@@ -564,7 +601,12 @@ mod tests {
         bytes.extend_from_slice(&1u64.to_le_bytes());
 
         assert_eq!(
-            exec(&bytes, &Everything, &mut StubRegistry(DOMAIN), builder()),
+            exec(
+                &bytes,
+                &Everything(crate::identity::TaskId(0)),
+                &mut StubRegistry(DOMAIN),
+                builder()
+            ),
             Err(WalkRefusal::Unfinished {
                 refusal: StreamRefusal::ProtectionEnvelopeUnclaimed,
             })
@@ -584,8 +626,13 @@ mod tests {
             &[good.clone(), bad, line_width(1.0)],
         );
 
-        let refused = exec(&bytes, &Everything, &mut StubRegistry(DOMAIN), builder())
-            .expect_err("an opcode the render rail carries no record for");
+        let refused = exec(
+            &bytes,
+            &Everything(crate::identity::TaskId(0)),
+            &mut StubRegistry(DOMAIN),
+            builder(),
+        )
+        .expect_err("an opcode the render rail carries no record for");
         assert_eq!(
             refused.site(),
             Some(StreamSite {
@@ -608,7 +655,12 @@ mod tests {
         bytes.extend_from_slice(&[0u8; 4]);
 
         assert_eq!(
-            exec(&bytes, &Everything, &mut StubRegistry(DOMAIN), builder()),
+            exec(
+                &bytes,
+                &Everything(crate::identity::TaskId(0)),
+                &mut StubRegistry(DOMAIN),
+                builder()
+            ),
             Err(WalkRefusal::RecordFraming {
                 at: StreamSite {
                     segment: 0,
@@ -623,7 +675,12 @@ mod tests {
     fn a_stream_that_does_not_frame_refuses_before_any_record() {
         let bytes = [0u8; 4];
         assert_eq!(
-            exec(&bytes, &Everything, &mut StubRegistry(DOMAIN), builder()),
+            exec(
+                &bytes,
+                &Everything(crate::identity::TaskId(0)),
+                &mut StubRegistry(DOMAIN),
+                builder()
+            ),
             Err(WalkRefusal::Framing(FramingRefusal::ShortHeader {
                 at: 0,
                 remaining: 4,
@@ -651,8 +708,13 @@ mod tests {
             std::slice::from_ref(&generate_mipmaps(3)),
         ));
 
-        let tx = exec(&bytes, &Everything, &mut StubRegistry(DOMAIN), builder())
-            .expect("both ends of the continuation are declared");
+        let tx = exec(
+            &bytes,
+            &Everything(crate::identity::TaskId(0)),
+            &mut StubRegistry(DOMAIN),
+            builder(),
+        )
+        .expect("both ends of the continuation are declared");
         assert_eq!(tx.streams.len(), 1, "one encoder, not two");
         assert_eq!(tx.record_count(), 3);
         // Where a record was written and which encoder ran it are different
@@ -685,8 +747,13 @@ mod tests {
             std::slice::from_ref(&barrier()),
         ));
 
-        let tx = exec(&bytes, &Everything, &mut StubRegistry(DOMAIN), builder())
-            .expect("a relayed encoder");
+        let tx = exec(
+            &bytes,
+            &Everything(crate::identity::TaskId(0)),
+            &mut StubRegistry(DOMAIN),
+            builder(),
+        )
+        .expect("a relayed encoder");
         assert_eq!(tx.streams.len(), 1);
         assert_eq!(tx.record_count(), 3);
         assert_eq!(
@@ -715,9 +782,14 @@ mod tests {
             std::slice::from_ref(&record),
         ));
         assert_eq!(
-            exec(&offered, &Everything, &mut StubRegistry(DOMAIN), builder())
-                .expect_err("an encoder was abandoned")
-                .reason(),
+            exec(
+                &offered,
+                &Everything(crate::identity::TaskId(0)),
+                &mut StubRegistry(DOMAIN),
+                builder()
+            )
+            .expect_err("an encoder was abandoned")
+            .reason(),
             "stream_encoder_begin_while_open"
         );
 
@@ -733,9 +805,14 @@ mod tests {
             std::slice::from_ref(&record),
         ));
         assert_eq!(
-            exec(&taken, &Everything, &mut StubRegistry(DOMAIN), builder())
-                .expect_err("nothing offered a continuation")
-                .reason(),
+            exec(
+                &taken,
+                &Everything(crate::identity::TaskId(0)),
+                &mut StubRegistry(DOMAIN),
+                builder()
+            )
+            .expect_err("nothing offered a continuation")
+            .reason(),
             "stream_continuation_without_encoder"
         );
 
@@ -747,9 +824,14 @@ mod tests {
             std::slice::from_ref(&barrier()),
         ));
         assert_eq!(
-            exec(&crossed, &Everything, &mut StubRegistry(DOMAIN), builder())
-                .expect_err("a compute segment cannot continue a blit encoder")
-                .reason(),
+            exec(
+                &crossed,
+                &Everything(crate::identity::TaskId(0)),
+                &mut StubRegistry(DOMAIN),
+                builder()
+            )
+            .expect_err("a compute segment cannot continue a blit encoder")
+            .reason(),
             "stream_continuation_kind_mismatch"
         );
     }
@@ -764,7 +846,12 @@ mod tests {
             std::slice::from_ref(&generate_mipmaps(1)),
         );
         assert_eq!(
-            exec(&bytes, &Everything, &mut StubRegistry(DOMAIN), builder()),
+            exec(
+                &bytes,
+                &Everything(crate::identity::TaskId(0)),
+                &mut StubRegistry(DOMAIN),
+                builder()
+            ),
             Err(WalkRefusal::Unfinished {
                 refusal: StreamRefusal::EncoderNeverEnded(SegmentKind::Blit),
             })
@@ -775,8 +862,13 @@ mod tests {
     /// submit a command buffer that encoded nothing.
     #[test]
     fn an_empty_stream_is_an_empty_transaction() {
-        let tx = exec(&[], &Everything, &mut StubRegistry(DOMAIN), builder())
-            .expect("a stream with no segments");
+        let tx = exec(
+            &[],
+            &Everything(crate::identity::TaskId(0)),
+            &mut StubRegistry(DOMAIN),
+            builder(),
+        )
+        .expect("a stream with no segments");
         assert_eq!(tx.record_count(), 0);
         assert!(tx.streams.is_empty());
         assert!(tx.accesses.is_empty());
@@ -795,8 +887,13 @@ mod tests {
             SegmentKind::Blit.wire_type(),
             &[generate_mipmaps(9), generate_mipmaps(10)],
         );
-        let tx = exec(&bytes, &Everything, &mut StubRegistry(DOMAIN), builder())
-            .expect("two single-ref records");
+        let tx = exec(
+            &bytes,
+            &Everything(crate::identity::TaskId(0)),
+            &mut StubRegistry(DOMAIN),
+            builder(),
+        )
+        .expect("two single-ref records");
         assert_eq!(tx.record_count(), 2);
         assert_eq!(tx.accesses.len(), 2);
     }
@@ -848,8 +945,13 @@ mod tests {
         // The base stream is itself walkable, or the sweep is corrupting
         // something that was already broken.
         let base = well_formed();
-        exec(&base, &Everything, &mut StubRegistry(DOMAIN), builder())
-            .expect("the stream the sweep corrupts is one the walk accepts");
+        exec(
+            &base,
+            &Everything(crate::identity::TaskId(0)),
+            &mut StubRegistry(DOMAIN),
+            builder(),
+        )
+        .expect("the stream the sweep corrupts is one the walk accepts");
 
         let mut walked = 0usize;
         let mut refused = 0usize;
@@ -881,7 +983,12 @@ mod tests {
                 bytes.push(u8::try_from(rng.next() % 256).expect("masked"));
             }
 
-            match exec(&bytes, &Everything, &mut StubRegistry(DOMAIN), builder()) {
+            match exec(
+                &bytes,
+                &Everything(crate::identity::TaskId(0)),
+                &mut StubRegistry(DOMAIN),
+                builder(),
+            ) {
                 Ok(tx) => {
                     // Whatever came out is a transaction the rest of the model
                     // may rely on: its records are in a strictly ascending

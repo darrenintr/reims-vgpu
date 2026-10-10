@@ -108,6 +108,10 @@ wayland-client = { version = "0.31", optional = true }
 wayland-backend = { version = "0.3", features = ["client_system"], optional = true }
 wayland-protocols = { version = "0.32", features = ["client", "unstable"], optional = true }
 x11-dl = { version = "2.21", optional = true }
+# `memfd`-backed RAMBlocks reach the GPU as one dma-buf each, made by the
+# `UDMABUF_CREATE` ioctl on `/dev/udmabuf` — see
+# `backend::vulkan::caps::dma_buf`. Already in the graph at this version.
+libc = "0.2"
 
 # Metal encode is macOS-only; `backend-metal` is rejected on any other host.
 [target.'cfg(target_os = "macos")'.dependencies]

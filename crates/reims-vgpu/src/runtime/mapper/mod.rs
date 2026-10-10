@@ -1485,6 +1485,12 @@ pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     // The backend allocation aliases the host view, so revoke the GPU parent
     // first. Existing child images and recorded buffers hold it through their
     // fence-safe retirement; only then is the matching host view unmapped.
+    // Packed aliases dropped by the bound-buffer registry owe the same two
+    // releases a mapping's view does, through the same queues.
+    for release in state.bound_buffers.take_released() {
+        state.retired_guest_imports.push(release.import);
+        state.retired_views.push(release.view);
+    }
     let backend = crate::backend::selected();
     let backend_owned: std::collections::HashSet<_> = state
         .retired_guest_imports
@@ -1820,7 +1826,7 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
     if gpas.is_empty() || gpas.len() != m.page_entries.len() {
         return None;
     }
-    if let Some((gpa, owner)) = { first_control_page_collision(state, &gpas) } {
+    if let Some((gpa, owner)) = first_control_page_collision(state, &gpas) {
         crate::observe::fail(format!(
             "mapping_pages fail reason=control_page_collision mid={mapping_id} gpa={gpa:#x} owner={owner} pages={}",
             gpas.len()
@@ -2049,9 +2055,16 @@ pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
             return Some((std::sync::Arc::clone(import), footprint));
         }
     }
-    let import = std::sync::Arc::new(
-        crate::runtime::guest_ram::GuestRamImport::new_host_allocation(ptr, len, align).ok()?,
-    );
+    let mut alias =
+        crate::runtime::guest_ram::GuestRamImport::new_host_allocation(ptr, len, align).ok()?;
+    // See `draw::vulkan`'s packed alias: the view's pages named in guest RAM's
+    // file are what a device that refuses the shared mapping can import.
+    if let Some(ranges) =
+        crate::runtime::guest_ram_map::fd_ranges_for_pages(footprint.pages(), footprint.page_size())
+    {
+        alias = alias.with_fd_ranges(ranges);
+    }
+    let import = std::sync::Arc::new(alias);
     state.mappings.get_mut(&mapping_id)?.contig_import = Some(std::sync::Arc::clone(&import));
     Some((import, footprint))
 }
@@ -2172,6 +2185,14 @@ pub(crate) struct RectStride {
     row_stride: usize,
     row_bytes: usize,
     row_count: usize,
+}
+
+/// A [`RectStride`] placed at a mapping-linear byte offset: the whole of where a
+/// rectangle sits in a mapping, which no rectangle write can use one half of.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PlacedRect {
+    pub(crate) off: u64,
+    pub(crate) rect: RectStride,
 }
 
 impl RectStride {
@@ -2720,12 +2741,12 @@ pub(crate) fn write_mapping_rect_only<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     mapping_id: u32,
-    off: u64,
-    rect: RectStride,
+    at: PlacedRect,
     src: &[u8],
     only: Option<&[(u64, u64)]>,
     vouched: &PagesVouched,
 ) -> bool {
+    let PlacedRect { off, rect } = at;
     if src.len() < rect.packed() {
         crate::observe::fail(format!(
             "mapping_write_rect fail reason=rect_src_short mid={mapping_id} off={off:#x} packed={} src={}",

@@ -335,6 +335,7 @@ fn appending_records_to_a_transaction_does_not_allocate_per_record() {
 
     fn id(slot: u32) -> ResourceId {
         ResourceId {
+            task: reims_vgpu_core::identity::TaskId(0),
             slot: ObjectListRef(slot),
             generation: SlotGeneration(1),
         }
@@ -501,6 +502,7 @@ fn walking_an_exec_does_not_allocate_per_record() {
     impl RefResolver for Everything {
         fn resource(&self, object_ref: u32) -> Option<ResourceId> {
             Some(ResourceId {
+                task: reims_vgpu_core::identity::TaskId(0),
                 slot: ObjectListRef(object_ref),
                 generation: SlotGeneration(1),
             })

@@ -536,6 +536,10 @@ pub(crate) struct DeviceContext {
     /// `VK_KHR_push_descriptor` entry points, present only when the extension
     /// was advertised, queried, and enabled for this device.
     pub push_descriptor: Option<ash::khr::push_descriptor::Device>,
+    /// `VK_KHR_external_memory_fd` entry points, loaded only where
+    /// [`HostGpuCaps::dma_buf`] is available — the only answer that enabled the
+    /// extension. The RAMBlock import site reads `None` as "host pointer only".
+    pub external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
     /// `VK_EXT_extended_dynamic_state` entry points — `vkCmdSetCullModeEXT`
     /// and `vkCmdSetFrontFaceEXT` — present only where
     /// [`crate::backend::vulkan::caps::DeviceFeatures::extended_dynamic_state`]
@@ -958,6 +962,8 @@ impl DeviceContext {
             pd,
             &has_device_extension,
         );
+        let dma_buf =
+            crate::backend::vulkan::caps::dma_buf::query(&instance, pd, &has_device_extension);
         // Published for `runtime::guest_ram_map`, which builds the imports and
         // has no device context to read the granularity or the heap sizes from.
         // A negative rung withdraws them rather than publishing zeroes, so the
@@ -1047,6 +1053,7 @@ impl DeviceContext {
         // host without it gets a device rather than a failed `vkCreateDevice`.
         enabled_device_extensions.extend(host_pointer.rung.required_extensions());
         enabled_device_extensions.extend(push_descriptor.required_extensions());
+        enabled_device_extensions.extend(dma_buf.required_extensions());
         // Built in `caps` too. Bound to a local here only because `push_next`
         // borrows it for the lifetime of `dci`.
         //
@@ -1127,6 +1134,7 @@ impl DeviceContext {
             quirks: DriverQuirk::for_portability_subset(portability_subset),
             host_pointer,
             push_descriptor,
+            dma_buf,
             portability_subset,
             device_api_version: props.api_version,
             device_type: props.device_type,
@@ -1141,6 +1149,10 @@ impl DeviceContext {
             .push_descriptor
             .is_available()
             .then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
+        let external_memory_fd = caps
+            .dma_buf
+            .is_available()
+            .then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
         let extended_dynamic_state = features
             .extended_dynamic_state
             .then(|| ash::ext::extended_dynamic_state::Device::new(&instance, &device));
@@ -1249,6 +1261,7 @@ impl DeviceContext {
             memory_properties,
             external_memory_host,
             push_descriptor,
+            external_memory_fd,
             extended_dynamic_state,
             extended_dynamic_state3,
             gq,
@@ -1568,6 +1581,34 @@ impl DeviceContext {
         unsafe { self.device.queue_submit(self.queue(), &[info], fence) }?;
         note.submitted(value);
         Ok(())
+    }
+
+    /// Fence access follows the same host ordering as submission. A queued
+    /// submission is not yet safe to query or wait on from another thread.
+    pub(crate) unsafe fn get_fence_status(&self, fence: vk::Fence) -> Result<bool, vk::Result> {
+        match self.queue_owner.as_ref() {
+            Some(owner) => owner.get_fence_status(fence),
+            None => self.device.get_fence_status(fence),
+        }
+    }
+
+    pub(crate) unsafe fn wait_for_fences(
+        &self,
+        fences: &[vk::Fence],
+        wait_all: bool,
+        timeout: u64,
+    ) -> Result<(), vk::Result> {
+        match self.queue_owner.as_ref() {
+            Some(owner) => owner.wait_for_fences(fences, wait_all, timeout),
+            None => self.device.wait_for_fences(fences, wait_all, timeout),
+        }
+    }
+
+    pub(crate) unsafe fn reset_fences(&self, fences: &[vk::Fence]) -> Result<(), vk::Result> {
+        match self.queue_owner.as_ref() {
+            Some(owner) => owner.reset_fences(fences),
+            None => self.device.reset_fences(fences),
+        }
     }
 
     pub(crate) fn queue_failure(&self) -> Option<vk::Result> {

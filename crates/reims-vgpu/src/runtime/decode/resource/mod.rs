@@ -891,6 +891,34 @@ pub struct RenderPipelineDescriptor {
     pub color_attachments: Vec<PipelineColorAttachment>,
 }
 
+impl RenderPipelineDescriptor {
+    /// Whether the guest gave this pipeline a fragment function.
+    ///
+    /// `MTLRenderPipelineDescriptor.fragmentFunction` may be nil: the vertex
+    /// stage still runs and rasterizes, and only depth and stencil are written.
+    /// A stencil-mask pass is the common shape — measured on a macOS 13 guest
+    /// running the iOS Simulator, a descriptor carrying a vertex function, colour
+    /// attachments and a stencil format but no fragment tag, drawn 1 812 times in
+    /// one second. The serializer omits the tag rather than writing a zero ref.
+    pub fn has_fragment_function(&self) -> bool {
+        self.fragment_func_ref != 0
+    }
+
+    /// The channels a colour attachment of this pipeline actually writes.
+    ///
+    /// The attachment's own declared mask when a fragment function exists, and
+    /// none when it does not: with no fragment stage there is no colour output,
+    /// so Metal leaves every colour attachment untouched. A rail that has to run
+    /// a fragment stage anyway must mask its writes through this.
+    pub fn effective_color_write_mask(&self, declared: ColorWriteMask) -> ColorWriteMask {
+        if self.has_fragment_function() {
+            declared
+        } else {
+            ColorWriteMask::NONE
+        }
+    }
+}
+
 /// Compute stage-input attribute from serializer-object compute pipeline compact block.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ComputeStageInputAttribute {

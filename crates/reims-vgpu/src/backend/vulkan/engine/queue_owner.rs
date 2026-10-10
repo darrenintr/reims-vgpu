@@ -5,7 +5,9 @@
 //! contract: a readback, present, or compute dispatch must remain behind every
 //! draw batch handed off before it.  Sending all queue operations through this
 //! FIFO preserves both properties while allowing an ended draw batch to leave
-//! the drain worker before the host driver returns from `vkQueueSubmit`.
+//! the drain worker before the host driver returns from `vkQueueSubmit`. Fence
+//! queries, waits and resets use the same owner: host access to a submitted
+//! fence must not overlap that driver call, even while the GPU is still busy.
 
 use ash::vk;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,7 +51,41 @@ impl PendingPresent {
     }
 }
 
+/// Fence host operations share the submission FIFO: a fence may be observed
+/// only after the host submit using it has returned, even if the GPU is still
+/// running. Waiting on the drain thread before that handoff completes races
+/// the driver's fence payload update (vkQueueSubmit requires external sync).
+enum FenceAccess {
+    Status(vk::Fence),
+    Wait {
+        fences: Vec<vk::Fence>,
+        wait_all: bool,
+        timeout: u64,
+    },
+    Reset(Vec<vk::Fence>),
+}
+
+impl FenceAccess {
+    unsafe fn execute(self, device: &ash::Device) -> Result<bool, vk::Result> {
+        match self {
+            Self::Status(fence) => device.get_fence_status(fence),
+            Self::Wait {
+                fences,
+                wait_all,
+                timeout,
+            } => device
+                .wait_for_fences(&fences, wait_all, timeout)
+                .map(|()| true),
+            Self::Reset(fences) => device.reset_fences(&fences).map(|()| true),
+        }
+    }
+}
+
 enum Request {
+    FenceAccess {
+        access: FenceAccess,
+        reply: mpsc::SyncSender<Result<bool, vk::Result>>,
+    },
     Submit {
         submit: OwnedSubmit,
         reply: Option<Reply>,
@@ -283,6 +319,39 @@ impl QueueOwner {
         Ok(PendingPresent { receiver })
     }
 
+    fn fence_access(&self, access: FenceAccess) -> Result<bool, vk::Result> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.sender
+            .send(Request::FenceAccess { access, reply })
+            .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
+        receiver
+            .recv()
+            .unwrap_or(Err(vk::Result::ERROR_DEVICE_LOST))
+    }
+
+    pub(crate) fn get_fence_status(&self, fence: vk::Fence) -> Result<bool, vk::Result> {
+        self.fence_access(FenceAccess::Status(fence))
+    }
+
+    pub(crate) fn wait_for_fences(
+        &self,
+        fences: &[vk::Fence],
+        wait_all: bool,
+        timeout: u64,
+    ) -> Result<(), vk::Result> {
+        self.fence_access(FenceAccess::Wait {
+            fences: fences.to_vec(),
+            wait_all,
+            timeout,
+        })
+        .map(|_| ())
+    }
+
+    pub(crate) fn reset_fences(&self, fences: &[vk::Fence]) -> Result<(), vk::Result> {
+        self.fence_access(FenceAccess::Reset(fences.to_vec()))
+            .map(|_| ())
+    }
+
     pub(crate) fn wait_idle(&self) -> Result<(), vk::Result> {
         // Unlike ordinary work this must reach the owner even after its failure
         // latch fired: callers destroy resources after it returns.
@@ -338,6 +407,12 @@ fn run(
 ) {
     while let Ok(request) = receiver.recv() {
         match request {
+            Request::FenceAccess { access, reply } => {
+                let result = failure
+                    .get()
+                    .map_or_else(|| unsafe { access.execute(device) }, Err);
+                let _ = reply.send(result);
+            }
             Request::Submit { submit, reply } => {
                 let async_queued_at = submit.async_queued_at;
                 let driver_started = std::time::Instant::now();
@@ -484,6 +559,59 @@ mod tests {
             failure: Arc::new(FailureLatch::default()),
             stats: Arc::new(QueueStats::default()),
             join: None,
+        }
+    }
+
+    #[test]
+    fn fence_access_cannot_pass_an_unprocessed_submission() {
+        let fence = vk::Fence::from_raw(2);
+        for access in [
+            FenceAccess::Status(fence),
+            FenceAccess::Wait {
+                fences: vec![fence],
+                wait_all: true,
+                timeout: 17,
+            },
+            FenceAccess::Reset(vec![fence]),
+        ] {
+            let (sender, receiver) = mpsc::channel();
+            let owner = owner_with_sender(sender);
+            owner
+                .submit_async(&[vk::CommandBuffer::from_raw(1)], fence, None)
+                .expect("accepted by FIFO, not yet submitted to driver");
+            let (done, observed) = mpsc::channel();
+            let query = std::thread::spawn(move || {
+                done.send(owner.fence_access(access)).unwrap();
+            });
+            let Request::Submit { submit, .. } = receiver.recv().unwrap() else {
+                panic!("fence access passed the submission");
+            };
+            assert_eq!(submit.fence, fence);
+            assert!(matches!(
+                observed.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            let Request::FenceAccess { access, reply } = receiver.recv().unwrap() else {
+                panic!("fence operation did not travel through its submit owner");
+            };
+            match access {
+                FenceAccess::Status(found) => assert_eq!(found, fence),
+                FenceAccess::Wait {
+                    fences,
+                    wait_all,
+                    timeout,
+                } => {
+                    assert_eq!(fences, vec![fence]);
+                    assert!(wait_all);
+                    assert_eq!(timeout, 17);
+                }
+                FenceAccess::Reset(fences) => assert_eq!(fences, vec![fence]),
+            }
+            // Simulate a driver refusal after the preceding submit returned.
+            // The caller must receive that result, never a successful handoff.
+            reply.send(Err(vk::Result::TIMEOUT)).unwrap();
+            assert_eq!(observed.recv().unwrap(), Err(vk::Result::TIMEOUT));
+            query.join().unwrap();
         }
     }
 

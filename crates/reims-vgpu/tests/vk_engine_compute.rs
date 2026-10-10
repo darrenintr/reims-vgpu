@@ -95,7 +95,9 @@ fn inc_comp_spirv() -> Option<Vec<u32>> {
     let bytes = std::fs::read(&spv).ok()?;
     Some(
         bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
     )
@@ -264,7 +266,9 @@ fn assemble_spvasm(asm: &str, name: &str) -> Option<Vec<u32>> {
     let bytes = std::fs::read(&spv_path).ok()?;
     Some(
         bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
     )
@@ -286,7 +290,9 @@ fn translate_kernel(name: &str) -> Option<Vec<u32>> {
     let bytes = metal2vulkan::translate(air.to_str().unwrap(), Stage::Kernel, &tmp).ok()?;
     Some(
         bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
     )
@@ -337,7 +343,9 @@ fn compute_inc_ssbo_known_result() {
     assert_eq!(out.buffers.len(), 1);
     let r: Vec<f32> = out.buffers[0]
         .bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     assert_eq!(r.len(), n);
@@ -474,7 +482,9 @@ fn compute_2d_grid_tiles_global_invocation_xy() {
     };
     let vals: Vec<u32> = out.buffers[0]
         .bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     for y in 0..8u32 {
@@ -541,7 +551,8 @@ fn compute_storage_image_rgba8unorm_known_result() {
     for p in out.images[0]
         .bytes()
         .expect("a Host destination reads bytes back")
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
     {
         assert!(
             p[0] >= 254 && p[1] == 0 && p[2] == 0 && p[3] >= 254,
@@ -817,7 +828,8 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
     for p in out.images[0]
         .bytes()
         .expect("a Host destination reads bytes back")
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
     {
         assert!(
             p[0] == 0 && p[1] == 0 && p[2] >= 254 && p[3] >= 254,
@@ -885,7 +897,9 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
     assert!(fill.images[0]
         .bytes()
         .expect("a Host destination reads bytes back")
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .all(|p| p[0] >= 254));
 
     // Skip dispatch: one texel, zero-placeholder bytes, matching generation.
@@ -896,7 +910,8 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
     for p in skip.images[0]
         .bytes()
         .expect("a Host destination reads bytes back")
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
     {
         assert!(
             p[0] >= 254 && p[1] == 0 && p[2] == 0 && p[3] >= 254,
@@ -983,7 +998,9 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     assert!(fill.images[0]
         .bytes()
         .expect("a Host destination reads bytes back")
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .all(|p| p[0] >= 254));
 
     let make_fetch = |generation: u32| ComputeRequest {
@@ -1019,7 +1036,9 @@ fn compute_sampled_resident_copy_and_lost_resident() {
         .expect("resident sample hit");
     let got: Vec<u32> = hit.buffers[0]
         .bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     assert_eq!(
@@ -1098,7 +1117,9 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
     };
     let got: Vec<u32> = out.buffers[0]
         .bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     let want: Vec<u32> = values.iter().map(|value| value.to_bits()).collect();
@@ -1118,7 +1139,9 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
     };
     let got: Vec<u32> = out.buffers[0]
         .bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     assert_eq!(got, vec![0.0f32.to_bits(), 0, 0, 1.0f32.to_bits()]);
@@ -1146,7 +1169,9 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
     };
     let got: Vec<u32> = out.buffers[0]
         .bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     assert_eq!(got, vec![0x1234_5678, 0, 0, 1]);
@@ -1192,7 +1217,9 @@ fn compute_m2v_float_mul4_add3_known_result() {
     };
     let got: Vec<f32> = out.buffers[0]
         .bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     assert_eq!(&got[..want.len()], want.as_slice());
@@ -1502,7 +1529,9 @@ fn compute_sampled_image_serves_every_declared_mip_level() {
         };
         let got: Vec<f32> = out.buffers[0]
             .bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         let want = f32::from(marker(level)) / 255.0;
@@ -1621,7 +1650,9 @@ fn compute_sampled_a8unorm_arrives_in_alpha() {
     };
     let got: Vec<f32> = out.buffers[0]
         .bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     let want_alpha = f32::from(BYTE) / 255.0;

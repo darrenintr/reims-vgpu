@@ -779,7 +779,7 @@ pub fn mirror_linear_color_cache<M: HostMemory + crate::runtime::host::HostOps>(
     let mut bgra = bytes[..need].to_vec();
     match w.pixel_format {
         MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => {
-            for px in bgra.chunks_exact_mut(RGBA8_BPP as usize) {
+            for px in bgra.as_chunks_mut::<{ RGBA8_BPP as usize }>().0 {
                 px.swap(0, 2);
             }
         }

@@ -1851,7 +1851,7 @@ fn clear_store_full_write_overwrites_prior_guest_outside_scissor() {
     assert!(state.set_mapping_geom(7, 4, 2, MTL_FORMAT_BGRA8_UNORM));
     // Prior guest content: "logo" non-zero all pixels.
     let mut logo = vec![0u8; 4 * 2 * 4];
-    for px in logo.chunks_exact_mut(4) {
+    for px in logo.as_chunks_mut::<4>().0 {
         px.copy_from_slice(&[0x10, 0x20, 0x30, 0xFF]); // BGRA
     }
     assert!(write_bgra8(&mut state, &mut host, 7, &logo, 16, 4, 2));

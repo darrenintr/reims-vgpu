@@ -529,7 +529,7 @@ fn clear_only_present_captures_the_surface_the_transaction_names() {
 
     // Mid 2: the surface the guest names, cleared to opaque black.
     let mut clear = vec![0u8; need];
-    for px in clear.chunks_exact_mut(4) {
+    for px in clear.as_chunks_mut::<4>().0 {
         px[3] = 255;
     }
     assert!(write_bgra8(&mut state, &mut host, 2, &clear, stride, w, h));
@@ -3749,7 +3749,7 @@ fn unmap_memory_retains_gva_host_cache_for_sample() {
     let h = 24u32;
     let need = (w * h * 4) as usize;
     let mut bgra = vec![0u8; need];
-    for px in bgra.chunks_exact_mut(4) {
+    for px in bgra.as_chunks_mut::<4>().0 {
         px[0] = 185;
         px[1] = 126;
         px[2] = 81;
@@ -5623,6 +5623,57 @@ fn a_dispatched_command_this_device_declines_names_itself() {
     }
 }
 
+/// A destroy whose kind the closure ledger settles as a proven no-op completes
+/// without a failure record, and one the ledger leaves unresolved still reports.
+///
+/// A driven macos-13 boot put `cmd_delete_object_unimplemented` on the failure
+/// channel for a compute-pipeline destroy (`0x3ee`), a row the ledger closes as
+/// `ProvenNoOp`: the report was a settled operation read as a gap.
+#[test]
+fn a_proven_noop_destroy_completes_without_reading_as_unimplemented() {
+    use reims_vgpu_wire::ops::destroy as d;
+    let delete_object = |kind: u32| {
+        let mut payload = vec![0u8; 4 + d::DELETE_TOTAL_LEN as usize];
+        st32(&mut payload[0..], 0x11);
+        st32(&mut payload[4..], kind);
+        st32(&mut payload[8..], d::DELETE_TOTAL_LEN);
+        st32(&mut payload[12..], 0x20);
+        payload
+    };
+    for (kind, reported) in [
+        (d::OPCODE_DELETE_FUNCTION, false),
+        (d::OPCODE_DELETE_COMPUTE_PIPELINE_STATE, false),
+        (d::OPCODE_DELETE_TEXTURE, true),
+    ] {
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        let payload = delete_object(kind);
+        let pkt = Packet {
+            opcode: CHILD_OP_DELETE_OBJECT,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        };
+        assert_eq!(
+            process_child_packet(&mut state, &mut host, 2, &pkt),
+            ChildPacketDisposition::Complete,
+            "{kind:#x}: the stamps still retire"
+        );
+        let unimplemented = state.fails.iter().any(|e| {
+            matches!(
+                e,
+                FailEvent::UnimplementedChildCommand {
+                    command: UnimplementedCommand::DeleteObject,
+                    ..
+                }
+            )
+        });
+        assert_eq!(unimplemented, reported, "{kind:#x}: {:?}", state.fails);
+    }
+}
+
 /// A `CmdDeleteObject` packet is bounded before its record is read at all.
 ///
 /// The command carries `{u32 task}` then a record that states its own byte
@@ -7125,5 +7176,31 @@ mod arrivals {
             arrival(&child(), &host, 0, CAPACITY),
             Arrival::Fault(PacketFault::ChildHeaderRead)
         ));
+    }
+}
+
+/// A pipeline that published nothing is a failure only once its answer will not
+/// come. Before the table holds it, and while its executor is still working, it
+/// is owed one — the first packet to bind a pipeline is walked before that
+/// packet declares it, so that case is expected on every new pipeline.
+#[test]
+fn only_a_lost_answer_reports_a_draw_with_no_published_stage() {
+    use reims_vgpu_core::pipeline::PipelineState as S;
+    for owed in [
+        None,
+        Some(S::Declared),
+        Some(S::Translating),
+        Some(S::Compiling),
+    ] {
+        assert!(
+            awaiting_first_answer(owed),
+            "{owed:?} is still owed its answer"
+        );
+    }
+    for lost in [Some(S::Ready), Some(S::Refused), Some(S::Retired)] {
+        assert!(
+            !awaiting_first_answer(lost),
+            "{lost:?} will publish nothing more"
+        );
     }
 }

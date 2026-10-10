@@ -46,6 +46,7 @@
 pub mod api_floor;
 pub mod device_features;
 pub mod device_select;
+pub mod dma_buf;
 pub mod host_pointer;
 pub mod linear_sampled;
 pub mod linear_target;
@@ -56,6 +57,7 @@ pub(crate) use host_pointer::{HostPointerCaps, HostPointerImport};
 // the only one that turns host capabilities into placement policy. Re-exported
 // here so `caps::` stays the one name this crate asks capability questions
 // through.
+pub(crate) use dma_buf::DmaBufCaps;
 pub(crate) use push_descriptor::PushDescriptorCaps;
 pub use reims_vgpu_vulkan::memory as memory_topology;
 pub(crate) use reims_vgpu_vulkan::memory::{MappedMemoryKind, MemoryClass, MemoryProfile};
@@ -108,6 +110,9 @@ pub struct HostGpuCaps {
     /// Whether descriptor writes may be recorded directly into a command
     /// buffer, and the maximum total descriptors in such a set layout.
     pub push_descriptor: PushDescriptorCaps,
+    /// Whether a RAMBlock that lives in a file may be imported as a dma-buf.
+    /// Read by the RAMBlock import site and nothing else; see [`dma_buf`].
+    pub dma_buf: DmaBufCaps,
     /// `VK_KHR_portability_subset` was advertised. Kept for the selection log
     /// line and for constructing [`DriverQuirk`] — never gate behavior on it
     /// directly.
@@ -167,6 +172,7 @@ mod tests {
                 span_max: host_pointer::IMPORT_SPAN_CEILING,
             },
             push_descriptor: PushDescriptorCaps::default(),
+            dma_buf: DmaBufCaps::default(),
             portability_subset: false,
             device_api_version: api,
             device_type: vk::PhysicalDeviceType::DISCRETE_GPU,

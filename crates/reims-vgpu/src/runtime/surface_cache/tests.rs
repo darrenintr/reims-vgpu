@@ -633,7 +633,7 @@ fn gva_encode_is_keyed_by_address_at_any_size() {
     let w = 64u32;
     let h = 48u32;
     let mut px = vec![0u8; (w * h * 4) as usize];
-    for chunk in px.chunks_exact_mut(4) {
+    for chunk in px.as_chunks_mut::<4>().0 {
         chunk[0] = 185;
         chunk[1] = 126;
         chunk[2] = 81;

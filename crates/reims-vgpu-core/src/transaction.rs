@@ -546,6 +546,7 @@ mod tests {
 
     fn resource(slot: u32) -> ResourceId {
         ResourceId {
+            task: crate::identity::TaskId(0),
             slot: crate::identity::ObjectListRef(slot),
             generation: crate::identity::SlotGeneration(1),
         }

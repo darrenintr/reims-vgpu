@@ -649,7 +649,7 @@ mod tests {
         let w = 4u32;
         let h = 4u32;
         let mut l0 = vec![0u8; (w * h * 4) as usize];
-        for px in l0.chunks_exact_mut(4) {
+        for px in l0.as_chunks_mut::<4>().0 {
             px[0] = 100;
             px[1] = 150;
             px[2] = 200;

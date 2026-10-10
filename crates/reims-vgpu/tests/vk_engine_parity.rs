@@ -103,7 +103,9 @@ fn translate_words(name: &str, stage: Stage) -> Vec<u32> {
     let spv = metal2vulkan::translate(path.to_str().unwrap(), stage, &tmp)
         .unwrap_or_else(|e| panic!("translate {name}: {e}"));
     let mut words: Vec<u32> = spv
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     // The translator emits its own narrow bands; the device uses wider ones so
@@ -185,7 +187,7 @@ fn near(got: u8, want: u8) -> bool {
 fn semantic_rgba(out: &engine::DrawOutput) -> Vec<u8> {
     let mut px = out.pixels.clone();
     if out.pixels_bgra {
-        for p in px.chunks_exact_mut(4) {
+        for p in px.as_chunks_mut::<4>().0 {
             p.swap(0, 2);
         }
     }
@@ -219,6 +221,27 @@ fn draw_or_skip(label: &str, req: &DrawRequest) -> Option<Vec<u8>> {
                 panic!("{label}: {s}");
             }
         }
+    }
+}
+
+/// A pipeline the guest gave no fragment function rasterizes and writes no
+/// colour. The Vulkan rail realizes it as the shared no-op fragment module with
+/// every colour write masked; the engine must accept that pair and leave the
+/// attachment at its clear value, where the same draw with a real fragment
+/// stage covers it (`plain_triangle_known_color`).
+#[test]
+fn a_draw_with_no_fragment_function_leaves_colour_untouched() {
+    let _g = engine_test_session();
+    let (v, _) = triangle_spirv();
+    let frag = reims_vgpu::backend::vulkan::pipeline_resolve::NO_FRAGMENT_SPIRV;
+    let mut req = engine_req(&v, &frag, 16, 16);
+    req.color_write_mask = engine::ColorWriteMask::NONE;
+    if let Some(px) = draw_or_skip("no_fragment", &req) {
+        assert_eq!(px.len(), 16 * 16 * 4);
+        assert!(
+            px.as_chunks::<4>().0.iter().all(|p| p[..3] == [0, 0, 0]),
+            "a fragment-less draw wrote colour into its attachment"
+        );
     }
 }
 
@@ -361,7 +384,9 @@ fn the_depth_compare_function_separates_two_draws_of_one_pipeline() {
     let rejected = draw_or_skip("depth_never", &req).expect("the first draw already found a GPU");
     assert!(
         rejected
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .all(|p| p[0] == 0 && p[1] == 0 && p[2] == 0),
         "`Never` must reject every fragment; got {:?}",
         &rejected[..16]
@@ -790,7 +815,7 @@ fn line_width_widens_a_wireframe_and_is_not_asked_of_a_filled_draw() {
     // Fragment is ~(64,128,191) and the clear is black, so the green channel
     // says covered — the same discriminator `triangle_covered` uses, counted
     // rather than sampled at one point.
-    let covered = |px: &[u8]| px.chunks_exact(4).filter(|p| p[1] > 32).count();
+    let covered = |px: &[u8]| px.as_chunks::<4>().0.iter().filter(|p| p[1] > 32).count();
 
     let thin = match run(true, None) {
         Ok(px) => px,
@@ -2592,7 +2617,9 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         metal2vulkan::translate_reflected(air.to_str().unwrap(), Stage::Fragment, &tmp)
             .expect("translate static sampler fixture");
     let mut frag = frag
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect::<Vec<_>>();
     assert_eq!(
@@ -2716,8 +2743,8 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         assert_eq!(descriptors.descriptor_pushes, 0);
         assert_eq!(descriptors.descriptor_push_held, 0);
     }
-    for (index, pixel) in pixels.chunks_exact(4).enumerate() {
-        assert_eq!(pixel, rgba, "static sampler pixel {index}");
+    for (index, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
+        assert_eq!(*pixel, rgba, "static sampler pixel {index}");
     }
 }
 

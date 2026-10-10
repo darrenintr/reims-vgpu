@@ -3912,3 +3912,31 @@ fn an_absurd_level_count_refuses_as_a_bad_count_not_as_a_short_body() {
         .iter()
         .any(|l| l.starts_with("dual_plane_levels_over_cap")));
 }
+
+#[test]
+fn a_pipeline_without_a_fragment_function_writes_no_colour() {
+    let declared = ColorWriteMask::new(0b0101).expect("in range");
+    let mut desc = RenderPipelineDescriptor {
+        vertex_func_ref: 3,
+        fragment_func_ref: 4,
+        ..Default::default()
+    };
+    assert!(desc.has_fragment_function());
+    assert_eq!(desc.effective_color_write_mask(declared), declared);
+    assert_eq!(
+        desc.effective_color_write_mask(ColorWriteMask::ALL),
+        ColorWriteMask::ALL
+    );
+
+    desc.fragment_func_ref = 0;
+    assert!(!desc.has_fragment_function());
+    assert_eq!(
+        desc.effective_color_write_mask(declared),
+        ColorWriteMask::NONE
+    );
+    assert_eq!(
+        desc.effective_color_write_mask(ColorWriteMask::ALL),
+        ColorWriteMask::NONE,
+        "an attachment that declared every channel still receives no colour output"
+    );
+}

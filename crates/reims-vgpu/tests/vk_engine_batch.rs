@@ -83,7 +83,9 @@ fn translate_words(name: &str, stage: Stage) -> Vec<u32> {
     assert!(path.exists(), "missing reims-vgpu AIR fixture: {name}");
     let spv = metal2vulkan::translate(path.to_str().unwrap(), stage, &tmp)
         .unwrap_or_else(|e| panic!("translate {name}: {e}"));
-    spv.chunks_exact(4)
+    spv.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -1410,7 +1412,9 @@ fn glsl_words(src: &str, stage: &str, name: &str) -> Option<Vec<u32>> {
     let bytes = std::fs::read(&spv_path).ok()?;
     Some(
         bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
     )

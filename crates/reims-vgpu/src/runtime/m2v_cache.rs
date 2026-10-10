@@ -383,7 +383,9 @@ impl CachedShader {
     /// words must not be allowed to drift apart.
     pub fn new(spirv: Vec<u8>, reflection: Arc<ShaderReflection>) -> Self {
         let mut words: Vec<u32> = spirv
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         let widened = crate::runtime::spirv_bind::widen_sampled_bands(&mut words);
@@ -485,7 +487,14 @@ struct Cache {
     misses: u64,
     async_queue: VecDeque<TranslationTask>,
     async_worker_running: bool,
-    /// The last identity each `(pipeline_ref, stage_tag)` was translated under.
+    /// The last identity each `(task, pipeline_ref, stage_tag)` was translated
+    /// under.
+    ///
+    /// The task is part of the key because a pipeline ref is a number in its
+    /// task's namespace: two guest processes each holding pipeline 5 are two
+    /// pipelines, and keying on the ref alone reported every such pair as one
+    /// pipeline whose shader changed — 38 reports against 2 real withdrawals on
+    /// a macOS 13 boot running Xcode's Simulator beside other apps.
     ///
     /// **Not a cache — a detector.** This cache is keyed by AIR content and the
     /// pre-scan's memo [`crate::backend::vulkan::pipeline_resolve::translations_ready`]
@@ -496,7 +505,7 @@ struct Cache {
     /// releases a packet against a shader that is microseconds old. This
     /// records where the two part company, and nothing reads it to decide
     /// anything.
-    last_identity: HashMap<(u32, u8), u64>,
+    last_identity: HashMap<(u32, u32, u8), u64>,
 }
 
 #[derive(Clone)]
@@ -923,14 +932,25 @@ fn repair_layout(
 /// sole FIFO scheduler. Returns true when the content is already resolved
 /// (success or deterministic failure), false while the background worker owns
 /// it. Callers keep the guest packet at the channel head and retry on poll.
-pub fn ensure_cached_async(air: &[u8], stage: Stage, pipeline_ref: u32) -> bool {
-    ensure_cached_async_keyed(ShaderId::render(stage, air), stage, None, pipeline_ref)
+pub fn ensure_cached_async(air: &[u8], stage: Stage, task_id: u32, pipeline_ref: u32) -> bool {
+    ensure_cached_async_keyed(
+        ShaderId::render(stage, air),
+        stage,
+        None,
+        task_id,
+        pipeline_ref,
+    )
 }
 
 /// Kernel counterpart to [`ensure_cached_async`]. LocalSize is part of both
 /// the translation options and cache key, so two dispatch geometries can never
 /// alias one another.
-pub fn ensure_cached_kernel_async(air: &[u8], local_size: [u32; 3], pipeline_ref: u32) -> bool {
+pub fn ensure_cached_kernel_async(
+    air: &[u8],
+    local_size: [u32; 3],
+    task_id: u32,
+    pipeline_ref: u32,
+) -> bool {
     if local_size.contains(&0) {
         return true;
     }
@@ -938,6 +958,7 @@ pub fn ensure_cached_kernel_async(air: &[u8], local_size: [u32; 3], pipeline_ref
         ShaderId::kernel(air, local_size),
         Stage::Kernel,
         Some(local_size),
+        task_id,
         pipeline_ref,
     )
 }
@@ -946,6 +967,7 @@ fn ensure_cached_async_keyed(
     id: ShaderId<'_>,
     stage: Stage,
     kernel_local_size: Option<[u32; 3]>,
+    task_id: u32,
     pipeline_ref: u32,
 ) -> bool {
     let mut start_worker = false;
@@ -968,7 +990,10 @@ fn ensure_cached_async_keyed(
         // under. See `Cache::last_identity`: this is the exact moment the
         // name-keyed memo becomes a promise about bytes that are no longer
         // there, and the only moment both identities are in one hand.
-        if let Some(previous) = c.last_identity.insert((pipeline_ref, id.stage), id.digest) {
+        if let Some(previous) = c
+            .last_identity
+            .insert((task_id, pipeline_ref, id.stage), id.digest)
+        {
             if previous != id.digest {
                 changed = Some(previous);
             }
@@ -1004,10 +1029,10 @@ fn ensure_cached_async_keyed(
     if let Some(previous) = changed {
         if crate::observe::first_sight(
             "m2v_pipe_content_changed",
-            u64::from(pipeline_ref) << 8 | u64::from(id.stage),
+            u64::from(task_id) << 40 | u64::from(pipeline_ref) << 8 | u64::from(id.stage),
         ) {
             crate::observe::fail(format!(
-                "linux_m2v reason=m2v_pipe_content_changed pipe={pipeline_ref} \
+                "linux_m2v reason=m2v_pipe_content_changed task={task_id} pipe={pipeline_ref} \
                  stage={stage:?}{dims} air={} was={previous:#x} now={:#x} (the guest pointed this \
                  ref at different AIR; the name-keyed pre-scan memo still calls it translated)",
                 id.air.len(),
@@ -1125,7 +1150,9 @@ fn spirv_uses_builtin(spv: &[u8], builtin: u32) -> bool {
         return false;
     }
     let words: Vec<u32> = spv
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     let mut i = 5; // skip header
@@ -1316,30 +1343,37 @@ mod tests {
         let _guard = test_lock();
         // A ref no other test in this process uses, so the map's own state is
         // this test's.
+        const TASK: u32 = 0xD1FF;
         const REF: u32 = 0xD1FF_0001;
         let a = ShaderId::render(Stage::Fragment, b"air-one");
         let b = ShaderId::render(Stage::Fragment, b"air-two-longer");
         assert_ne!(a.digest, b.digest, "the fixture needs two identities");
 
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
-        c.last_identity.remove(&(REF, a.stage));
+        c.last_identity.remove(&(TASK, REF, a.stage));
 
         assert_eq!(
-            c.last_identity.insert((REF, a.stage), a.digest),
+            c.last_identity.insert((TASK, REF, a.stage), a.digest),
             None,
             "the first translation of a ref has nothing to differ from"
         );
         assert_eq!(
-            c.last_identity.insert((REF, a.stage), a.digest),
+            c.last_identity.insert((TASK, REF, a.stage), a.digest),
             Some(a.digest),
             "the same AIR asked for twice is not a change"
         );
         assert_eq!(
-            c.last_identity.insert((REF, b.stage), b.digest),
+            c.last_identity.insert((TASK, REF, b.stage), b.digest),
             Some(a.digest),
             "different AIR under one ref is the change the detector names"
         );
-        c.last_identity.remove(&(REF, a.stage));
+        assert_eq!(
+            c.last_identity.insert((TASK + 1, REF, a.stage), a.digest),
+            None,
+            "the same ref number in another task is another pipeline, not a change"
+        );
+        c.last_identity.remove(&(TASK, REF, a.stage));
+        c.last_identity.remove(&(TASK + 1, REF, a.stage));
     }
 
     /// A variant's reflected sampler interface must agree with the executable
@@ -1596,7 +1630,9 @@ mod tests {
         // The bytes must not be allowed to disagree with the words.
         let from_bytes: Vec<u32> = shader
             .spirv
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         assert_eq!(from_bytes, widened);
@@ -1725,7 +1761,7 @@ mod tests {
         // The admission still resolves, so the guest packet advances rather
         // than re-polling a translation that keeps failing.
         assert!(
-            ensure_cached_async(air, Stage::Vertex, 7),
+            ensure_cached_async(air, Stage::Vertex, 1, 7),
             "a stored failure must resolve the ask, or the packet never advances"
         );
 
@@ -1923,7 +1959,7 @@ mod tests {
             let mut c = global().lock().unwrap();
             c.put(id, &Arc::from(&air[..]), Entry::Loading);
         }
-        assert!(!ensure_cached_async(air, Stage::Fragment, 7));
+        assert!(!ensure_cached_async(air, Stage::Fragment, 1, 7));
         assert!(global().lock().unwrap().async_queue.is_empty());
 
         global().lock().unwrap().put(
@@ -1933,7 +1969,7 @@ mod tests {
                 detail: "synthetic failure".into(),
             }),
         );
-        assert!(ensure_cached_async(air, Stage::Fragment, 7));
+        assert!(ensure_cached_async(air, Stage::Fragment, 1, 7));
         assert_eq!(
             // `.err()` rather than `unwrap_err()`: the success arm is an
             // `Arc<CachedShader>`, which carries no `Debug`.
@@ -1978,7 +2014,7 @@ mod tests {
             );
         }
         assert!(
-            ensure_cached_async(&hot, Stage::Fragment, 1),
+            ensure_cached_async(&hot, Stage::Fragment, 1, 1),
             "the first-compiled shader is still resolved after 1024 later ones"
         );
         assert_eq!(
@@ -2002,9 +2038,9 @@ mod tests {
                 Entry::Loading,
             );
         }
-        assert!(!ensure_cached_kernel_async(air, [16, 16, 1], 20));
+        assert!(!ensure_cached_kernel_async(air, [16, 16, 1], 1, 20));
         assert!(global().lock().unwrap().async_queue.is_empty());
-        assert!(ensure_cached_kernel_async(air, [0, 16, 1], 20));
+        assert!(ensure_cached_kernel_async(air, [0, 16, 1], 1, 20));
         reset_for_test();
     }
 

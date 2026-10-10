@@ -351,7 +351,7 @@ impl PipelineObjectIdentity {
 
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let raw = NEXT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .expect("retained pipeline identity space exhausted");
@@ -2108,6 +2108,33 @@ impl TargetIdentity {
             Self::Texture { ref_, .. } => (1, u64::from(*ref_)),
             Self::Gva { gva, .. } => (2, *gva),
             Self::Anonymous { slot } => (3, *slot),
+        }
+    }
+
+    /// Whether this identity replaces `older` as the same guest surface after
+    /// its page list was rewritten.
+    ///
+    /// A surface's `generation` is its mapping's `map_generation`, which every
+    /// writer of the page list bumps, and `surface_identity` only ever names
+    /// the current one. So an older generation of the same mapping names pages
+    /// the guest has already recycled: no draw can ask for it again, and the
+    /// writeback ledger discards any debt armed at it (`wbdebt_generation_moved`).
+    /// Extent and format are not compared, because the generation belongs to the
+    /// mapping, not to one view of it.
+    ///
+    /// Only the surface namespace is answered. A GVA or texture generation has
+    /// no such established contract, so those never supersede anything.
+    pub fn supersedes(&self, older: &Self) -> bool {
+        match (self, older) {
+            (
+                Self::Surface { id, generation, .. },
+                Self::Surface {
+                    id: older_id,
+                    generation: older_generation,
+                    ..
+                },
+            ) => id == older_id && generation != older_generation,
+            _ => false,
         }
     }
 

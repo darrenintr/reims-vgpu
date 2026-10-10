@@ -125,8 +125,8 @@ fn main() {
             // Arm a swapchain rebuild for the present two lines below. The
             // toggle only has to make the extent *differ* from the last one; see
             // the module docs on why the value itself is not the claim.
-            if recreate_every != 0 && seq % recreate_every == 0 {
-                let height = if (seq / recreate_every) % 2 == 0 {
+            if recreate_every != 0 && seq.is_multiple_of(recreate_every) {
+                let height = if (seq / recreate_every).is_multiple_of(2) {
                     H
                 } else {
                     H - 1

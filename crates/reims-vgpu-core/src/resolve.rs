@@ -1378,6 +1378,7 @@ mod tests {
     impl RefResolver for Live {
         fn resource(&self, object_ref: u32) -> Option<ResourceId> {
             self.0.contains(&object_ref).then_some(ResourceId {
+                task: crate::identity::TaskId(0),
                 slot: ObjectListRef(object_ref),
                 generation: SlotGeneration(7),
             })
@@ -1386,6 +1387,7 @@ mod tests {
 
     fn id(object_ref: u32) -> ResourceId {
         ResourceId {
+            task: crate::identity::TaskId(0),
             slot: ObjectListRef(object_ref),
             generation: SlotGeneration(7),
         }
@@ -2131,6 +2133,7 @@ mod tests {
     impl RefResolver for Everything {
         fn resource(&self, object_ref: u32) -> Option<ResourceId> {
             Some(ResourceId {
+                task: crate::identity::TaskId(0),
                 slot: ObjectListRef(object_ref),
                 generation: SlotGeneration(7),
             })

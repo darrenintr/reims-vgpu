@@ -165,6 +165,12 @@ struct Waiting {
     word: crate::runtime::guest_ram::GuestRef,
     /// The FIFO completion value published into `word`.
     stamp: u32,
+    /// When the drain worker handed this stamp over. Observation only.
+    registered: std::time::Instant,
+    /// When its submission reached the queue owner: at registration for a
+    /// stamp behind already-submitted work, at the batch's submit for one
+    /// parked on an open batch. Observation only.
+    bound: Option<std::time::Instant>,
 }
 
 /// Association between one guest stamp and one FIFO-owned submission.
@@ -209,6 +215,7 @@ impl PendingQueue {
         for waiting in &mut self.waiting {
             if waiting.point == CompletionPoint::NextSubmission(timeline) {
                 waiting.point = CompletionPoint::Submitted(timeline);
+                waiting.bound = Some(std::time::Instant::now());
                 bound += 1;
             }
         }
@@ -397,6 +404,19 @@ impl StampCompletion {
         )
     }
 
+    /// The highest timeline point reserved so far, and the point the GPU has
+    /// completed through (`None` if it could not be read).
+    ///
+    /// Non-blocking. Every submission that can touch guest memory reserves a
+    /// point here, in submission order, under the engine lock, and the timeline
+    /// is monotonic, so work reserved at or below the completed value has
+    /// executed.
+    pub(crate) fn timeline_progress(&self, device: &ash::Device) -> (u64, Option<u64>) {
+        let reserved = self.shared.next_value.load(Ordering::Acquire);
+        let completed = unsafe { device.get_semaphore_counter_value(self.semaphore) }.ok();
+        (reserved, completed)
+    }
+
     /// The newest queue point this device has accepted, including work waiting
     /// in the ordered owner's host FIFO.
     pub(crate) fn latest_queued(&self) -> Option<(vk::Semaphore, u64)> {
@@ -433,11 +453,14 @@ impl StampCompletion {
         if self.shared.stop.load(Ordering::Acquire) {
             return;
         }
+        let registered = std::time::Instant::now();
         queue.push(Waiting {
             point: CompletionPoint::Submitted(timeline),
             index,
             word,
             stamp,
+            registered,
+            bound: Some(registered),
         });
         PENDING_FIFO_MASK.fetch_or(1u32 << index, Ordering::Release);
         drop(queue);
@@ -478,6 +501,8 @@ impl StampCompletion {
             index,
             word,
             stamp,
+            registered: std::time::Instant::now(),
+            bound: None,
         });
         PENDING_FIFO_MASK.fetch_or(1u32 << index, Ordering::Release);
         UNSUBMITTED_FIFO_MASK.fetch_or(1u32 << index, Ordering::Release);
@@ -621,10 +646,86 @@ fn run(device: &ash::Device, semaphore: vk::Semaphore, shared: &Shared) {
             }
         }
         shared.wake.notify_all();
+        let done = std::time::Instant::now();
         announce(waiting.index);
+        latency::note(&waiting, done);
         if stopping {
             return;
         }
+    }
+}
+
+/// How long a guest waits on each completion word, split at the three points
+/// this device controls, and reported once a second.
+///
+/// Observation only: nothing here selects a route. It exists because a
+/// compositor that waits on its previous frame's stamps before building the
+/// next one runs at the rate of this round trip, not at the rate of the GPU,
+/// and the round trip had no measurement at all.
+///
+/// * `hold` — registered → handed to the queue owner. Non-zero only for a stamp
+///   parked behind a batch still recording.
+/// * `gpu` — handed over → the timeline point completed.
+/// * `total` — registered → interrupt raised.
+mod latency {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    const WINDOW: Duration = Duration::from_secs(1);
+
+    #[derive(Default)]
+    struct Window {
+        since: Option<Instant>,
+        hold: Vec<u32>,
+        gpu: Vec<u32>,
+        total: Vec<u32>,
+    }
+
+    static WINDOW_STATE: Mutex<Window> = Mutex::new(Window {
+        since: None,
+        hold: Vec::new(),
+        gpu: Vec::new(),
+        total: Vec::new(),
+    });
+
+    fn us(d: Duration) -> u32 {
+        u32::try_from(d.as_micros()).unwrap_or(u32::MAX)
+    }
+
+    /// `(p50, p90, max)` of `v`, which it sorts.
+    pub(super) fn quantiles(v: &mut [u32]) -> (u32, u32, u32) {
+        if v.is_empty() {
+            return (0, 0, 0);
+        }
+        v.sort_unstable();
+        let at = |q: usize| v[(v.len() - 1) * q / 100];
+        (at(50), at(90), v[v.len() - 1])
+    }
+
+    pub(super) fn note(waiting: &super::Waiting, done: Instant) {
+        let bound = waiting.bound.unwrap_or(waiting.registered);
+        let mut w = WINDOW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+        w.hold
+            .push(us(bound.saturating_duration_since(waiting.registered)));
+        w.gpu.push(us(done.saturating_duration_since(bound)));
+        w.total
+            .push(us(done.saturating_duration_since(waiting.registered)));
+        let since = *w.since.get_or_insert(done);
+        let elapsed = done.saturating_duration_since(since);
+        if elapsed < WINDOW {
+            return;
+        }
+        let n = w.total.len();
+        let (h50, h90, hmax) = quantiles(&mut w.hold);
+        let (g50, g90, gmax) = quantiles(&mut w.gpu);
+        let (t50, t90, tmax) = quantiles(&mut w.total);
+        *w = Window::default();
+        drop(w);
+        crate::observe::off(format!(
+            "stamp_latency window_ms={} n={n} hold_us={h50}/{h90}/{hmax} \
+             gpu_us={g50}/{g90}/{gmax} total_us={t50}/{t90}/{tmax} (p50/p90/max)",
+            elapsed.as_millis()
+        ));
     }
 }
 
@@ -870,7 +971,18 @@ mod tests {
             index,
             word: crate::runtime::guest_ram::GuestRef::new(import, slice).expect("guest word"),
             stamp,
+            registered: std::time::Instant::now(),
+            bound: None,
         }
+    }
+
+    /// The census reports the median, the ninetieth percentile and the worst,
+    /// from the sorted samples and never from their arrival order.
+    #[test]
+    fn latency_quantiles_are_order_independent() {
+        assert_eq!(latency::quantiles(&mut []), (0, 0, 0));
+        let mut v: Vec<u32> = (1..=10).rev().collect();
+        assert_eq!(latency::quantiles(&mut v), (5, 9, 10));
     }
 
     fn deferred(index: u32, stamp: u32, submission: u64) -> Waiting {
@@ -1035,6 +1147,8 @@ mod tests {
             index: 2,
             word,
             stamp: 0x89ab_cdef,
+            registered: std::time::Instant::now(),
+            bound: None,
         };
 
         assert!(publish_stamp_word(&waiting));

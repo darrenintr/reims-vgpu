@@ -219,6 +219,34 @@ pub struct GuestRamRegion {
     pub len: u64,
 }
 
+/// The file that backs a RAMBlock import, and where in it the import starts.
+///
+/// A fact about where the bytes live, carried beside the import so a backend
+/// that can import a file (a dma-buf built from a memfd) need not ask the host
+/// again. The descriptor is QEMU's own and is lent for the VM's lifetime: no
+/// holder of this value may close it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FdBacking {
+    /// The backing file's descriptor in this process.
+    pub fd: i32,
+    /// Byte offset of the import's first byte within that file.
+    pub offset: u64,
+}
+
+/// One stretch of an import's bytes as it sits in a file: `len` bytes from
+/// `offset` in `fd`.
+///
+/// An import's ranges, in order, are its bytes in order. A RAMBlock import is
+/// one range; a packed alias is one per physically-contiguous run of the pages
+/// it views, because the alias is consecutive in this process and scattered in
+/// the file. The descriptor is lent exactly as [`FdBacking`]'s is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FdRange {
+    pub fd: i32,
+    pub offset: u64,
+    pub len: u64,
+}
+
 /// Identity of one live import.
 ///
 /// Process-monotonic and never reused, which is load-bearing rather than
@@ -442,6 +470,9 @@ pub struct GuestRamImport {
     /// The backend's import granularity — `minImportedHostPointerAlignment` on
     /// Vulkan, the host page size on Metal-direct.
     align: u64,
+    /// Where this import's bytes sit in a file, in order, when the host
+    /// reported it. Tiles `len` exactly; see [`Self::with_fd_ranges`].
+    fd_ranges: Option<std::sync::Arc<[FdRange]>>,
 }
 
 impl GuestRamImport {
@@ -512,6 +543,7 @@ impl GuestRamImport {
             host_base: host_base as usize,
             len,
             align,
+            fd_ranges: None,
         })
     }
 
@@ -551,7 +583,51 @@ impl GuestRamImport {
             host_base,
             len,
             align,
+            fd_ranges: None,
         })
+    }
+
+    /// Record the file behind this RAMBlock import, as the host reported it for
+    /// exactly this import's `[host_base, host_base + len)`.
+    ///
+    /// Ignored on a packed alias, which has no single file range: it takes
+    /// [`Self::with_fd_ranges`] instead.
+    #[must_use]
+    pub fn with_fd_backing(mut self, backing: FdBacking) -> Self {
+        if self.gpa_base.is_some() {
+            self.fd_ranges = Some(std::sync::Arc::from([FdRange {
+                fd: backing.fd,
+                offset: backing.offset,
+                len: self.len,
+            }]));
+        }
+        self
+    }
+
+    /// Record where a packed alias's bytes sit in a file, run by run.
+    ///
+    /// Ignored unless the ranges tile this import exactly — every range
+    /// non-empty and their lengths summing to [`Self::len`]. A list that does
+    /// not would hand a backend a buffer whose tail is some other range's bytes,
+    /// or short of this import's, and the caller has no lawful use for either.
+    /// Ignored on a RAMBlock import too, which names its file through
+    /// [`Self::with_fd_backing`].
+    #[must_use]
+    pub fn with_fd_ranges(mut self, ranges: Vec<FdRange>) -> Self {
+        let tiles = ranges.iter().all(|r| r.len != 0)
+            && ranges
+                .iter()
+                .try_fold(0u64, |sum, r| sum.checked_add(r.len))
+                == Some(self.len);
+        if self.gpa_base.is_none() && tiles {
+            self.fd_ranges = Some(ranges.into());
+        }
+        self
+    }
+
+    /// Where this import's bytes sit in a file, in order, if the host said.
+    pub fn fd_ranges(&self) -> Option<&[FdRange]> {
+        self.fd_ranges.as_deref()
     }
 
     /// This import's identity. Every [`GuestSlice`] it makes carries it.

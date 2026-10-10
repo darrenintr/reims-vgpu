@@ -749,9 +749,11 @@ fn vbl_contended_pulse(slot: &BoundDevice) {
         slot.vbl_display_index.load(Ordering::Acquire),
         &slot.intr_disp,
         page_size as usize,
-        &slot.vbl_last_us,
-        crate::observe::elapsed_us(),
-        interval_us,
+        crate::runtime::drain::VblTick {
+            last_us: &slot.vbl_last_us,
+            now_us: crate::observe::elapsed_us(),
+            interval_us,
+        },
     );
 }
 

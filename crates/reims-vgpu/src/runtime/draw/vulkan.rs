@@ -3311,12 +3311,19 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
             None => {
                 crate::runtime::drain::note_store_route("zc_packed_alias_import");
                 crate::runtime::drain::note_store_route(packed_scatter_band(&gpas, page));
-                let import = std::sync::Arc::new(
-                    crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
-                        host_base, map_len, align,
-                    )
-                    .ok()?,
-                );
+                let mut alias = crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                    host_base, map_len, align,
+                )
+                .ok()?;
+                // The alias is a shared mapping of guest RAM's file, which a
+                // device may refuse as a host pointer; the same pages named in
+                // that file are what it can import instead.
+                if let Some(ranges) =
+                    crate::runtime::guest_ram_map::fd_ranges_for_pages(&gpas, page)
+                {
+                    alias = alias.with_fd_ranges(ranges);
+                }
+                let import = std::sync::Arc::new(alias);
                 let whole = import.slice(head, backing.size).ok()?;
                 let guest =
                     crate::runtime::guest_ram::GuestRef::new(std::sync::Arc::clone(&import), whole)
@@ -6809,12 +6816,14 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         // The mask is read from the same entry but *not* through the
         // `blending_enabled` filter below: `MTLColorWriteMask` applies whether
         // or not the slot blends, and an entry with no mask means `all`.
-        let color_write_mask = pipeline
-            .color_attachments
-            .iter()
-            .find(|a| a.slot == c.slot)
-            .map(|a| a.write_mask)
-            .unwrap_or_default();
+        let color_write_mask = pipeline.effective_color_write_mask(
+            pipeline
+                .color_attachments
+                .iter()
+                .find(|a| a.slot == c.slot)
+                .map(|a| a.write_mask)
+                .unwrap_or_default(),
+        );
         // The six ordinals travel to the engine as the guest wrote them. An
         // out-of-contract factor or op used to make *this slot* unblended with
         // a decline of its own, which is a compositing attachment quietly
@@ -9006,7 +9015,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // unblended attachment with a mask still leaves its unwritten channels
         // alone, so gating the mask on blending would drop it exactly where the
         // guest is replacing rather than compositing.
-        resources.color_write_mask = pd.color0.write_mask;
+        resources.color_write_mask = pd.effective_color_write_mask(pd.color0.write_mask);
         // The encoder's blend colour, unconditionally: it is one value per
         // draw whether or not any attachment names a constant factor. The
         // substitution for a guest that issued no `setBlendColorRed:` is the
@@ -9431,7 +9440,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             } else {
                 let mut rgb_nz = 0usize;
                 let mut max_rgb = 0u8;
-                for px in out.pixels.chunks_exact(4) {
+                for px in out.pixels.as_chunks::<4>().0 {
                     let m = px[0].max(px[1]).max(px[2]);
                     if m != 0 {
                         rgb_nz += 1;
@@ -12366,7 +12375,7 @@ mod vulkan_split_tests {
         // What the guest painted, on the wire in BGRA and distinct per channel so
         // a swizzle cannot pass for a rung.
         let mut pages = vec![0u8; (w * h * 4) as usize];
-        for px in pages.chunks_exact_mut(4) {
+        for px in pages.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&[0x10, 0x20, 0x30, 0xFF]);
         }
         assert!(write_bgra8(&mut state, &mut host, mid, &pages, w * 4, w, h));
@@ -12374,7 +12383,7 @@ mod vulkan_split_tests {
         // What this device last published for the same surface — an older frame,
         // and the one the rung under test would serve.
         let mut cached = vec![0u8; (w * h * 4) as usize];
-        for px in cached.chunks_exact_mut(4) {
+        for px in cached.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xFF]);
         }
         crate::runtime::surface_cache::store(&mut state, mid, w, h, cached);
@@ -12536,7 +12545,7 @@ mod vulkan_split_tests {
         // Guest-side content the compositor expects a LOAD to preserve. BGRA on
         // the wire; distinct per channel so a swizzle error cannot pass.
         let mut pages = vec![0u8; (w * h * 4) as usize];
-        for px in pages.chunks_exact_mut(4) {
+        for px in pages.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&[0x10, 0x20, 0x30, 0xFF]);
         }
         assert!(write_bgra8(&mut state, &mut host, mid, &pages, w * 4, w, h));
@@ -12593,7 +12602,7 @@ mod vulkan_split_tests {
         // A live cache entry still wins: it is the fresher copy (the last Store's
         // output) and the fallback must stay a fallback.
         let mut cached = vec![0u8; (w * h * 4) as usize];
-        for px in cached.chunks_exact_mut(4) {
+        for px in cached.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xFF]);
         }
         crate::runtime::surface_cache::store(&mut state, mid, w, h, cached);
@@ -13426,7 +13435,7 @@ pub(super) fn reorder_rb_in_place(px: &mut [u8], have_bgra: bool, want_bgra: boo
     if have_bgra == want_bgra {
         return;
     }
-    for p in px.chunks_exact_mut(4) {
+    for p in px.as_chunks_mut::<4>().0 {
         p.swap(0, 2);
     }
 }
@@ -13927,7 +13936,7 @@ pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
     host: &M,
     task_id: u32,
     pipeline_ref: u32,
-) -> Result<(Vec<u8>, Vec<u8>), DrawPreparationDecline> {
+) -> Result<(Vec<u8>, Option<Vec<u8>>), DrawPreparationDecline> {
     let pd = load_render_pipeline(state, host, task_id, pipeline_ref).ok_or(
         DrawPreparationDecline::PipelineMissing {
             task_id,
@@ -13940,17 +13949,25 @@ pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
             function_ref: pd.vertex_func_ref,
         },
     )?;
-    let f_mtlb = load_mtlb(
-        state,
-        host,
-        task_id,
-        pd.fragment_func_ref,
-        AirLoadRail::Draw,
-    )
-    .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
-        task_id,
-        function_ref: pd.fragment_func_ref,
-    })?;
+    // `None` is a pipeline the guest gave no fragment function, which has no
+    // container to load — see `RenderPipelineDescriptor::has_fragment_function`.
+    let f_mtlb = if pd.has_fragment_function() {
+        Some(
+            load_mtlb(
+                state,
+                host,
+                task_id,
+                pd.fragment_func_ref,
+                AirLoadRail::Draw,
+            )
+            .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
+                task_id,
+                function_ref: pd.fragment_func_ref,
+            })?,
+        )
+    } else {
+        None
+    };
     Ok((v_mtlb, f_mtlb))
 }
 

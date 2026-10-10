@@ -699,7 +699,6 @@ impl Unpublished {
 
     /// The flight and the compiled pipeline, whichever arm this is. The caller
     /// publishes them where they belong or destroys the pipeline.
-    #[must_use]
     pub fn into_parts(self) -> (variant::Flight<GraphicsKey>, Result<Native, VariantRefusal>) {
         match self {
             Self::Misdirected(inner) => (inner.flight, inner.outcome),
@@ -1784,6 +1783,7 @@ mod store_tests {
 
     fn id(slot: u32, generation: u64) -> ResourceId {
         ResourceId {
+            task: reims_vgpu_core::identity::TaskId(0),
             slot: ObjectListRef(slot),
             generation: SlotGeneration(generation),
         }

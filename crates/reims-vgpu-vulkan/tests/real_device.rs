@@ -599,6 +599,7 @@ fn a_ragged_fill_writes_exactly_the_range_the_guest_named() {
     let mut residency = resident::Residency::new();
     let mut retirement = NativeRetirement::new();
     let name = ResourceId {
+        task: reims_vgpu_core::identity::TaskId(0),
         slot: ObjectListRef(1),
         generation: SlotGeneration(1),
     };
@@ -952,7 +953,7 @@ fn a_mip_ladder_reduces_a_constant_image_to_that_constant() {
     // submitted against it yet.
     unsafe {
         let bytes = std::slice::from_raw_parts_mut(mapped.cast::<u8>(), staging_bytes as usize);
-        for texel in bytes.chunks_exact_mut(4) {
+        for texel in bytes.as_chunks_mut::<4>().0 {
             texel.copy_from_slice(&TEXEL);
         }
     }
@@ -1325,6 +1326,7 @@ fn a_planned_pass_becomes_a_render_pass_and_a_framebuffer_this_driver_accepts() 
         array_length: 1,
     };
     descriptor.color[0].texture = Some(ResourceId {
+        task: reims_vgpu_core::identity::TaskId(0),
         slot: ObjectListRef(1),
         generation: SlotGeneration(1),
     });
@@ -1463,7 +1465,9 @@ fn the_embedded_probe_spirv_matches_its_source() {
         assert!(status.success(), "glslc refused {name}");
         let bytes = std::fs::read(&out).expect("glslc wrote no output");
         let recompiled: Vec<u32> = bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         assert_eq!(

@@ -21,7 +21,14 @@
 extern "C" {
 #endif
 
-/* v20: map_pages fills ReimsVgpuMapPagesFailure when it refuses a view.
+/* v21: ReimsVgpuHostOps.guest_ram_fd — the file and offset that back a span of
+ *      guest RAM, when one does. A RAMBlock QEMU allocated from a memfd (as
+ *      `memory-backend-memfd` does) can then reach the GPU as one dma-buf per
+ *      span instead of a host-pointer import; on amdgpu the latter is a userptr
+ *      buffer that every submit revalidates and every write-protect of one of
+ *      its pages (KVM dirty logging) re-faults whole. A fact about where the
+ *      bytes live, not a choice of import: the backend decides.
+ * v20: map_pages fills ReimsVgpuMapPagesFailure when it refuses a view.
  * v19: ReimsVgpuHostOps.page_alias_census reports the packed page views the
  *      shim currently owns and their cumulative lifetime totals.
  * v18: ReimsVgpuHostOps.dmabuf_for_pages and every REIMS_VGPU_DMABUF_* removed.
@@ -94,7 +101,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 20u
+#define REIMS_VGPU_QEMU_ABI_VERSION 21u
 
 #define REIMS_VGPU_MAP_PAGES_FAILURE_NONE 0u
 #define REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION 1u
@@ -117,6 +124,8 @@ extern "C" {
  */
 #define REIMS_VGPU_GUEST_RAM_ERR_ARGS -1
 #define REIMS_VGPU_GUEST_RAM_ERR_NO_RAM -2
+/* guest_ram_fd: the range is guest RAM, but no file backs it. */
+#define REIMS_VGPU_GUEST_RAM_FD_NONE -3
 
 /*
  * One span of guest RAM: where it starts in guest physical address space, where
@@ -384,6 +393,22 @@ typedef struct ReimsVgpuHostOps {
                                    uint64_t *out, size_t max);
     /* Current packed map_pages aliases and cumulative lifetime totals. */
     int (*page_alias_census)(void *ctx, ReimsVgpuPageAliasCensus *out);
+    /*
+     * The file that backs guest RAM at [host_va, host_va + len), if one does.
+     *
+     * On success writes the file descriptor and the byte offset of `host_va`
+     * within that file, and returns 0. The descriptor is QEMU's own, live for
+     * the VM's lifetime, and is lent rather than given: the caller must not
+     * close it, and anything it builds from it (a udmabuf) holds its own
+     * reference.
+     *
+     * Returns REIMS_VGPU_GUEST_RAM_FD_NONE when the range is guest RAM with no
+     * file behind it (anonymous memory), and REIMS_VGPU_GUEST_RAM_ERR_ARGS when
+     * the range is not wholly inside one RAMBlock. Absent (NULL) on a shim that
+     * cannot answer, which callers read as "no file".
+     */
+    int (*guest_ram_fd)(void *ctx, uint64_t host_va, uint64_t len, int *fd,
+                        uint64_t *offset);
 } ReimsVgpuHostOps;
 
 /*

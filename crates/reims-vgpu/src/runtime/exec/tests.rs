@@ -7518,8 +7518,10 @@ fn a_draw_with_no_instance_count_and_one_asking_for_zero_are_not_the_same_draw()
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
     let mut out = ExecResult::default();
-    let mut acc = StreamAccum::default();
-    acc.pipeline_ref = 7171;
+    let mut acc = StreamAccum {
+        pipeline_ref: 7171,
+        ..Default::default()
+    };
 
     // `drawPrimitives:vertexStart:vertexCount:` — primitive first at 32 bits,
     // then two 16-bit counts. No instance count on the wire at all.
@@ -7596,8 +7598,10 @@ fn a_compact_draw_and_its_wide_encoding_record_the_same_draw() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
-        let mut acc = StreamAccum::default();
-        acc.pipeline_ref = 7171;
+        let mut acc = StreamAccum {
+            pipeline_ref: 7171,
+            ..Default::default()
+        };
         let opcode = ld32(&command[0..]);
         handle_render_record(&mut state, &host, 1, opcode, command, &mut out, &mut acc);
         acc.draws.first().map(|d| d.draw)
@@ -7855,6 +7859,7 @@ fn a_pipeline_whose_inputs_cannot_load_is_not_a_pending_translation() {
             reims_vgpu_core::exec::ResolvedOperation::Render(
                 reims_vgpu_core::render::RenderOp::SetPipeline {
                     pipeline: reims_vgpu_core::identity::ResourceId {
+                        task: reims_vgpu_core::identity::TaskId(1),
                         slot: reims_vgpu_core::identity::ObjectListRef(41),
                         generation: reims_vgpu_core::identity::SlotGeneration(1),
                     },
@@ -7903,6 +7908,7 @@ fn the_executing_walk_and_the_resolving_walk_reach_the_same_records() {
     impl RefResolver for Everything {
         fn resource(&self, object_ref: u32) -> Option<ResourceId> {
             Some(ResourceId {
+                task: reims_vgpu_core::identity::TaskId(0),
                 slot: ObjectListRef(object_ref),
                 generation: SlotGeneration(1),
             })

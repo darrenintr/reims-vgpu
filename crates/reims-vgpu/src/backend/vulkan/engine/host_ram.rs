@@ -491,6 +491,7 @@ impl HostRamImports {
             Ok(made) => made,
             Err(decline) => {
                 self.declined.insert(key, decline);
+                withdraw_if_backing_refused(import, &decline);
                 return Err(decline);
             }
         };
@@ -542,6 +543,390 @@ impl HostRamImports {
     }
 }
 
+/// Withdraw the guest-RAM import rail if `decline` says the driver refuses the
+/// backing of a RAMBlock, and say whether this call did.
+///
+/// A RAMBlock whose backing is refused leaves the guest-RAM map holding
+/// references into an import that will never exist, beside others (the BAR)
+/// that do: the partial import `guest_ram_map` documents as a hard error at the
+/// writeback sites rather than a fallback. On RADV with memfd-backed guest RAM
+/// that was a compute storage output reported as landed in guest pages and read
+/// by the guest as zeros. Withdrawing the limits this backend published, and the
+/// map built on them, puts the boot on the copying rails, the state
+/// `REIMS_VGPU_GUEST_IMPORT=off` reaches by hand.
+///
+/// It is decided here, where every RAMBlock import is attempted, and not by the
+/// handshake warm alone. The handshake can arrive before the device exists — a
+/// macos-13 x86 boot negotiated its protocol version 70 ms before the Vulkan
+/// device was selected — and a warm with no published granularity imports
+/// nothing. The first attempt then came from a draw, which only declined, and
+/// the boot refused 1273 imports without ever leaving the import rail.
+///
+/// Only a RAMBlock's refusal withdraws. A per-resource host allocation is
+/// memory this process chose, and its refusal says nothing about guest RAM.
+/// Once withdrawn there is no granularity, so a second refusal — another
+/// RAMBlock attempted from a reference the map handed out before the reset —
+/// does not report the same withdrawal again.
+fn withdraw_if_backing_refused(import: &GuestRamImport, decline: &HostRamDecline) -> bool {
+    if import.gpa_base().is_none()
+        || !decline.refuses_the_backing()
+        || crate::runtime::guest_ram::granularity().is_none()
+    {
+        return false;
+    }
+    crate::runtime::guest_ram::forget_import_limits();
+    crate::runtime::guest_ram_map::reset();
+    crate::observe::Emit::decline("vk_guest_import_withdrawn", decline).fail();
+    true
+}
+
+/// Why a RAMBlock that lives in a file did not reach the device as a dma-buf.
+///
+/// Never the end of the import: the caller reports it and takes the
+/// host-pointer import, which is the rail every host has. So each variant names
+/// the one step that refused, and none of them withdraws anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DmaBufDecline {
+    /// This build has no `/dev/udmabuf` to ask: it is not a Linux build.
+    #[cfg(not(target_os = "linux"))]
+    NoUdmabufOnThisHost,
+    /// `/dev/udmabuf` could not be opened.
+    #[cfg(target_os = "linux")]
+    OpenUdmabuf { errno: i32 },
+    /// `UDMABUF_CREATE` refused the range. `EINVAL` is the usual answer for a
+    /// memfd without `F_SEAL_SHRINK`, or a range that is not page-aligned.
+    #[cfg(target_os = "linux")]
+    CreateUdmabuf { errno: i32 },
+    /// `vkGetMemoryFdPropertiesKHR` refused the dma-buf.
+    FdProperties { result: vk::Result },
+    /// No memory type both accepts the dma-buf and meets the request.
+    NoMemoryType {
+        fd_types: u32,
+        refusal: crate::backend::vulkan::caps::memory_topology::MemoryTypeRefusal,
+    },
+    /// `vkCreateBuffer` over the span failed.
+    CreateBuffer { result: vk::Result },
+    /// The buffer needs more bytes than the span has, or excludes the type.
+    BufferMismatch {
+        required: u64,
+        available: u64,
+        buffer_types: u32,
+    },
+    /// `vkAllocateMemory` with the chained dma-buf import failed.
+    AllocateMemory { result: vk::Result },
+    /// `vkBindBufferMemory` failed after a successful import.
+    BindBuffer { result: vk::Result },
+}
+
+impl Decline for DmaBufDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            #[cfg(not(target_os = "linux"))]
+            Self::NoUdmabufOnThisHost => "dmabuf_import_no_udmabuf_on_this_host",
+            #[cfg(target_os = "linux")]
+            Self::OpenUdmabuf { .. } => "dmabuf_import_open_udmabuf",
+            #[cfg(target_os = "linux")]
+            Self::CreateUdmabuf { .. } => "dmabuf_import_create_udmabuf",
+            Self::FdProperties { .. } => "dmabuf_import_fd_properties",
+            Self::NoMemoryType { .. } => "dmabuf_import_no_memory_type",
+            Self::CreateBuffer { .. } => "dmabuf_import_create_buffer",
+            Self::BufferMismatch { .. } => "dmabuf_import_buffer_mismatch",
+            Self::AllocateMemory { .. } => "dmabuf_import_allocate_memory",
+            Self::BindBuffer { .. } => "dmabuf_import_bind_buffer",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            #[cfg(not(target_os = "linux"))]
+            Self::NoUdmabufOnThisHost => Vec::new(),
+            #[cfg(target_os = "linux")]
+            Self::OpenUdmabuf { errno } | Self::CreateUdmabuf { errno } => {
+                vec![("errno", errno.to_string())]
+            }
+            Self::FdProperties { result }
+            | Self::CreateBuffer { result }
+            | Self::AllocateMemory { result }
+            | Self::BindBuffer { result } => vec![("result", format!("{result:?}"))],
+            Self::NoMemoryType { fd_types, refusal } => vec![
+                ("fd_types", format!("{fd_types:#x}")),
+                ("check", refusal.slug().to_string()),
+            ],
+            Self::BufferMismatch {
+                required,
+                available,
+                buffer_types,
+            } => vec![
+                ("required", required.to_string()),
+                ("available", available.to_string()),
+                ("buffer_types", format!("{buffer_types:#x}")),
+            ],
+        }
+    }
+}
+
+crate::observe::decline_display!(DmaBufDecline);
+
+/// A dma-buf over `ranges` of the files behind guest RAM, in order, made by
+/// `/dev/udmabuf`.
+///
+/// One range is a RAMBlock (`UDMABUF_CREATE`); several are a packed alias's
+/// scattered pages laid end to end (`UDMABUF_CREATE_LIST`), so the device sees
+/// the same consecutive bytes the alias shows this process. The kernel bounds
+/// the list by its `list_limit` parameter and refuses past it, which arrives
+/// here as [`DmaBufDecline::CreateUdmabuf`].
+///
+/// The memfd QEMU allocated guest RAM from is pinned by the dma-buf for as long
+/// as the dma-buf lives, which is what removes the per-submit revalidation a
+/// userptr import pays — see [`crate::backend::vulkan::caps::dma_buf`].
+#[cfg(target_os = "linux")]
+fn udmabuf(
+    ranges: &[crate::runtime::guest_ram::FdRange],
+) -> Result<std::os::fd::OwnedFd, DmaBufDecline> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    /// `struct udmabuf_create` from `<linux/udmabuf.h>`.
+    #[repr(C)]
+    struct UdmabufCreate {
+        memfd: u32,
+        flags: u32,
+        offset: u64,
+        size: u64,
+    }
+    /// `struct udmabuf_create_item`.
+    #[repr(C)]
+    struct UdmabufCreateItem {
+        memfd: u32,
+        pad: u32,
+        offset: u64,
+        size: u64,
+    }
+    /// `struct udmabuf_create_list` with its flexible array following in the
+    /// same allocation.
+    #[repr(C)]
+    struct UdmabufCreateList {
+        flags: u32,
+        count: u32,
+    }
+    /// `_IOW('u', 0x42, struct udmabuf_create)`.
+    const UDMABUF_CREATE: libc::c_ulong = 0x4018_7542;
+    /// `_IOW('u', 0x43, struct udmabuf_create_list)`.
+    const UDMABUF_CREATE_LIST: libc::c_ulong = 0x4008_7543;
+    const UDMABUF_FLAGS_CLOEXEC: u32 = 0x01;
+    const _: () = assert!(std::mem::size_of::<UdmabufCreate>() == 24);
+    const _: () = assert!(std::mem::size_of::<UdmabufCreateItem>() == 24);
+    const _: () = assert!(std::mem::size_of::<UdmabufCreateList>() == 8);
+
+    let errno = || std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    let Ok(count) = u32::try_from(ranges.len()) else {
+        return Err(DmaBufDecline::CreateUdmabuf { errno: libc::E2BIG });
+    };
+    // SAFETY: a constant NUL-terminated path; the returned descriptor is owned
+    // here and closed when `device` drops.
+    let raw = unsafe { libc::open(c"/dev/udmabuf".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if raw < 0 {
+        return Err(DmaBufDecline::OpenUdmabuf { errno: errno() });
+    }
+    let device = unsafe { OwnedFd::from_raw_fd(raw) };
+    let device_fd = std::os::fd::AsRawFd::as_raw_fd(&device);
+    let made = if let [only] = ranges {
+        let request = UdmabufCreate {
+            memfd: only.fd as u32,
+            flags: UDMABUF_FLAGS_CLOEXEC,
+            offset: only.offset,
+            size: only.len,
+        };
+        // SAFETY: `request` is a live, correctly laid out `udmabuf_create`; the
+        // memfd is QEMU's and is only read by the kernel, which takes its own
+        // reference for the dma-buf it returns.
+        unsafe { libc::ioctl(device_fd, UDMABUF_CREATE as _, &request) }
+    } else {
+        // The header and its items as one `u64`-aligned allocation, in the
+        // layout the kernel copies in: eight header bytes, then `count` items.
+        let words = (8 + 24 * ranges.len()).div_ceil(8);
+        let mut request = vec![0u64; words];
+        let base = request.as_mut_ptr().cast::<u8>();
+        // SAFETY: `request` is `words * 8 >= 8 + 24 * count` bytes, aligned for
+        // both structs (alignment 8 and 4), and each write below lands inside
+        // it: the header at 0, item `i` at `8 + 24 * i`.
+        unsafe {
+            base.cast::<UdmabufCreateList>().write(UdmabufCreateList {
+                flags: UDMABUF_FLAGS_CLOEXEC,
+                count,
+            });
+            for (i, range) in ranges.iter().enumerate() {
+                base.add(8 + 24 * i)
+                    .cast::<UdmabufCreateItem>()
+                    .write(UdmabufCreateItem {
+                        memfd: range.fd as u32,
+                        pad: 0,
+                        offset: range.offset,
+                        size: range.len,
+                    });
+            }
+            libc::ioctl(device_fd, UDMABUF_CREATE_LIST as _, base)
+        }
+    };
+    if made < 0 {
+        return Err(DmaBufDecline::CreateUdmabuf { errno: errno() });
+    }
+    // SAFETY: a fresh descriptor the ioctl returned and nothing else holds.
+    Ok(unsafe { OwnedFd::from_raw_fd(made) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn udmabuf(
+    _ranges: &[crate::runtime::guest_ram::FdRange],
+) -> Result<std::os::fd::OwnedFd, DmaBufDecline> {
+    Err(DmaBufDecline::NoUdmabufOnThisHost)
+}
+
+/// Import one RAMBlock or packed alias, through the file behind it where this
+/// device can.
+///
+/// An import whose bytes the host placed in a file is imported as a dma-buf
+/// when the device has the extensions for it; anything else — no file, no
+/// extension, or a dma-buf step that refused — takes the host-pointer import
+/// exactly as before. The dma-buf refusal is reported rather than swallowed,
+/// because the host-pointer import that follows is the slow one on amdgpu, and
+/// for a packed alias over a memfd it is refused outright
+/// (`VK_ERROR_INVALID_EXTERNAL_HANDLE`): a shared file mapping is not
+/// something amdgpu's userptr will pin.
+///
+/// # Safety
+///
+/// As [`HostRamImports::bind`].
+unsafe fn import_ramblock(
+    ctx: &super::context::DeviceContext,
+    import: &GuestRamImport,
+) -> Result<ImportedHostRam, HostRamDecline> {
+    if let (Some(ranges), Some(fd_ext)) = (import.fd_ranges(), ctx.external_memory_fd.as_ref()) {
+        match unsafe { import_ramblock_dmabuf(ctx, fd_ext, import, ranges) } {
+            Ok(made) => return Ok(made),
+            Err(decline) => {
+                // Once per reason: a packed alias is imported per resource, and
+                // one that the kernel refuses for its range count is refused
+                // the same way for every resource that size.
+                crate::observe::Emit::decline("vk_guest_ram_dmabuf", &decline)
+                    .field("import_id", import.id().get())
+                    .field("ranges", ranges.len())
+                    .fail_once(crate::observe::Decline::slug(&decline).as_ptr() as u64);
+            }
+        }
+    }
+    unsafe { import_ramblock_host_pointer(ctx, import) }
+}
+
+/// [`import_ramblock`]'s dma-buf half.
+///
+/// # Safety
+///
+/// As [`HostRamImports::bind`]; `fd_ext` must be the device's own loader.
+unsafe fn import_ramblock_dmabuf(
+    ctx: &super::context::DeviceContext,
+    fd_ext: &ash::khr::external_memory_fd::Device,
+    import: &GuestRamImport,
+    ranges: &[crate::runtime::guest_ram::FdRange],
+) -> Result<ImportedHostRam, DmaBufDecline> {
+    use crate::backend::vulkan::caps::host_pointer::GUEST_IMPORT_USAGE;
+    use std::os::fd::{AsRawFd, IntoRawFd};
+    use std::time::Instant;
+    const HANDLE_TYPE: vk::ExternalMemoryHandleTypeFlags =
+        vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
+
+    let size = import.len();
+    let started = Instant::now();
+    let dmabuf = udmabuf(ranges)?;
+    let udmabuf_us = started.elapsed().as_micros() as u64;
+
+    let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+    unsafe { fd_ext.get_memory_fd_properties(HANDLE_TYPE, dmabuf.as_raw_fd(), &mut fd_props) }
+        .map_err(|result| DmaBufDecline::FdProperties { result })?;
+    // The same selector and the same class as the host-pointer import, so the
+    // two primitives cannot rank memory types differently.
+    let req = ctx
+        .caps
+        .memory_request(crate::backend::vulkan::caps::MemoryClass::Upload);
+    let pick = crate::backend::vulkan::caps::memory_topology::select_memory_type(
+        &ctx.memory_properties,
+        fd_props.memory_type_bits,
+        &req,
+        size,
+        ctx.caps.max_allocation_size,
+    )
+    .map_err(|refusal| DmaBufDecline::NoMemoryType {
+        fd_types: fd_props.memory_type_bits,
+        refusal,
+    })?;
+
+    let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(HANDLE_TYPE);
+    let create = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(GUEST_IMPORT_USAGE)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .push_next(&mut external);
+    let buffer = unsafe { ctx.device.create_buffer(&create, None) }
+        .map_err(|result| DmaBufDecline::CreateBuffer { result })?;
+
+    let bound = (|| {
+        let reqs = unsafe { ctx.device.get_buffer_memory_requirements(buffer) };
+        if reqs.size > size || reqs.memory_type_bits & (1u32 << pick.index) == 0 {
+            return Err(DmaBufDecline::BufferMismatch {
+                required: reqs.size,
+                available: size,
+                buffer_types: reqs.memory_type_bits,
+            });
+        }
+        let mut fd_import = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(HANDLE_TYPE)
+            .fd(dmabuf.as_raw_fd());
+        let allocate = vk::MemoryAllocateInfo::default()
+            .allocation_size(size)
+            .memory_type_index(pick.index)
+            .push_next(&mut fd_import);
+        let memory = unsafe { ctx.device.allocate_memory(&allocate, None) }
+            .map_err(|result| DmaBufDecline::AllocateMemory { result })?;
+        match unsafe { ctx.device.bind_buffer_memory(buffer, memory, 0) } {
+            Ok(()) => Ok(ImportedHostRam {
+                buffer,
+                memory,
+                memory_type_index: pick.index,
+                size,
+                // A packed alias's host view is still this process's to
+                // release once the device lets go, whichever handle reached it.
+                alias: import.gpa_base().is_none().then_some((
+                    import.host_base(),
+                    usize::try_from(size).expect("host allocation size fits this process"),
+                )),
+            }),
+            Err(result) => {
+                unsafe { ctx.device.free_memory(memory, None) };
+                Err(DmaBufDecline::BindBuffer { result })
+            }
+        }
+    })();
+
+    match &bound {
+        // A successful import owns the descriptor now (the specification moves
+        // it into the implementation), so it must not be closed here.
+        Ok(_) => {
+            let _ = dmabuf.into_raw_fd();
+        }
+        // On any failure ownership never moved: dropping `dmabuf` closes it.
+        Err(_) => unsafe { ctx.device.destroy_buffer(buffer, None) },
+    }
+    crate::observe::off(format!(
+        "host_ram_import id={} bytes={size} mtype={} heap={} heap_mb={} via=dmabuf \
+         udmabuf_us={udmabuf_us} alloc_us={} ok={}",
+        import.id().get(),
+        pick.index,
+        pick.heap_index,
+        pick.heap_bytes >> 20,
+        started.elapsed().as_micros() as u64,
+        bound.is_ok(),
+    ));
+    bound
+}
+
 /// Import one RAMBlock's whole host mapping.
 ///
 /// # Cost, and why it is timed
@@ -558,7 +943,7 @@ impl HostRamImports {
 /// # Safety
 ///
 /// As [`HostRamImports::bind`].
-unsafe fn import_ramblock(
+unsafe fn import_ramblock_host_pointer(
     ctx: &super::context::DeviceContext,
     import: &GuestRamImport,
 ) -> Result<ImportedHostRam, HostRamDecline> {
@@ -845,6 +1230,60 @@ mod tests {
             },
         ] {
             assert!(!transient.refuses_the_backing(), "{transient:?}");
+        }
+    }
+
+    /// A RAMBlock whose backing the driver refuses withdraws the import rail
+    /// from the import itself, so a boot whose first attempt comes from a draw
+    /// rather than the handshake warm leaves the rail too. Nothing else does:
+    /// not another RAMBlock refusal, and not a per-resource host allocation
+    /// refused for the same reason.
+    #[test]
+    fn a_refused_ramblock_backing_withdraws_the_import_rail_wherever_it_is_attempted() {
+        use crate::runtime::guest_ram::{self, GuestRamImport, GuestRamRegion};
+
+        let saved = (
+            guest_ram::granularity(),
+            guest_ram::import_budget(),
+            guest_ram::import_span_max(),
+        );
+        const ALIGN: u64 = 0x1000;
+        let ramblock = GuestRamImport::new(
+            GuestRamRegion {
+                gpa_base: 0x1_0000_0000,
+                host_va: 0x10_0000,
+                len: 0x10_0000,
+            },
+            ALIGN,
+        )
+        .expect("a page-aligned stand-in RAMBlock");
+        let host_allocation = GuestRamImport::new_host_allocation(0x10_0000, 0x1_0000, ALIGN)
+            .expect("a page-aligned stand-in host allocation");
+        let refused = HostRamDecline::AllocateMemory {
+            result: vk::Result::ERROR_INVALID_EXTERNAL_HANDLE,
+        };
+        let out_of_memory = HostRamDecline::AllocateMemory {
+            result: vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+        };
+
+        guest_ram::latch_import_limits(ALIGN, 1 << 30, 1 << 30);
+        assert!(!withdraw_if_backing_refused(&host_allocation, &refused));
+        assert!(!withdraw_if_backing_refused(&ramblock, &out_of_memory));
+        assert_eq!(guest_ram::granularity(), Some(ALIGN), "the rail stands");
+
+        assert!(withdraw_if_backing_refused(&ramblock, &refused));
+        assert_eq!(guest_ram::granularity(), None, "the rail is withdrawn");
+        assert_eq!(guest_ram::import_budget(), None);
+        assert!(
+            !withdraw_if_backing_refused(&ramblock, &refused),
+            "a rail already withdrawn is not withdrawn twice"
+        );
+
+        match saved {
+            (Some(align), Some(budget), Some(span)) => {
+                guest_ram::latch_import_limits(align, budget, span)
+            }
+            _ => guest_ram::forget_import_limits(),
         }
     }
 

@@ -898,7 +898,6 @@ impl WindowPresenter {
                 continue;
             }
             let signaled = ctx
-                .device
                 .get_fence_status(self.frames[ix].in_flight)
                 .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowFenceStatus, error)))?;
             if !signaled {
@@ -951,7 +950,7 @@ impl WindowPresenter {
         if fences.is_empty() {
             return;
         }
-        if let Err(error) = ctx.device.wait_for_fences(&fences, true, u64::MAX) {
+        if let Err(error) = ctx.wait_for_fences(&fences, true, u64::MAX) {
             let decline = VkCall::new(VkOp::WindowFenceStatus, error);
             crate::observe::Emit::decline("host_window_staging_wait", &decline).fail_once(0);
         }
@@ -1336,8 +1335,7 @@ impl WindowPresenter {
             .or(staged);
 
         let submit_result = (|| {
-            ctx.device
-                .reset_fences(&[frame_in_flight])
+            ctx.reset_fences(&[frame_in_flight])
                 .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowResetFence, error)))?;
             ctx.device
                 .reset_command_buffer(frame_cmd, vk::CommandBufferResetFlags::empty())

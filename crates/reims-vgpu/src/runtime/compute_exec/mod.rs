@@ -792,8 +792,7 @@ pub fn apply_record<M: HostMemory + HostOps>(
     record: &ComputeRecord<'_>,
     seg: &mut crate::runtime::compute_session::ComputeSegment,
 ) -> Option<ComputeStatus> {
-    let out = apply_record_inner(state, host, task_id, record, seg);
-    out
+    apply_record_inner(state, host, task_id, record, seg)
 }
 
 /// Apply one sequencing record the closure ledger has not settled.
@@ -811,8 +810,7 @@ pub fn apply_sequencing_record<M: HostMemory + HostOps>(
     cmd: &ComputeCommand,
     seg: &mut crate::runtime::compute_session::ComputeSegment,
 ) -> ComputeStatus {
-    let out = crate::runtime::compute_session::apply_sequencing(state, host, task_id, cmd, seg);
-    out
+    crate::runtime::compute_session::apply_sequencing(state, host, task_id, cmd, seg)
 }
 
 fn apply_record_inner<M: HostMemory + HostOps>(
@@ -3431,6 +3429,8 @@ use reims_vgpu_protocol::extent::Extent3;
 pub mod metal;
 #[cfg(feature = "backend-vulkan")]
 pub mod stall_watchdog;
+#[cfg(feature = "backend-vulkan")]
+mod timing;
 #[cfg(feature = "backend-vulkan")]
 pub mod vulkan;
 

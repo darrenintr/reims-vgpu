@@ -1090,6 +1090,7 @@ mod tests {
             object_ref: u32,
         ) -> Option<reims_vgpu_core::identity::ResourceId> {
             Some(reims_vgpu_core::identity::ResourceId {
+                task: reims_vgpu_core::identity::TaskId(0),
                 slot: reims_vgpu_core::identity::ObjectListRef(object_ref),
                 generation: reims_vgpu_core::identity::SlotGeneration(
                     u64::from(task.0).saturating_add(1),

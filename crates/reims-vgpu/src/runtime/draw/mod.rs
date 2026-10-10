@@ -377,19 +377,12 @@ pub fn bind_attribute_stride(
 #[inline]
 fn swap_rb_channels(src: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; src.len()];
-    let mut src_px = src.chunks_exact(4);
-    let mut out_px = out.chunks_exact_mut(4);
-    for (s, d) in (&mut src_px).zip(&mut out_px) {
-        d[0] = s[2];
-        d[1] = s[1];
-        d[2] = s[0];
-        d[3] = s[3];
+    let (src_px, rem) = src.as_chunks::<4>();
+    let (out_px, out_rem) = out.as_chunks_mut::<4>();
+    for (s, d) in src_px.iter().zip(out_px) {
+        *d = [s[2], s[1], s[0], s[3]];
     }
-    let rem = src_px.remainder();
-    if !rem.is_empty() {
-        let start = out.len() - rem.len();
-        out[start..].copy_from_slice(rem);
-    }
+    out_rem.copy_from_slice(rem);
     out
 }
 
@@ -410,7 +403,7 @@ fn swap_rb_channels(src: &[u8]) -> Vec<u8> {
 /// [`swap_rb_channels`] follows, stated once so the two cannot drift.
 #[inline]
 pub(crate) fn swap_rb_channels_in_place(frame: &mut [u8]) {
-    for px in frame.chunks_exact_mut(4) {
+    for px in frame.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }
 }
@@ -974,25 +967,23 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
             return None;
         }
     };
-    // Both stages are required to build a pipeline, and the two are reported
-    // apart because they are different guest mistakes — the compute sibling
-    // names its one stage the same way, as `kernel_func_zero`.
+    // A vertex function is required — the compute sibling names its one stage
+    // the same way, as `kernel_func_zero`. A fragment function is not: Metal
+    // allows it to be nil, and the guest binds and draws such pipelines (see
+    // [`RenderPipelineDescriptor::has_fragment_function`]). Each rail realizes
+    // the absent stage itself.
     if p.vertex_func_ref == 0 {
         report.reason(task_id, pipeline_ref, "vertex_func_zero", "");
-        return None;
-    }
-    if p.fragment_func_ref == 0 {
-        report.reason(task_id, pipeline_ref, "fragment_func_zero", "");
         return None;
     }
     // The guest has created this pipeline object, which is the semantic model's
     // `Declared` and nothing more — no host work has started here, and both
     // rails reach this same door before any of theirs does.
     //
-    // After the two zero-stage checks rather than before them: a descriptor
-    // naming no vertex or fragment function is not a pipeline the guest can
-    // ever bind, and declaring one would put a name in the table that nothing
-    // will ever advance or retire.
+    // After the zero-stage check rather than before it: a descriptor naming no
+    // vertex function is not a pipeline the guest can ever bind, and declaring
+    // one would put a name in the table that nothing will ever advance or
+    // retire.
     if let Some(name) = objects::name_resource(state, host, task_id, pipeline_ref) {
         crate::runtime::drain::note_store_route(if state.declare_pipeline(name) {
             "pipeline_declared"
@@ -1044,6 +1035,12 @@ pub(super) fn name_depth_stencil<M: HostMemory + HostOps>(
 /// is the order [`DeviceState::publish_pipeline_usage`] requires — a lease
 /// taken before the reflection lands gets a footprint that is conservative for
 /// the life of that transaction.
+///
+/// Compiled with the Vulkan rail only, because only it reflects its shaders
+/// today. The Metal rail does not publish yet, so on it every bound slot stays
+/// `Unknown` and orders conservatively — the gap this function's "both rails"
+/// still describes.
+#[cfg(feature = "backend-vulkan")]
 pub(crate) fn publish_pipeline_usage<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
@@ -1775,9 +1772,11 @@ pub fn load_composite_premult_one_omsa(draw_rgba: &[u8], seed_rgba: &[u8]) -> (V
     let mut out = vec![0u8; draw_rgba.len()];
     let mut blended = 0usize;
     for ((o, s), d) in out
-        .chunks_exact_mut(4)
-        .zip(draw_rgba.chunks_exact(4))
-        .zip(seed_rgba.chunks_exact(4))
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(draw_rgba.as_chunks::<4>().0.iter())
+        .zip(seed_rgba.as_chunks::<4>().0.iter())
     {
         let sa = s[3] as u32;
         if sa == 0 {
@@ -3144,6 +3143,21 @@ pub(crate) fn write_gva_frame_within<M: HostMemory + HostOps>(
     )
 }
 
+/// Which source row `row` currently holds the conversion of.
+#[derive(Default)]
+struct ConvertedRow {
+    last: Option<usize>,
+}
+
+impl ConvertedRow {
+    /// Whether the source row at `at` is byte-equal to the one last converted,
+    /// so the scratch row already holds its conversion.
+    fn reuses(&self, src: &[u8], at: usize, len: usize) -> bool {
+        self.last
+            .is_some_and(|prev| prev == at || src[prev..prev + len] == src[at..at + len])
+    }
+}
+
 /// [`write_gva_frame_within`], leaving `skip` untouched.
 ///
 /// `skip` is in bytes from `gva`, ascending and disjoint — the same coordinate
@@ -3203,6 +3217,12 @@ pub(crate) fn write_gva_frame_within_skipping<M: HostMemory + HostOps>(
     // converts nothing, so an unsupported format is not its problem and the
     // parse stays lazy. See `pixel_format::Rgba8ToRow`.
     let row_rail = pixel_format::Rgba8ToRow::for_format(format);
+    // A conversion is a pure function of its source row, so a row byte-equal to
+    // the one already in `row` is not converted again. That is every row of a
+    // solid clear — a clear-only pass reaches this writer as a whole frame of one
+    // colour — where converting each of 1080 identical rows was a seventh of the
+    // device's CPU on a 1080p clear loop.
+    let mut converted = ConvertedRow::default();
     // Guest writes resolve through a fresh PT walk at write time — never a
     // cached view (stale-view heap-corruption class; see
     // `gva_view::write_span_within`) —
@@ -3217,12 +3237,14 @@ pub(crate) fn write_gva_frame_within_skipping<M: HostMemory + HostOps>(
             let at = y * src_stride;
             let out_row: &[u8] = match frame {
                 FrameRows::Rgba8(rgba) => {
-                    if !row_rail
-                        .is_some_and(|r| r.convert(&rgba[at..at + src_stride], width, &mut row))
+                    if !converted.reuses(rgba, at, src_stride)
+                        && !row_rail
+                            .is_some_and(|r| r.convert(&rgba[at..at + src_stride], width, &mut row))
                     {
                         res = Err(MemError::BadArgs);
                         break;
                     }
+                    converted.last = Some(at);
                     &row
                 }
                 FrameRows::Native(native) => &native[at..at + src_stride],
@@ -3260,10 +3282,13 @@ pub(crate) fn write_gva_frame_within_skipping<M: HostMemory + HostOps>(
         let at = y * src_stride;
         let out_row: &[u8] = match frame {
             FrameRows::Rgba8(rgba) => {
-                if !row_rail.is_some_and(|r| r.convert(&rgba[at..at + src_stride], width, &mut row))
+                if !converted.reuses(rgba, at, src_stride)
+                    && !row_rail
+                        .is_some_and(|r| r.convert(&rgba[at..at + src_stride], width, &mut row))
                 {
                     return Err(MemError::BadArgs);
                 }
+                converted.last = Some(at);
                 &row
             }
             FrameRows::Native(native) => &native[at..at + src_stride],

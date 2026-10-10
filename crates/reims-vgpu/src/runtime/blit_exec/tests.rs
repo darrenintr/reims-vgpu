@@ -2841,6 +2841,40 @@ fn copy_region_io_enrichment_dedups_per_page_and_direction() {
     ));
 }
 
+/// Asking whether a texture is a view is a question with two answers, and "no"
+/// is not a refusal.
+///
+/// Render-target and sampled-texture resolution both probe every bound texture
+/// this way and take the texture's own ref when it is not a view. The probe used
+/// to send a non-view slot through the strict typed resolver, which on a
+/// retained resolution logs `memo_wrong_type` on the always-on channel — one
+/// line per such texture, every one of them the expected answer.
+#[test]
+fn probing_a_texture_that_is_not_a_view_is_quiet() {
+    use crate::runtime::draw::resolve_texture_view;
+
+    let (mut host, mut state) = blit_device();
+    install_mapper_ref_texture(&mut host, &mut state, 3, 9, 0x20);
+    install_texture_view(&mut host, &mut state, 4, 3, MTL_FORMAT_BGRA8_UNORM, 0, None);
+    // Retain both resolutions first: the strict resolver's refusal line fires
+    // on a retained hit, which is the state every steady-state bind is in.
+    crate::runtime::objects::resolve_resource(&state, &host, 1, 3).expect("texture resolves");
+    crate::runtime::objects::resolve_resource(&state, &host, 1, 4).expect("view resolves");
+
+    let refused_before = crate::runtime::drain::census::store_route_count("memo_wrong_type");
+    assert!(
+        resolve_texture_view(&state, &host, 1, 3).is_none(),
+        "a plain texture is not a view"
+    );
+    assert_eq!(
+        crate::runtime::drain::census::store_route_count("memo_wrong_type"),
+        refused_before,
+        "the probe must not record a refusal for the expected answer"
+    );
+    let view = resolve_texture_view(&state, &host, 1, 4).expect("a view still resolves");
+    assert_eq!(view.base_texture_ref, 3);
+}
+
 /// The copy path and the draw/sample path follow a texture-view chain exactly
 /// as deep as each other.
 ///

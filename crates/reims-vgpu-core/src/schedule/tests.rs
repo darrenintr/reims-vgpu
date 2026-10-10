@@ -19,6 +19,7 @@ use crate::transaction::{DeviceTransaction, Payload, PayloadClass};
 
 fn res(slot: u32) -> ResourceId {
     ResourceId {
+        task: crate::identity::TaskId(1),
         slot: ObjectListRef(slot),
         generation: SlotGeneration(1),
     }
@@ -242,7 +243,7 @@ fn from_records(count: u64) -> Vec<DeviceTransaction> {
             ]);
             let work = crate::walk::exec(
                 &bytes,
-                &crate::testing::Everything,
+                &crate::testing::Everything(TASK),
                 &mut model.task_access(TASK, ChannelId(1)),
                 crate::exec::ExecBuilder::new(),
             )
@@ -281,7 +282,7 @@ fn from_render_records(count: u64) -> Vec<DeviceTransaction> {
             ]);
             let work = crate::walk::exec(
                 &bytes,
-                &crate::testing::Everything,
+                &crate::testing::Everything(TASK),
                 &mut model.task_access(TASK, ChannelId(1)),
                 crate::exec::ExecBuilder::new(),
             )

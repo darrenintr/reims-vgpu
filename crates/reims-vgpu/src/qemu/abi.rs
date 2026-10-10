@@ -92,7 +92,7 @@ use std::slice;
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
 /// v20 gives `map_pages` a structured per-call failure output.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 20;
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 21;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -127,6 +127,8 @@ pub const REIMS_VGPU_QEMU_EMPTY: c_int = 4;
 /// on exactly one pathway.
 pub const REIMS_VGPU_GUEST_RAM_ERR_ARGS: c_int = -1;
 pub const REIMS_VGPU_GUEST_RAM_ERR_NO_RAM: c_int = -2;
+/// `guest_ram_fd`: the range is guest RAM with no file behind it.
+pub const REIMS_VGPU_GUEST_RAM_FD_NONE: c_int = -3;
 
 fn copy_host_ops(ops: *const ReimsVgpuHostOps) -> Option<ReimsVgpuHostOps> {
     if ops.is_null() {
@@ -967,6 +969,7 @@ mod tests {
                 "REIMS_VGPU_GUEST_RAM_ERR_NO_RAM",
                 REIMS_VGPU_GUEST_RAM_ERR_NO_RAM,
             ),
+            ("REIMS_VGPU_GUEST_RAM_FD_NONE", REIMS_VGPU_GUEST_RAM_FD_NONE),
         ] {
             assert_eq!(
                 header_define_i32(name),

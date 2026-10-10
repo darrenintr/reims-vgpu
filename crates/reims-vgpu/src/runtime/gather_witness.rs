@@ -760,9 +760,9 @@ pub(crate) unsafe fn fold_runs(runs: &[crate::runtime::guest_ram::GuestRun], spa
         // SAFETY: caller's precondition — `host_ptr` is a stable RAMBlock alias
         // valid for at least `run.len` bytes, and `n <= run.len`.
         let bytes = unsafe { std::slice::from_raw_parts(run.host_ptr() as *const u8, n) };
-        let (words, tail) = bytes.split_at(n & !7);
-        for chunk in words.chunks_exact(8) {
-            let w = u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8) yields 8 bytes"));
+        let (words, tail) = bytes.as_chunks::<8>();
+        for chunk in words {
+            let w = u64::from_le_bytes(*chunk);
             a = (a ^ w).rotate_left(29).wrapping_mul(0x9e37_79b9_7f4a_7c15);
             b = b.rotate_left(7).wrapping_add(w ^ a);
         }

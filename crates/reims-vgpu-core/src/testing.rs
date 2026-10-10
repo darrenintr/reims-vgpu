@@ -100,11 +100,12 @@ pub(crate) fn identity(domain: u32, ingress: u64) -> crate::identity::Transactio
 /// Resolution is not what the suites using this are about: an unresolvable ref
 /// would report a missing object where the question is about framing, ordering
 /// or scheduling.
-pub(crate) struct Everything;
+pub(crate) struct Everything(pub crate::identity::TaskId);
 
 impl crate::resolve::RefResolver for Everything {
     fn resource(&self, object_ref: u32) -> Option<crate::identity::ResourceId> {
         Some(crate::identity::ResourceId {
+            task: self.0,
             slot: crate::identity::ObjectListRef(object_ref),
             generation: crate::identity::SlotGeneration(1),
         })

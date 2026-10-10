@@ -1531,11 +1531,11 @@ pub struct ObjectList {
 }
 
 impl Task {
-    fn new(directory: DirectoryFrame) -> Self {
+    fn new(task: TaskId, directory: DirectoryFrame) -> Self {
         Self {
             directory,
             object_list: None,
-            namespace: Namespace::new(),
+            namespace: Namespace::new(task),
             heaps: Heaps::default(),
             resident: HashMap::new(),
         }
@@ -2031,7 +2031,7 @@ impl Lifecycle {
             }
             None => Effects::default(),
         };
-        self.tasks.insert(task, Task::new(directory));
+        self.tasks.insert(task, Task::new(task, directory));
         Ok(effects)
     }
 
@@ -2533,6 +2533,7 @@ mod tests {
 
     fn name(slot: u32) -> ResourceId {
         ResourceId {
+            task: TASK,
             slot: ObjectListRef(slot),
             generation: SlotGeneration::default().next(),
         }
@@ -3085,6 +3086,7 @@ mod tests {
         let backing = BackingId(10);
         let version = l.content().version_of(backing, range(0, 256));
         let stale = ResourceId {
+            task: TASK,
             slot: ObjectListRef(9),
             generation: SlotGeneration::default().next(),
         };
@@ -3197,6 +3199,7 @@ mod tests {
         };
 
         let stale = ResourceId {
+            task: TASK,
             slot: ObjectListRef(9),
             generation: SlotGeneration::default().next(),
         };
@@ -3754,6 +3757,7 @@ mod tests {
         payload.extend_from_slice(&TASK.0.to_le_bytes());
         payload.extend_from_slice(&7u32.to_le_bytes());
         let resource = ResourceId {
+            task: TASK,
             slot: ObjectListRef(7),
             generation: SlotGeneration(1),
         };
@@ -3785,7 +3789,7 @@ mod tests {
     /// what a command resolves against.
     #[test]
     fn a_delete_resolves_against_the_namespace_that_declared_the_object() {
-        let mut names = crate::namespace::Namespace::new();
+        let mut names = crate::namespace::Namespace::new(TASK);
         let declared = names.declare(ObjectListRef(7), Some(crate::access::BackingId(10)));
         assert_eq!(declared.displaced, None, "a free slot");
         let id = declared.id;
@@ -4540,6 +4544,7 @@ mod tests {
     impl crate::resolve::RefResolver for Everything {
         fn resource(&self, object_ref: u32) -> Option<ResourceId> {
             Some(ResourceId {
+                task: TASK,
                 slot: ObjectListRef(object_ref),
                 generation: SlotGeneration(1),
             })
@@ -4601,6 +4606,7 @@ mod tests {
     impl crate::resolve::TaskNamespaces for PerTask {
         fn resource(&self, task: TaskId, object_ref: u32) -> Option<ResourceId> {
             Some(ResourceId {
+                task,
                 slot: ObjectListRef(object_ref),
                 generation: SlotGeneration(u64::from(task.0) + 1),
             })
@@ -4637,6 +4643,7 @@ mod tests {
                 task: TaskId(5),
                 object_ref: REF,
                 resource: Some(ResourceId {
+                    task: TaskId(5),
                     slot: ObjectListRef(REF),
                     generation: SlotGeneration(6),
                 }),
@@ -4647,7 +4654,7 @@ mod tests {
             LifecycleOp::DeleteResource {
                 task: TaskId(9),
                 object_ref: REF,
-                resource: Some(ResourceId {
+                resource: Some(ResourceId { task: TaskId(9),
                     slot: ObjectListRef(REF),
                     generation: SlotGeneration(10),
                 }),
@@ -4670,6 +4677,7 @@ mod tests {
         assert_eq!(
             resources,
             vec![ResourceId {
+                task: TaskId(11),
                 slot: ObjectListRef(REF),
                 generation: SlotGeneration(12),
             }],
@@ -5638,6 +5646,7 @@ mod tests {
                     .map_or_else(|| SlotGeneration::default().next(), |g| g.next());
                 generations.insert((*task, *slot), generation);
                 let id = ResourceId {
+                    task: *task,
                     slot: *slot,
                     generation,
                 };

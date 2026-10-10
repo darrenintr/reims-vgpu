@@ -948,14 +948,14 @@ pub fn preflight_submission<M: HostMemory + HostOps>(
             (extent.iter().all(|d| *d != 0)).then_some((pipeline.slot.0, extent))
         })
         .collect();
-    let pending = crate::backend::selected().preflight_translations(
+
+    crate::backend::selected().preflight_translations(
         state,
         host,
         submission.task_id,
         &refs,
         &dispatches,
-    );
-    pending
+    )
 }
 
 /// Run one read and planned submission's host work.
@@ -3776,17 +3776,32 @@ fn draw_instances(instances: reims_vgpu_protocol::decode::render::Instancing) ->
     u32::try_from(count).ok()
 }
 
+/// A render row the rail routed to the draw arm, with the kind that routed it.
+///
+/// The kind travels with the row rather than beside it because it is the
+/// answer that made this row a draw, and the only one that can say which of the
+/// two encodings it arrived in (see the wide-encoding census below).
+struct DrawRow<'a> {
+    task_id: u32,
+    opcode: u32,
+    kind: ProtoRenderKind,
+    cmd_bytes: &'a [u8],
+}
+
 /// Record one draw, lifted by the protocol crate.
 fn handle_render_draw<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
-    task_id: u32,
-    kind: ProtoRenderKind,
-    opcode: u32,
-    cmd_bytes: &[u8],
+    row: DrawRow<'_>,
     out: &mut ExecResult,
     acc: &mut StreamAccum,
 ) {
+    let DrawRow {
+        task_id,
+        opcode,
+        kind,
+        cmd_bytes,
+    } = row;
     use reims_vgpu_protocol::decode::render::{DrawRecord, RenderRecord};
 
     let Some(framed) = frame_render_record(task_id, opcode, cmd_bytes) else {
@@ -3999,7 +4014,13 @@ fn handle_render_record<M: HostMemory + HostOps>(
         // **The draws.** The group that reads what the other three wrote, which
         // is why it moves last — see [`is_render_draw`].
         if is_render_draw(kind) {
-            return handle_render_draw(state, host, task_id, kind, opcode, cmd_bytes, out, acc);
+            let row = DrawRow {
+                task_id,
+                opcode,
+                kind,
+                cmd_bytes,
+            };
+            return handle_render_draw(state, host, row, out, acc);
         }
     }
     let cmd = match render_spi::decode(cmd_bytes) {

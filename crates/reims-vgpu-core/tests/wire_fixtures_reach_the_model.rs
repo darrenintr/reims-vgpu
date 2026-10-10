@@ -58,6 +58,7 @@ struct Everything;
 impl RefResolver for Everything {
     fn resource(&self, object_ref: u32) -> Option<ResourceId> {
         Some(ResourceId {
+            task: TASK,
             slot: ObjectListRef(object_ref),
             generation: SlotGeneration(1),
         })
@@ -541,6 +542,7 @@ impl RefResolver for Recording {
     fn resource(&self, object_ref: u32) -> Option<ResourceId> {
         self.0.borrow_mut().insert(object_ref);
         Some(ResourceId {
+            task: TASK,
             slot: ObjectListRef(object_ref),
             generation: SlotGeneration(1),
         })

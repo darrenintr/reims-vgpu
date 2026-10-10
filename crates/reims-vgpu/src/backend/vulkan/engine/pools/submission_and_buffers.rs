@@ -1353,7 +1353,7 @@ impl ResourcePools {
         }
         let fence = self.slots[index].fence;
         let wait_started = std::time::Instant::now();
-        let waited = ctx.device.wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS);
+        let waited = ctx.wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS);
         crate::runtime::drain::stall::note_stall_since(
             crate::runtime::drain::stall::Stall::RingWait,
             wait_started,
@@ -1362,8 +1362,7 @@ impl ResourcePools {
             crate::observe::fail(format!("vk_engine_fence_wedged slot={index} result={e:?}"));
             Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesRetire)
         })?;
-        ctx.device
-            .reset_fences(&[fence])
+        ctx.reset_fences(&[fence])
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsResetFencesRetire, e)))?;
         let pending = self.slots[index].pending.take().expect("checked above");
         self.in_flight = self.in_flight.saturating_sub(1);
@@ -1388,7 +1387,6 @@ impl ResourcePools {
                 continue;
             }
             let signaled = ctx
-                .device
                 .get_fence_status(self.slots[index].fence)
                 .map_err(|e| Self::wait_error(counters, e, status_op))?;
             if !signaled {
@@ -1458,12 +1456,9 @@ impl ResourcePools {
             // Count as a "block" only when the fence is genuinely unsignaled
             // (the GPU still owns the slot); reclaiming a finished slot on
             // advance is bookkeeping, not a stall.
-            let still_running = !ctx
-                .device
-                .get_fence_status(self.slots[next].fence)
-                .map_err(|e| {
-                    Self::wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry)
-                })?;
+            let still_running = !ctx.get_fence_status(self.slots[next].fence).map_err(|e| {
+                Self::wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry)
+            })?;
             self.retire_slot(ctx, counters, next)?;
             if still_running {
                 counters.ring_retire_blocks.fetch_add(1, Ordering::Relaxed);
@@ -2005,7 +2000,7 @@ impl ResourcePools {
             ));
         }
         let wait_started = std::time::Instant::now();
-        let waited = ctx.device.wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS);
+        let waited = ctx.wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS);
         crate::runtime::drain::stall::note_stall_since(
             crate::runtime::drain::stall::Stall::EntryWait,
             wait_started,
@@ -7003,10 +6998,12 @@ fn exchange_rb_into(src: &[u8], dst: &mut [u8]) {
     let n = src.len().min(dst.len());
     let whole = n / 4 * 4;
     for (s, d) in src[..whole]
-        .chunks_exact(4)
-        .zip(dst[..whole].chunks_exact_mut(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(dst[..whole].as_chunks_mut::<4>().0)
     {
-        d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
+        *d = [s[2], s[1], s[0], s[3]];
     }
     dst[whole..n].copy_from_slice(&src[whole..n]);
 }

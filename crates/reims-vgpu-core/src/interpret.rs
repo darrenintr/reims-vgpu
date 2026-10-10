@@ -704,6 +704,7 @@ mod tests {
 
     fn res(slot: u32) -> ResourceId {
         ResourceId {
+            task: crate::identity::TaskId(1),
             slot: ObjectListRef(slot),
             generation: SlotGeneration(1),
         }
@@ -1721,6 +1722,7 @@ mod tests {
         let task = TaskId(1);
         let backing = BackingId(10);
         let resource = ResourceId {
+            task: crate::identity::TaskId(1),
             slot: ObjectListRef(0),
             generation: SlotGeneration::default().next(),
         };

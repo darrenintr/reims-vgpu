@@ -626,7 +626,7 @@ pub fn bgra_rgb_stats(bgra: &[u8]) -> (usize, u8, [u8; 4]) {
     } else {
         [0, 0, 0, 0]
     };
-    for px in bgra.chunks_exact(4) {
+    for px in bgra.as_chunks::<4>().0 {
         let m = px[0].max(px[1]).max(px[2]);
         if m != 0 {
             rgb_nz += 1;
@@ -678,7 +678,7 @@ pub fn bgra_present_stats_scalar(bgra: &[u8]) -> (usize, u8, usize, u8, [u8; 4])
     } else {
         [0, 0, 0, 0]
     };
-    for px in bgra.chunks_exact(4) {
+    for px in bgra.as_chunks::<4>().0 {
         // Per-byte nonzero/max across all four channels (== nonzero_stats over
         // a length that is a multiple of 4; the present frame always is).
         for &b in px {
@@ -771,7 +771,7 @@ unsafe fn bgra_present_stats_sse2(bgra: &[u8]) -> (usize, u8, usize, u8, [u8; 4]
         let rgb_zeros = (z32[0] + z32[1] + z32[2] + z32[3]) as usize;
         let mut rgb_nz = n / 4 - rgb_zeros;
         // Scalar tail (frame length is a multiple of 4 but not always of 16).
-        for px in bgra[n..].chunks_exact(4) {
+        for px in bgra[n..].as_chunks::<4>().0 {
             for &b in px {
                 if b != 0 {
                     byte_nz += 1;
@@ -820,7 +820,7 @@ pub fn rgba_rgb_stats(rgba: &[u8]) -> RgbaRgbStats {
     } else {
         [0, 0, 0, 0]
     };
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         let m = px[0].max(px[1]).max(px[2]);
         if m != 0 {
             rgb_nz += 1;
@@ -1065,7 +1065,7 @@ mod tests {
     fn bgra_rgb_stats_black_alpha_full_is_zero_rgb_nz() {
         // Solid black opaque: every A byte is 255 → byte nz is full, rgb_nz must be 0.
         let mut bgra = vec![0u8; 16];
-        for px in bgra.chunks_exact_mut(4) {
+        for px in bgra.as_chunks_mut::<4>().0 {
             px[3] = 255;
         }
         let (byte_nz, _) = nonzero_stats(&bgra);
@@ -1141,7 +1141,7 @@ mod tests {
     fn a_flat_white_surface_is_distinguishable_from_a_painted_one_only_by_the_mean() {
         let white = vec![0xff_u8; 4 * 64];
         let mut painted = vec![0u8; 4 * 64];
-        for (i, px) in painted.chunks_exact_mut(4).enumerate() {
+        for (i, px) in painted.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             // Values in this rail's painted range, varied so the buffer is not
             // itself flat -- a flat grey would make the test pass for the wrong
             // reason.

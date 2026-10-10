@@ -1181,6 +1181,7 @@ mod tests {
 
     fn id(slot: u32) -> ResourceId {
         ResourceId {
+            task: reims_vgpu_core::identity::TaskId(0),
             slot: ObjectListRef(slot),
             generation: SlotGeneration(1),
         }
@@ -2616,6 +2617,7 @@ mod cache_tests {
             array_length: 1,
         };
         descriptor.color[0].texture = Some(ResourceId {
+            task: reims_vgpu_core::identity::TaskId(0),
             slot: ObjectListRef(1),
             generation: SlotGeneration(1),
         });

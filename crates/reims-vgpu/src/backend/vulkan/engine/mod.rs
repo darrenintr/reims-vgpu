@@ -510,8 +510,12 @@ mod tail_reopen_band_tests {
     }
 }
 
-fn end_of_tranche_requires_engine(batch_open: bool, device_lost: bool) -> bool {
-    batch_open || device_lost
+fn end_of_tranche_requires_engine(
+    batch_open: bool,
+    device_lost: bool,
+    guest_writes_outstanding: bool,
+) -> bool {
+    batch_open || device_lost || guest_writes_outstanding
 }
 
 /// Lock-free publication of the immutable answers attached to the current
@@ -1141,6 +1145,7 @@ pub fn flush_batched_draws(state: &crate::model::DeviceState) {
     if !end_of_tranche_requires_engine(
         BATCH_OPEN.load(std::sync::atomic::Ordering::Acquire),
         device_lost::device_lost_seen(),
+        guest_writes_outstanding(),
     ) {
         return;
     }
@@ -1196,7 +1201,7 @@ fn flush_batched_draws_with(caches: &mut ObjectCaches) {
             call_started.elapsed().as_micros() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
-        match result {
+        let lost = match result {
             Ok(()) if had_batch => {
                 counters
                     .batch_tail_flushes
@@ -1213,7 +1218,11 @@ fn flush_batched_draws_with(caches: &mut ObjectCaches) {
                 crate::observe::Emit::decline("vk_batch_flush", &e).fail_once(0);
                 lost
             }
+        };
+        if !lost {
+            retire_landed_guest_writes(ctx, pools);
         }
+        lost
     };
     // "A lost device surfaces again on the next draw" is only true while draws
     // keep coming, and a device loss is one of the things that stops them.
@@ -1227,11 +1236,12 @@ mod end_of_tranche_gate_tests {
     use super::end_of_tranche_requires_engine;
 
     #[test]
-    fn only_owned_batch_or_recovery_work_enters_the_engine() {
-        assert!(!end_of_tranche_requires_engine(false, false));
-        assert!(end_of_tranche_requires_engine(true, false));
-        assert!(end_of_tranche_requires_engine(false, true));
-        assert!(end_of_tranche_requires_engine(true, true));
+    fn only_owned_batch_recovery_or_write_retirement_enters_the_engine() {
+        assert!(!end_of_tranche_requires_engine(false, false, false));
+        assert!(end_of_tranche_requires_engine(true, false, false));
+        assert!(end_of_tranche_requires_engine(false, true, false));
+        assert!(end_of_tranche_requires_engine(false, false, true));
+        assert!(end_of_tranche_requires_engine(true, true, true));
     }
 }
 
@@ -1332,6 +1342,21 @@ static GUEST_WRITE_PAGES: std::sync::Mutex<GuestWriteFootprint> =
         allocations: Vec::new(),
     });
 
+/// One outstanding write's pages, and how far the completion timeline must get
+/// before they have landed.
+///
+/// `bound` is `None` until the end of the drain tranche that recorded the write,
+/// and then the highest timeline point reserved at that moment. Every command
+/// buffer is submitted by then — the tranche ends by flushing the open batch,
+/// and every other recording is submitted inside the engine-locked call that
+/// made it — so the write rides on a point at or below that value. It is an
+/// upper bound, which is the safe direction: the entry can only outlive its
+/// write, never be retired before it.
+struct ArmedWrite<T> {
+    pages: T,
+    bound: Option<u64>,
+}
+
 /// The page lists behind [`GUEST_WRITE_PAGES`].
 struct GuestWriteFootprint {
     /// One entry per outstanding writeback, each ascending and deduplicated.
@@ -1349,13 +1374,42 @@ struct GuestWriteFootprint {
     /// the overflow that is now a merge, and the only other way to lose the
     /// ledger — a poisoned mutex — already answers `Unnamed` at every ask
     /// without one.
-    armed: Vec<Vec<u64>>,
+    armed: Vec<ArmedWrite<Vec<u64>>>,
     /// Resource-owned allocation footprints. A repeated Store into the same
     /// admitted resident retains one immutable identity here rather than
     /// copying and sorting its full page list again. These need no artificial
     /// entry cap: each is a small `Arc`-backed handle, and the same global
     /// settle that clears `armed` clears them all.
-    allocations: Vec<crate::runtime::guest_ram::GuestPageFootprint>,
+    allocations: Vec<ArmedWrite<crate::runtime::guest_ram::GuestPageFootprint>>,
+}
+
+impl GuestWriteFootprint {
+    fn is_empty(&self) -> bool {
+        self.armed.is_empty() && self.allocations.is_empty()
+    }
+
+    /// Tag every write recorded since the last call with `reserved`, then drop
+    /// every write whose bound the timeline has reached. Returns how many
+    /// entries were dropped.
+    ///
+    /// `completed` is `None` when the timeline could not be read; nothing is
+    /// retired then, because nothing is known to have landed.
+    fn retire_through(&mut self, reserved: u64, completed: Option<u64>) -> usize {
+        for a in &mut self.armed {
+            a.bound.get_or_insert(reserved);
+        }
+        for a in &mut self.allocations {
+            a.bound.get_or_insert(reserved);
+        }
+        let Some(completed) = completed else {
+            return 0;
+        };
+        let landed = |bound: Option<u64>| matches!(bound, Some(b) if b <= completed);
+        let before = self.armed.len() + self.allocations.len();
+        self.armed.retain(|a| !landed(a.bound));
+        self.allocations.retain(|a| !landed(a.bound));
+        before - self.armed.len() - self.allocations.len()
+    }
 }
 
 /// Whether an outstanding guest-page write reaches a set of pages.
@@ -1383,14 +1437,102 @@ fn arm_guest_write_pages(pages: &[u64]) {
     // panic here would protect is a bound this function does not own.
     if f.armed.len() >= pools::RING_DEPTH {
         if let Some(oldest) = f.armed.first_mut() {
-            oldest.extend_from_slice(&sorted);
-            oldest.sort_unstable();
-            oldest.dedup();
+            oldest.pages = merge_ascending(&oldest.pages, &sorted);
+            // Part of it is this unsubmitted write now, so it waits for the
+            // tag the next tranche end gives it.
+            oldest.bound = None;
             crate::runtime::drain::note_store_route("gwdebt_merged");
             return;
         }
     }
-    f.armed.push(sorted);
+    f.armed.push(ArmedWrite {
+        pages: sorted,
+        bound: None,
+    });
+}
+
+/// The ascending, deduplicated union of two ascending, deduplicated lists.
+///
+/// One linear pass. The fold used to append and re-sort the oldest entry, which
+/// is the whole accumulated list per write.
+fn merge_ascending(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => {
+                out.push(a[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.push(b[j]);
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+    out
+}
+
+#[cfg(test)]
+mod ledger_retirement_tests {
+    use super::{ArmedWrite, GuestWriteFootprint};
+
+    fn ledger(bounds: &[Option<u64>]) -> GuestWriteFootprint {
+        GuestWriteFootprint {
+            armed: bounds
+                .iter()
+                .map(|&bound| ArmedWrite {
+                    pages: vec![0x1000],
+                    bound,
+                })
+                .collect(),
+            allocations: Vec::new(),
+        }
+    }
+
+    /// A write recorded this tranche is tagged with the reservation high-water
+    /// and kept until the timeline reaches it; one tagged earlier and already
+    /// reached is dropped.
+    #[test]
+    fn an_entry_is_retired_only_once_the_timeline_passes_its_bound() {
+        let mut f = ledger(&[Some(3), None]);
+        assert_eq!(f.retire_through(7, Some(5)), 1, "the bound-3 write landed");
+        assert_eq!(f.armed.len(), 1);
+        assert_eq!(f.armed[0].bound, Some(7), "the fresh write is bounded by 7");
+        assert_eq!(f.retire_through(9, Some(6)), 0, "6 has not reached 7");
+        assert_eq!(f.retire_through(9, Some(7)), 1);
+        assert!(f.is_empty());
+    }
+
+    /// An unreadable timeline proves nothing landed.
+    #[test]
+    fn nothing_retires_without_a_timeline_reading() {
+        let mut f = ledger(&[Some(1)]);
+        assert_eq!(f.retire_through(4, None), 0);
+        assert!(!f.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod merge_ascending_tests {
+    use super::merge_ascending;
+
+    #[test]
+    fn the_fold_is_the_sorted_union_without_duplicates() {
+        assert_eq!(
+            merge_ascending(&[1, 4, 9], &[2, 4, 10, 11]),
+            vec![1, 2, 4, 9, 10, 11]
+        );
+        assert_eq!(merge_ascending(&[], &[3]), vec![3]);
+        assert_eq!(merge_ascending(&[5], &[]), vec![5]);
+    }
 }
 
 /// Record one resource-owned allocation that an outstanding GPU Store writes.
@@ -1399,13 +1541,20 @@ fn arm_guest_write_footprint(footprint: &crate::runtime::guest_ram::GuestPageFoo
     let Ok(mut f) = GUEST_WRITE_PAGES.lock() else {
         return;
     };
-    if f.allocations
-        .iter()
-        .any(|held| held.same_allocation(footprint))
+    if let Some(held) = f
+        .allocations
+        .iter_mut()
+        .find(|held| held.pages.same_allocation(footprint))
     {
+        // A newer write into a held allocation: its old bound no longer covers
+        // this one, so it waits for a fresh tag.
+        held.bound = None;
         return;
     }
-    f.allocations.push(footprint.clone());
+    f.allocations.push(ArmedWrite {
+        pages: footprint.clone(),
+        bound: None,
+    });
 }
 
 /// Forget the outstanding writebacks' pages. Called under the engine lock, after
@@ -1429,7 +1578,7 @@ pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
     let Ok(f) = GUEST_WRITE_PAGES.lock() else {
         return GuestWriteReach::Unnamed;
     };
-    if f.armed.is_empty() && f.allocations.is_empty() {
+    if f.is_empty() {
         // The flag said something was outstanding and the ledger names nothing:
         // the settle that cleared it raced this ask. Nothing to rule out
         // against, so nothing may be ruled out.
@@ -1452,7 +1601,7 @@ pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
     };
     let hi = pages.iter().max().copied().unwrap_or(lo);
     let disjoint_span = |(a_lo, a_hi): (u64, u64)| a_hi < lo || a_lo > hi;
-    let hit = f.armed.iter().any(|a| {
+    let hit = f.armed.iter().map(|a| &a.pages).any(|a| {
         // Ascending and deduplicated at arm time, so the span is the ends.
         match (a.first(), a.last()) {
             (Some(&a_lo), Some(&a_hi)) if !disjoint_span((a_lo, a_hi)) => {
@@ -1460,14 +1609,115 @@ pub fn guest_writes_reaching(pages: &[u64]) -> GuestWriteReach {
             }
             _ => false,
         }
-    }) || f.allocations.iter().any(|a| match a.page_span() {
-        Some(span) if !disjoint_span(span) => pages.iter().any(|p| a.contains_page(*p)),
-        _ => false,
-    });
+    }) || f
+        .allocations
+        .iter()
+        .map(|a| &a.pages)
+        .any(|a| match a.page_span() {
+            Some(span) if !disjoint_span(span) => pages.iter().any(|p| a.contains_page(*p)),
+            _ => false,
+        });
     if hit {
         GuestWriteReach::Overlap
     } else {
         GuestWriteReach::Disjoint
+    }
+}
+
+/// Retire the outstanding-write ledger once everything that could carry one of
+/// its writes has executed, without waiting for it.
+///
+/// [`quiesce_guest_writes`] is the only other thing that clears the ledger, and
+/// it blocks, so it runs only where a reader insists. Between two of those the
+/// ledger used to keep every page any GPU write had ever named: entries were
+/// never retired when their submission landed, and past [`pools::RING_DEPTH`]
+/// each new write folded into the oldest entry. The result grew with uptime in
+/// both directions that matter — the fold cost more per write, and readers whose
+/// pages had been written seconds earlier were still told `Overlap` and made to
+/// settle. A driven Safari animation fell from 31-39 to 17-30 presents/s over
+/// four minutes of one boot while the stamp hold time climbed from 1.1 to 4.5 ms.
+///
+/// The test is the same conclusion the blocking settle reaches, asked without
+/// blocking: no batch is still recording (every other command buffer is
+/// recorded and submitted inside one engine-locked call, and this holds that
+/// lock), and the completion timeline has passed every point reserved — which
+/// every guest-memory submission takes. Then every recorded write has landed.
+fn retire_landed_guest_writes(ctx: &context::DeviceContext, pools: &mut pools::ResourcePools) {
+    use std::sync::atomic::Ordering;
+    if !GUEST_WRITE_DEBT.load(Ordering::Acquire) || pools.batch_open_recording().is_some() {
+        return;
+    }
+    let Some(completion) = ctx.stamp_completion.as_ref() else {
+        return;
+    };
+    let (reserved, completed) = completion.timeline_progress(&ctx.device);
+    let (retired, emptied, entries) = {
+        let Ok(mut f) = GUEST_WRITE_PAGES.lock() else {
+            return;
+        };
+        let retired = f.retire_through(reserved, completed);
+        (retired, f.is_empty(), f.armed.len() + f.allocations.len())
+    };
+    if emptied {
+        // Ledger first, then the flag: a reader between the two sees the flag
+        // with an empty ledger and is answered `Unnamed`, which settles.
+        pools.take_guest_write_debt();
+        GUEST_WRITE_DEBT.store(false, Ordering::Release);
+    }
+    ledger_census::note(retired, emptied, entries);
+}
+
+/// Once a second: how many ledger entries the timeline retired, how often the
+/// ledger emptied, and how many entries were left. Observation only.
+mod ledger_census {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    struct Window {
+        since: Option<Instant>,
+        retired: u64,
+        emptied: u64,
+        checks: u64,
+        max_entries: usize,
+    }
+
+    static WINDOW: Mutex<Window> = Mutex::new(Window {
+        since: None,
+        retired: 0,
+        emptied: 0,
+        checks: 0,
+        max_entries: 0,
+    });
+
+    pub(super) fn note(retired: usize, emptied: bool, entries: usize) {
+        let now = Instant::now();
+        let mut w = WINDOW.lock().unwrap_or_else(|p| p.into_inner());
+        w.retired += retired as u64;
+        w.emptied += u64::from(emptied);
+        w.checks += 1;
+        w.max_entries = w.max_entries.max(entries);
+        let since = *w.since.get_or_insert(now);
+        let elapsed = now.saturating_duration_since(since);
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        let line = format!(
+            "guest_write_ledger window_ms={} checks={} retired={} emptied={} max_entries={}",
+            elapsed.as_millis(),
+            w.checks,
+            w.retired,
+            w.emptied,
+            w.max_entries
+        );
+        *w = Window {
+            since: Some(now),
+            retired: 0,
+            emptied: 0,
+            checks: 0,
+            max_entries: 0,
+        };
+        drop(w);
+        crate::observe::off(line);
     }
 }
 
@@ -3064,7 +3314,8 @@ unsafe fn copy_image_level0_to_host_delivered(
         pools.finish_entry_async(&ctx.device, sealed);
     }
     pools.wait_entry_fence(ctx, counters, fence)?;
-    let out = match lease.disarm() {
+
+    match lease.disarm() {
         // The mapping is already established for the slot's lifetime, so all
         // this owes is the invalidate a non-coherent readback owes any reader.
         // What `ReadbackPhase::Map` measures on this arm is therefore that call
@@ -3105,8 +3356,7 @@ unsafe fn copy_image_level0_to_host_delivered(
         },
         None => pools::read_back_slot(ctx, &readback, rb_size, ops.map, ops.invalidate)
             .map(ReadbackResult::Copied),
-    };
-    out
+    }
 }
 
 /// A resident target's pixels plus the physical channel order they came out in.
@@ -3184,7 +3434,7 @@ impl TargetReadback {
             ReadbackTexel::Native(_) => None,
             ReadbackTexel::Rgba8 => Some(self.pixels),
             ReadbackTexel::Bgra8 => {
-                for px in self.pixels.chunks_exact_mut(4) {
+                for px in self.pixels.as_chunks_mut::<4>().0 {
                     px.swap(0, 2);
                 }
                 Some(self.pixels)
@@ -3204,7 +3454,7 @@ impl TargetReadback {
             ReadbackTexel::Native(_) => None,
             ReadbackTexel::Bgra8 => Some(self.pixels),
             ReadbackTexel::Rgba8 => {
-                for px in self.pixels.chunks_exact_mut(4) {
+                for px in self.pixels.as_chunks_mut::<4>().0 {
                     px.swap(0, 2);
                 }
                 Some(self.pixels)
@@ -5326,7 +5576,6 @@ pub fn warm_guest_ram_imports(
     };
     let mut warmed = 0usize;
     let mut bytes = 0u64;
-    let mut refused_backing = None;
     for import in imports {
         match unsafe { pools.warm_guest_ram(ctx, import) } {
             Ok(true) => {
@@ -5335,32 +5584,14 @@ pub fn warm_guest_ram_imports(
             }
             Ok(false) => {}
             // The draw path asks again and declines there with the same reason,
-            // so a decline here is reported and not propagated: a warm that
-            // could not import must not by itself decide the rail is off.
+            // so a decline here is reported and not propagated. The one decline
+            // that does decide the rail — a RAMBlock whose backing the driver
+            // refuses — is withdrawn by the import itself, wherever it is first
+            // attempted (`host_ram::withdraw_if_backing_refused`).
             Err(inner) => {
                 crate::observe::Emit::decline("vk_guest_ram_warm", &inner).fail_once(0);
-                if import.gpa_base().is_some() && inner.refuses_the_backing() {
-                    refused_backing = Some(inner);
-                }
             }
         }
-    }
-    drop(guard);
-    // The one decline that does decide it. A RAMBlock whose backing the driver
-    // refuses outright leaves the map holding references into an import that
-    // will never exist, beside others (the BAR) that do: the partial import
-    // `guest_ram_map` documents as a hard error at the writeback sites rather
-    // than a fallback. On RADV with memfd-backed guest RAM that was a compute
-    // storage output the engine reported as landed in guest pages and the guest
-    // read as zeros — an iOS Simulator whose every pixel stayed transparent.
-    // Withdrawing the limits this backend published, and the map built on them,
-    // puts the boot on the copying rails, the state `REIMS_VGPU_GUEST_IMPORT=off`
-    // reaches by hand.
-    if let Some(inner) = refused_backing {
-        crate::runtime::guest_ram::forget_import_limits();
-        crate::runtime::guest_ram_map::reset();
-        crate::observe::Emit::decline("vk_guest_import_withdrawn", &inner).fail();
-        return (0, 0);
     }
     (warmed, bytes)
 }
@@ -6038,7 +6269,7 @@ pub fn reset_draw_counters() {
 pub fn test_reset_engine(state: &crate::model::DeviceState) {
     device_caches(state)
         .expect("this rail holds the slot")
-        .with(|caches| test_reset_engine_with(caches));
+        .with(test_reset_engine_with);
 }
 
 fn test_reset_engine_with(caches: &mut ObjectCaches) {

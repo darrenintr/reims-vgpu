@@ -3138,7 +3138,12 @@ impl RowToRgba8 {
         match self {
             Self::Rgba8 => dst.copy_from_slice(src),
             Self::Bgra8 => {
-                for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                for (s, d) in src
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+                {
                     d[COMPONENT_R] = s[2];
                     d[COMPONENT_G] = s[1];
                     d[COMPONENT_B] = s[0];
@@ -3146,14 +3151,14 @@ impl RowToRgba8 {
                 }
             }
             Self::A8 => {
-                for (s, d) in src.iter().zip(dst.chunks_exact_mut(4)) {
+                for (s, d) in src.iter().zip(dst.as_chunks_mut::<4>().0.iter_mut()) {
                     let mut px = [0u8; 4];
                     px[COMPONENT_A] = *s;
                     d.copy_from_slice(&px);
                 }
             }
             Self::R8 => {
-                for (s, d) in src.iter().zip(dst.chunks_exact_mut(4)) {
+                for (s, d) in src.iter().zip(dst.as_chunks_mut::<4>().0.iter_mut()) {
                     let mut px = [0u8; 4];
                     px[COMPONENT_R] = *s;
                     px[COMPONENT_A] = UNORM8_MAX;
@@ -3161,7 +3166,12 @@ impl RowToRgba8 {
                 }
             }
             Self::Rg8 => {
-                for (s, d) in src.chunks_exact(2).zip(dst.chunks_exact_mut(4)) {
+                for (s, d) in src
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+                {
                     let mut px = [0u8; 4];
                     px[COMPONENT_R] = s[0];
                     px[COMPONENT_G] = s[1];
@@ -3171,7 +3181,12 @@ impl RowToRgba8 {
             }
             Self::Rgba16Float => {
                 let lut = f16_to_unorm8_lut();
-                for (s, d) in src.chunks_exact(8).zip(dst.chunks_exact_mut(4)) {
+                for (s, d) in src
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+                {
                     d[COMPONENT_R] = lut[ld16(&s[0..2]) as usize];
                     d[COMPONENT_G] = lut[ld16(&s[2..4]) as usize];
                     d[COMPONENT_B] = lut[ld16(&s[4..6]) as usize];
@@ -3180,7 +3195,12 @@ impl RowToRgba8 {
             }
             Self::Rg16Float => {
                 let lut = f16_to_unorm8_lut();
-                for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                for (s, d) in src
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+                {
                     let mut px = [0u8; 4];
                     px[COMPONENT_R] = lut[ld16(&s[0..2]) as usize];
                     px[COMPONENT_G] = lut[ld16(&s[2..4]) as usize];
@@ -3341,7 +3361,12 @@ impl Rgba8ToRow {
         match self {
             Self::Rgba8 => dst.copy_from_slice(src),
             Self::Bgra8 => {
-                for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                for (s, d) in src
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+                {
                     d[0] = s[COMPONENT_B];
                     d[1] = s[COMPONENT_G];
                     d[2] = s[COMPONENT_R];
@@ -3349,26 +3374,41 @@ impl Rgba8ToRow {
                 }
             }
             Self::R8 => {
-                for (s, d) in src.chunks_exact(4).zip(dst.iter_mut()) {
+                for (s, d) in src.as_chunks::<4>().0.iter().zip(dst.iter_mut()) {
                     *d = s[COMPONENT_R];
                 }
             }
             Self::R16Float => {
                 let lut = unorm8_to_f16_lut();
-                for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(2)) {
+                for (s, d) in src
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(dst.as_chunks_mut::<2>().0.iter_mut())
+                {
                     st16(d, lut[s[COMPONENT_R] as usize]);
                 }
             }
             Self::Rg16Float => {
                 let lut = unorm8_to_f16_lut();
-                for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                for (s, d) in src
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+                {
                     st16(&mut d[0..2], lut[s[COMPONENT_R] as usize]);
                     st16(&mut d[2..4], lut[s[COMPONENT_G] as usize]);
                 }
             }
             Self::Rgba16Float => {
                 let lut = unorm8_to_f16_lut();
-                for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(8)) {
+                for (s, d) in src
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(dst.as_chunks_mut::<8>().0.iter_mut())
+                {
                     let r = u64::from(lut[s[COMPONENT_R] as usize]);
                     let g = u64::from(lut[s[COMPONENT_G] as usize]);
                     let b = u64::from(lut[s[COMPONENT_B] as usize]);
@@ -3377,7 +3417,12 @@ impl Rgba8ToRow {
                 }
             }
             Self::Bgr10A2 => {
-                for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                for (s, d) in src
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+                {
                     let mut texel = [0u8; 4];
                     texel.copy_from_slice(s);
                     d.copy_from_slice(&rgba8_to_bgr10a2_word(texel).to_le_bytes());
@@ -3486,11 +3531,14 @@ mod tests {
         assert_eq!(img.len(), 37 * 11 * RGBA8_BPP as usize);
         let expect = [UNORM8_MAX, UNORM8_MIN, f64_to_unorm8(0.5), UNORM8_MAX];
         assert!(
-            img.chunks_exact(RGBA8_BPP as usize).all(|t| t == expect),
+            img.as_chunks::<{ RGBA8_BPP as usize }>()
+                .0
+                .iter()
+                .all(|t| *t == expect),
             "a texel was left unwritten, so the fill and the length disagree"
         );
         assert_eq!(
-            img.chunks_exact(RGBA8_BPP as usize).count(),
+            img.as_chunks::<{ RGBA8_BPP as usize }>().0.len(),
             37 * 11,
             "the buffer holds a whole number of texels and exactly w*h of them"
         );

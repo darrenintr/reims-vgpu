@@ -145,6 +145,19 @@ pub struct ReimsVgpuHostOps {
     >,
     pub page_alias_census:
         Option<unsafe extern "C" fn(ctx: *mut c_void, out: *mut PageAliasCensus) -> i32>,
+    /// The file and offset backing guest RAM at `[host_va, host_va + len)`:
+    /// 0 with `fd`/`offset` written, `REIMS_VGPU_GUEST_RAM_FD_NONE` for RAM no
+    /// file backs, `REIMS_VGPU_GUEST_RAM_ERR_ARGS` for a range that is not
+    /// wholly inside one RAMBlock. The descriptor is lent, never given.
+    pub guest_ram_fd: Option<
+        unsafe extern "C" fn(
+            ctx: *mut c_void,
+            host_va: u64,
+            len: u64,
+            fd: *mut c_int,
+            offset: *mut u64,
+        ) -> c_int,
+    >,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -181,6 +194,7 @@ impl ReimsVgpuHostOps {
             guest_write_gen: None,
             guest_written_pages: None,
             page_alias_census: None,
+            guest_ram_fd: None,
             is_ram_gpa: None,
             guest_ram_regions: None,
             notify_actions: None,
@@ -669,6 +683,23 @@ impl HostOps for QemuHost<'_> {
         }
         buf.truncate(total);
         Ok(buf)
+    }
+
+    fn guest_ram_fd(
+        &mut self,
+        host_va: u64,
+        len: u64,
+    ) -> Option<crate::runtime::guest_ram::FdBacking> {
+        let f = self.ops.guest_ram_fd?;
+        let mut fd: c_int = -1;
+        let mut offset = 0u64;
+        // SAFETY: QEMU owns ctx for the device lifetime; both out-pointers are
+        // valid writable locals for the duration of the call.
+        let rc = unsafe { f(self.ops.ctx, host_va, len, &mut fd, &mut offset) };
+        // Anything but success is "no file to import": RAM with no file behind
+        // it, or a range the shim would not vouch for. Either way the
+        // host-pointer import is still the rail, so nothing is reported here.
+        (rc == 0 && fd >= 0).then_some(crate::runtime::guest_ram::FdBacking { fd, offset })
     }
 
     fn unmap_pages(&mut self, ptr: usize, len: usize) {

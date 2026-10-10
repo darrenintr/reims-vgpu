@@ -583,6 +583,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         ComputeSampledImageResource, ComputeSampledSource, ComputeStorageImageResource, DrawError,
     };
 
+    let mut timing = super::timing::DispatchTiming::new();
     if acc.pipeline_ref == 0 {
         return ComputeStatus::MissingPipeline("compute_vk_pipeline_ref_zero");
     }
@@ -782,6 +783,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     // has staged successfully. A bind reflection calls `Unused` or does not
     // declare is skipped before resolving its descriptor, walking its pages, or
     // allocating its staging Vec.
+    timing.enter(super::timing::Phase::Stage);
     let mut staged_bufs: Vec<StagedBuffer> = Vec::with_capacity(acc.buffers.len());
     let mut buffer_accesses = Vec::with_capacity(acc.buffers.len());
     let mut buffer_readonly_count = 0usize;
@@ -1041,6 +1043,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
             writable: *writable,
         });
     }
+    timing.enter(super::timing::Phase::Plan);
     let mut sampled_images = Vec::with_capacity(sampled_count);
     let mut storage_images = Vec::with_capacity(storage_count);
     let mut storage_formats = Vec::with_capacity(storage_count);
@@ -1420,6 +1423,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         );
         vk_engine::execute_compute_request(device, req)
     };
+    timing.enter(super::timing::Phase::Engine);
     let out_result = run_engine(&req);
     let out = match out_result {
         Ok(o) => o,
@@ -1434,6 +1438,26 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
             return ComputeStatus::MetalFailed("compute_vk_engine_run");
         }
     };
+    timing.enter(super::timing::Phase::Writeback);
+    let host_bytes = out
+        .buffers
+        .iter()
+        .map(|buffer| buffer.bytes.len() as u64)
+        .chain(
+            out.images
+                .iter()
+                .filter_map(|image| image.bytes().map(|bytes| bytes.len() as u64)),
+        )
+        .fold(0u64, u64::saturating_add);
+    let direct_bytes = out
+        .images
+        .iter()
+        .filter_map(|image| match image {
+            ComputeImageResult::Landed { bytes } => Some(*bytes),
+            _ => None,
+        })
+        .fold(0u64, u64::saturating_add);
+    timing.outputs(host_bytes, direct_bytes);
     if out.buffers.len() != buffer_writable_count || out.images.len() != storage_count {
         crate::observe::fail(format!(
             "compute_linux readback count mismatch pipe={} buf={}/{} img={}/{}",
@@ -1566,6 +1590,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         staged_tex.len(),
     )
     });
+    timing.complete();
     ComputeStatus::Ok
 }
 
@@ -1698,7 +1723,9 @@ pub(super) fn spirv_words_le(bytes: &[u8]) -> Result<Vec<u32>, ComputeSpirvDecli
         });
     }
     Ok(bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
 }

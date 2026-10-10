@@ -68,7 +68,7 @@ fn resident_target_backing_with(
                 return Retention::Warm(lease.backing());
             }
             // An engine reset invalidates the lease under this exact identity,
-            // but another identity is another child resource, not a
+            // but another identity is usually another child resource, not a
             // replacement. A texture can own several views/surfaces
             // concurrently.
             held.0.remove(identity);
@@ -79,6 +79,16 @@ fn resident_target_backing_with(
                 .unwrap_or(ResidentContentBacking::NotReady);
             if let Some(lease) = acquired {
                 held.0.insert(identity.clone(), lease);
+            }
+            // The exception is an older generation of the same surface: its
+            // pages were recycled, so its lease would pin a resident nothing can
+            // ask for again for as long as the resource lives. Released after
+            // the acquisition, so the new generation resolves while the old
+            // resident is still held.
+            let before = held.0.len();
+            held.0.retain(|older, _| !identity.supersedes(older));
+            for _ in held.0.len()..before {
+                crate::runtime::drain::note_store_route("resident_lease_superseded");
             }
             Retention::Acquired(backing)
         })
@@ -109,12 +119,26 @@ mod tests {
     use super::*;
     use crate::runtime::decode::resource::ListObjectEntry;
     use std::cell::Cell;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    /// These tests read process-wide census counters and advance the global
+    /// resident epoch, so two of them running at once read each other's work.
+    static LEASE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        LEASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
 
     fn identity(generation: u64) -> TargetIdentity {
+        surface(9, 64, generation)
+    }
+
+    fn surface(id: u32, width: u32, generation: u64) -> TargetIdentity {
         TargetIdentity::Surface {
-            id: 9,
-            width: 64,
+            id,
+            width,
             height: 32,
             generation,
             format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
@@ -123,6 +147,7 @@ mod tests {
 
     #[test]
     fn a_resource_retains_each_child_identity_until_the_resource_ends() {
+        let _serial = serial();
         let resource = TaskResource::new(ListObjectEntry::default(), Arc::from([]));
         let first = identity(1);
         let acquisitions = Cell::new(0_u32);
@@ -179,20 +204,28 @@ mod tests {
             "a new mapping generation reacquires once"
         );
 
+        let other_surface = surface(10, 64, 1);
+        resident_target_backing_with(&resource, &other_surface, |identity| {
+            acquisitions.set(acquisitions.get() + 1);
+            Some(ResidentResourceLease::test_new(
+                identity.clone(),
+                ResidentContentBacking::GuestAllocation,
+            ))
+        });
         assert_eq!(
-            resident_target_backing_with(&resource, &first, |_| {
-                panic!("adding a child identity must not evict the first child")
+            resident_target_backing_with(&resource, &replacement, |_| {
+                panic!("adding another surface must not evict the first one")
             }),
-            ResidentContentBacking::DeviceAllocation
+            ResidentContentBacking::GuestAllocation
         );
         assert_eq!(
             acquisitions.get(),
-            3,
+            4,
             "both child identities remain retained"
         );
         assert_eq!(
             crate::runtime::drain::census::store_route_count("resident_resource_acquired"),
-            acquired_before + 3
+            acquired_before + 4
         );
 
         // The synthetic leases have no registry pins behind them. Make the
@@ -202,6 +235,7 @@ mod tests {
 
     #[test]
     fn an_unavailable_target_is_counted_and_retried() {
+        let _serial = serial();
         let resource = TaskResource::new(ListObjectEntry::default(), Arc::from([]));
         let unavailable_before =
             crate::runtime::drain::census::store_route_count("resident_resource_unavailable");
@@ -220,6 +254,77 @@ mod tests {
         assert_eq!(
             crate::runtime::drain::census::store_route_count("resident_resource_unavailable"),
             unavailable_before + 2
+        );
+    }
+
+    /// #111: a long-lived resource whose surface pages are recycled acquired a
+    /// lease per generation and kept every one, so `pinned` grew with uptime on
+    /// an idle desktop. A new generation of the same surface now releases the
+    /// lease on the old one.
+    #[test]
+    fn a_new_surface_generation_releases_the_old_generations_lease() {
+        let _serial = serial();
+        let resource = TaskResource::new(ListObjectEntry::default(), Arc::from([]));
+        let superseded_before =
+            crate::runtime::drain::census::store_route_count("resident_lease_superseded");
+        let acquire = |identity: &TargetIdentity| {
+            Some(ResidentResourceLease::test_new(
+                identity.clone(),
+                ResidentContentBacking::GuestAllocation,
+            ))
+        };
+        for generation in 1..=20 {
+            resident_target_backing_with(&resource, &identity(generation), acquire);
+        }
+        let held = resource
+            .with_rail_state(|held: &mut ResidentTargets| {
+                held.0.keys().cloned().collect::<Vec<_>>()
+            })
+            .expect("this rail owns the slot");
+        assert_eq!(
+            held,
+            vec![identity(20)],
+            "only the current generation stays pinned"
+        );
+        assert_eq!(
+            crate::runtime::drain::census::store_route_count("resident_lease_superseded"),
+            superseded_before + 19
+        );
+
+        let reacquired = std::cell::Cell::new(false);
+        resident_target_backing_with(&resource, &identity(1), |identity| {
+            reacquired.set(true);
+            acquire(identity)
+        });
+        assert!(reacquired.get(), "a superseded generation is not held warm");
+
+        super::super::test_advance_resident_resource_epoch();
+    }
+
+    #[test]
+    fn only_a_surface_generation_supersedes() {
+        let _serial = serial();
+        let format = crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT;
+        let gva = |generation| TargetIdentity::Gva {
+            gva: 0x1000,
+            width: 64,
+            height: 32,
+            generation,
+            format,
+        };
+        assert!(identity(2).supersedes(&identity(1)));
+        assert!(
+            identity(2).supersedes(&surface(9, 128, 1)),
+            "a generation belongs to the mapping, not to one extent of it"
+        );
+        assert!(
+            !identity(1).supersedes(&identity(1)),
+            "an identity is not its own successor"
+        );
+        assert!(!identity(2).supersedes(&surface(10, 64, 1)));
+        assert!(
+            !gva(2).supersedes(&gva(1)),
+            "no GVA generation contract is established"
         );
     }
 }

@@ -497,6 +497,21 @@ pub trait HostOps {
         Err(GuestRamRegionsError::CallbackMissing)
     }
 
+    /// The file that backs guest RAM at `[host_va, host_va + len)`, and the
+    /// offset of `host_va` in it — or `None` when no file does, the range is not
+    /// one RAMBlock's, or the host cannot say.
+    ///
+    /// A fact about where bytes live and never an import decision: a backend
+    /// that can import a file uses it, every other ignores it. Default `None`,
+    /// which leaves the host-pointer import exactly as it was.
+    fn guest_ram_fd(
+        &mut self,
+        _host_va: u64,
+        _len: u64,
+    ) -> Option<crate::runtime::guest_ram::FdBacking> {
+        None
+    }
+
     /// True if `gpa` is guest RAM (not MMIO / ROM / unmapped). Product QEMU
     /// implements via `address_space_translate` + `memory_region_is_ram`.
     /// Default: true (fixtures / NullHost without a RAM map).

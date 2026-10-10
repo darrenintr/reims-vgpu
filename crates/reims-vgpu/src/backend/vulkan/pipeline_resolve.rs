@@ -270,40 +270,89 @@ pub struct ResolvedRenderPipeline {
     pub bind_plan: Arc<VertexBindPlan>,
 }
 
+/// A reflection that declares nothing: no bindings, varyings, render targets
+/// or builtins. What a module with an empty interface reflects as.
+fn empty_reflection(
+    stage: metal2vulkan::reflect::ShaderStage,
+) -> Arc<metal2vulkan::reflect::ShaderReflection> {
+    use metal2vulkan::reflect::{ShaderReflection, REFLECTION_VERSION};
+    Arc::new(ShaderReflection {
+        reflection_version: REFLECTION_VERSION,
+        descriptor_layout: Default::default(),
+        stage,
+        entry_point: None,
+        bindings: vec![],
+        argument_buffer_fields: vec![],
+        vertex_attributes: vec![],
+        varyings: vec![],
+        render_targets: vec![],
+        depth_members: vec![],
+        depth_qualifier: None,
+        stencil_members: vec![],
+        local_size: None,
+        max_work_group_size: None,
+        kernel_dispatch: None,
+        vertex_builtins: None,
+        tessellation: None,
+        imageblock_layouts: vec![],
+        implicit_imageblock_attachments: vec![],
+        fragment_imageblock: None,
+        datalayout: None,
+        runtime_sampler_specializations: vec![],
+        runtime_storage_image_specializations: vec![],
+        function_constants: vec![],
+    })
+}
+
+/// The fragment stage this rail runs for a pipeline whose guest named none.
+///
+/// Metal rasterizes such a pipeline and writes only depth and stencil
+/// ([`RenderPipelineDescriptor::has_fragment_function`]). This rail's pipeline
+/// builder always takes a fragment module, so it gets one that does nothing:
+/// SPIR-V 1.0, `OpEntryPoint Fragment "main"`, a body that returns. It declares
+/// no outputs, so colour attachments would receive undefined values if they
+/// were written — which is why every colour write mask of such a pipeline is
+/// taken through [`RenderPipelineDescriptor::effective_color_write_mask`].
+/// Depth and stencil come from fixed-function state and rasterized depth, which
+/// a no-op fragment stage leaves exactly as Metal's absent one does.
+#[rustfmt::skip]
+pub const NO_FRAGMENT_SPIRV: [u32; 32] = [
+    0x0723_0203, 0x0001_0000, 0, 5, 0,             // header: SPIR-V 1.0, id bound 5
+    (2 << 16) | 17, 1,                             // OpCapability Shader
+    (3 << 16) | 14, 0, 1,                          // OpMemoryModel Logical GLSL450
+    (5 << 16) | 15, 4, 1, u32::from_le_bytes(*b"main"), 0, // OpEntryPoint Fragment %1 "main"
+    (3 << 16) | 16, 1, 7,                          // OpExecutionMode %1 OriginUpperLeft
+    (2 << 16) | 19, 2,                             // %2 = OpTypeVoid
+    (3 << 16) | 33, 3, 2,                          // %3 = OpTypeFunction %2
+    (5 << 16) | 54, 2, 1, 0, 3,                    // %1 = OpFunction %2 None %3
+    (2 << 16) | 248, 4,                            // %4 = OpLabel
+    (1 << 16) | 253,                               // OpReturn
+    (1 << 16) | 56,                                // OpFunctionEnd
+];
+
+/// The shared no-op fragment shader, built once per process.
+pub(crate) fn no_fragment_shader() -> Arc<CachedShader> {
+    static SHADER: std::sync::OnceLock<Arc<CachedShader>> = std::sync::OnceLock::new();
+    SHADER
+        .get_or_init(|| {
+            Arc::new(CachedShader::new(
+                NO_FRAGMENT_SPIRV
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect(),
+                empty_reflection(metal2vulkan::reflect::ShaderStage::Fragment),
+            ))
+        })
+        .clone()
+}
+
 #[cfg(test)]
 pub(crate) fn retained_pipeline_with_desc_for_test(
     desc: RenderPipelineDescriptor,
 ) -> Arc<ResolvedRenderPipeline> {
-    use metal2vulkan::reflect::{ShaderReflection, ShaderStage, REFLECTION_VERSION};
+    use metal2vulkan::reflect::ShaderStage;
 
-    let reflection = |stage| {
-        Arc::new(ShaderReflection {
-            reflection_version: REFLECTION_VERSION,
-            descriptor_layout: Default::default(),
-            stage,
-            entry_point: None,
-            bindings: vec![],
-            argument_buffer_fields: vec![],
-            vertex_attributes: vec![],
-            varyings: vec![],
-            render_targets: vec![],
-            depth_members: vec![],
-            depth_qualifier: None,
-            stencil_members: vec![],
-            local_size: None,
-            max_work_group_size: None,
-            kernel_dispatch: None,
-            vertex_builtins: None,
-            tessellation: None,
-            imageblock_layouts: vec![],
-            implicit_imageblock_attachments: vec![],
-            fragment_imageblock: None,
-            datalayout: None,
-            runtime_sampler_specializations: vec![],
-            runtime_storage_image_specializations: vec![],
-            function_constants: vec![],
-        })
-    };
+    let reflection = empty_reflection;
     let desc = Arc::new(desc);
     Arc::new(ResolvedRenderPipeline {
         pipeline_object: Some(crate::backend::vulkan::engine::PipelineObjectIdentity::new()),
@@ -635,26 +684,9 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         task_id,
         function_ref: desc.vertex_func_ref,
     })?;
-    let f_mtlb = load_mtlb(
-        state,
-        host,
-        task_id,
-        desc.fragment_func_ref,
-        AirLoadRail::Draw,
-    )
-    .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
-        task_id,
-        function_ref: desc.fragment_func_ref,
-    })?;
     let v_air = crate::runtime::mtlb::extract_air(&v_mtlb).map_err(|reason| {
         DrawPreparationDecline::VertexAirExtract {
             function_ref: desc.vertex_func_ref,
-            reason,
-        }
-    })?;
-    let f_air = crate::runtime::mtlb::extract_air(&f_mtlb).map_err(|reason| {
-        DrawPreparationDecline::FragmentAirExtract {
-            function_ref: desc.fragment_func_ref,
             reason,
         }
     })?;
@@ -667,15 +699,36 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         pipeline_ref,
         reason,
     })?;
-    let fragment = crate::runtime::m2v_cache::translate_cached_reflected(
-        f_air,
-        metal2vulkan::passes::Stage::Fragment,
-        pipeline_ref,
-    )
-    .map_err(|reason| DrawPreparationDecline::FragmentTranslate {
-        pipeline_ref,
-        reason,
-    })?;
+    let fragment = if desc.has_fragment_function() {
+        let f_mtlb = load_mtlb(
+            state,
+            host,
+            task_id,
+            desc.fragment_func_ref,
+            AirLoadRail::Draw,
+        )
+        .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
+            task_id,
+            function_ref: desc.fragment_func_ref,
+        })?;
+        let f_air = crate::runtime::mtlb::extract_air(&f_mtlb).map_err(|reason| {
+            DrawPreparationDecline::FragmentAirExtract {
+                function_ref: desc.fragment_func_ref,
+                reason,
+            }
+        })?;
+        crate::runtime::m2v_cache::translate_cached_reflected(
+            f_air,
+            metal2vulkan::passes::Stage::Fragment,
+            pipeline_ref,
+        )
+        .map_err(|reason| DrawPreparationDecline::FragmentTranslate {
+            pipeline_ref,
+            reason,
+        })?
+    } else {
+        no_fragment_shader()
+    };
     // Both stages are SPIR-V now. What is left is this rail building the
     // pipeline object out of them, which is `Compiling`.
     crate::runtime::draw::advance_pipeline(
@@ -698,6 +751,29 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_absent_fragment_stage_is_a_valid_module_with_an_empty_interface() {
+        let shader = no_fragment_shader();
+        assert_eq!(*shader.words, NO_FRAGMENT_SPIRV.to_vec());
+        assert_eq!(
+            shader.reflection.stage,
+            metal2vulkan::reflect::ShaderStage::Fragment
+        );
+        assert!(shader.reflection.bindings.is_empty());
+        assert!(shader.reflection.render_targets.is_empty());
+        assert!(
+            Arc::ptr_eq(&shader, &no_fragment_shader()),
+            "one shared module per process"
+        );
+        // `validate` reports an absent `spirv-val` as accepted, so this only
+        // proves something on a host that has SPIRV-Tools — which every host
+        // that boots a guest must.
+        assert_eq!(
+            crate::runtime::spirv_bind::validate(&NO_FRAGMENT_SPIRV),
+            crate::runtime::spirv_bind::SpirvValidation::Accepted
+        );
+    }
     use crate::runtime::decode::resource::VertexAttribute;
 
     /// This rail's retained table, which is what these tests are about. Named

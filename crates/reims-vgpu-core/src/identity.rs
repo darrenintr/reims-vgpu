@@ -195,8 +195,9 @@ pub struct SerializerRef {
     pub value: u32,
 }
 
-/// A resolved resource: the slot the guest named and the generation it was
-/// resolved in.
+/// A resolved resource: its owning task, the slot the guest named and the
+/// generation it was resolved in. Slot generations are task-local, so the
+/// task is part of the identity even in a session-wide registry.
 ///
 /// Work holds one of these and never a bare slot. A guest that deletes an
 /// object and creates another in the same slot produces a new generation, so
@@ -204,6 +205,8 @@ pub struct SerializerRef {
 /// object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceId {
+    /// The task whose object-list namespace issued this name.
+    pub task: TaskId,
     pub slot: ObjectListRef,
     pub generation: SlotGeneration,
 }
@@ -444,10 +447,12 @@ mod tests {
     fn a_resolved_id_carries_the_generation_it_was_resolved_in() {
         let slot = ObjectListRef(32);
         let first = ResourceId {
+            task: crate::identity::TaskId(0),
             slot,
             generation: SlotGeneration::default(),
         };
         let after_reuse = ResourceId {
+            task: crate::identity::TaskId(0),
             slot,
             generation: SlotGeneration::default().next(),
         };

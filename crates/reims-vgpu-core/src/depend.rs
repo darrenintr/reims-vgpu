@@ -328,7 +328,7 @@ impl DependencyGraph {
     /// In place, and allocation-free once warm: every index list keeps its own
     /// order and capacity and has its entries renumbered through one reused
     /// map, so running this on the admission path does not undo the
-    /// structural zero [`Self::scratch`] exists for. The census is a running
+    /// structural zero the `scratch` buffer exists for. The census is a running
     /// total across the graph's life and is not touched: compaction is
     /// bookkeeping, and it did not admit anything.
     pub fn compact(&mut self) {

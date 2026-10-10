@@ -1233,7 +1233,7 @@ fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderRefl
 fn swap_rb_channels_matches_two_pass_and_preserves_tail() {
     fn two_pass(src: &[u8]) -> Vec<u8> {
         let mut v = src.to_vec();
-        for px in v.chunks_exact_mut(4) {
+        for px in v.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
         }
         v
@@ -3853,7 +3853,7 @@ fn gva_layer_host_cache_roundtrip_for_sample() {
     let h = 3u32;
     // Sky-blue solid (pipe-59 class): R G B A
     let mut rgba = vec![0u8; (w * h * 4) as usize];
-    for px in rgba.chunks_exact_mut(4) {
+    for px in rgba.as_chunks_mut::<4>().0 {
         px[0] = 81;
         px[1] = 126;
         px[2] = 185;
@@ -4539,7 +4539,10 @@ fn a_gva_load_from_resident_draw_with_no_resident_puts_the_seed_back() {
         "the restored seed must be the attachment's own guest texels"
     );
     assert!(
-        seed.chunks_exact(4).all(|px| px == [3, 5, 7, 255]),
+        seed.as_chunks::<4>()
+            .0
+            .iter()
+            .all(|px| *px == [3, 5, 7, 255]),
         "every texel of the re-read attachment, not just the first row"
     );
 }
@@ -5873,7 +5876,7 @@ fn a_packed_run_names_the_window_and_not_its_offset_into_the_block() {
     st32(&mut directory[DIRECTORY_DEPTH as usize..], 1);
     host.write_gpa(dir_gpa, &directory).unwrap();
     let mut ptes = [0u8; 24];
-    for (i, pte) in ptes.chunks_exact_mut(4).enumerate() {
+    for (i, pte) in ptes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         st32(pte, (data_gpa >> page_shift) as u32 + i as u32);
     }
     host.write_gpa(root_gpa, &ptes).unwrap();
@@ -5950,7 +5953,7 @@ fn packed_buffer_alias_is_reused_across_offsets() {
     st32(&mut directory[DIRECTORY_DEPTH as usize..], 1);
     host.write_gpa(dir_gpa, &directory).unwrap();
     let mut ptes = [0u8; 24];
-    for (i, pte) in ptes.chunks_exact_mut(4).enumerate() {
+    for (i, pte) in ptes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         st32(pte, 4 + i as u32);
     }
     host.write_gpa(root_gpa, &ptes).unwrap();
@@ -7901,10 +7904,12 @@ fn a_preserving_gva_attachment_reaches_the_encoder_able_to_preserve() {
         // The attachment's own texels, as `seed_color_load` would return them:
         // BGRA in guest pages becomes RGBA here, so [7,5,3,255] reads back as
         // [3,5,7,255].
-        let carries_attachment = c0
-            .target_seed_rgba
-            .as_ref()
-            .is_some_and(|s| s.chunks_exact(4).all(|px| px == [3u8, 5, 7, 255]));
+        let carries_attachment = c0.target_seed_rgba.as_ref().is_some_and(|s| {
+            s.as_chunks::<4>()
+                .0
+                .iter()
+                .all(|px| *px == [3u8, 5, 7, 255])
+        });
         (
             carries_attachment || req.gva_load_from_resident,
             c0.target_seed_rgba.is_some(),
@@ -8238,4 +8243,16 @@ fn both_spellings_of_the_channel_exchange_agree_and_are_their_own_inverse() {
              function serve both directions"
         );
     }
+}
+
+/// A row is reused only when its source bytes equal the row last converted:
+/// never before anything was converted, and never for a row that differs.
+#[test]
+fn a_converted_row_is_reused_only_for_identical_source_bytes() {
+    let src = [1u8, 2, 3, 4, 1, 2, 3, 4, 9, 9, 9, 9];
+    let mut converted = ConvertedRow::default();
+    assert!(!converted.reuses(&src, 0, 4), "nothing converted yet");
+    converted.last = Some(0);
+    assert!(converted.reuses(&src, 4, 4), "same bytes as row 0");
+    assert!(!converted.reuses(&src, 8, 4), "different bytes");
 }

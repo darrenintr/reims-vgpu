@@ -514,6 +514,15 @@ fn apply_delete_object<H: HostMemory + HostOps>(
         op.opcode(),
         RefSpacePopulation::Untracked,
     );
+    // A kind the ledger closes as a proven no-op is done once it is counted:
+    // retiring nothing *is* its operation (function and compute-pipeline
+    // destroys — this device keys both by content, never by guest ref), and
+    // reporting it as unimplemented would put a settled row on the failure
+    // channel beside the kinds that are genuinely unmeasured.
+    if is_proven_noop_kind(op.opcode()) {
+        note_store_route("delete_object_proven_noop");
+        return;
+    }
     note_unimplemented(
         state,
         channel_id,
@@ -536,6 +545,15 @@ const fn is_retained_kind(opcode: u32) -> bool {
             | d::OPCODE_DELETE_DEPTH_STENCIL_STATE
             | d::OPCODE_DELETE_RENDER_PIPELINE_STATE
     )
+}
+
+/// Whether the closure ledger settles this destroy kind as a proven no-op.
+///
+/// Read from [`reims_vgpu_protocol::closure::LEDGER`]'s root-rail row rather
+/// than restated, so a kind joins only when its row carries the evidence.
+fn is_proven_noop_kind(opcode: u32) -> bool {
+    use reims_vgpu_protocol::closure::{find, Closure, Rail};
+    find(Rail::Root, opcode).is_some_and(|op| matches!(op.closure, Closure::ProvenNoOp { .. }))
 }
 
 /// Which population of destroys a ref-space reading belongs to.
@@ -1976,7 +1994,9 @@ fn decode_packet_inner(
     // out of the arithmetic: `chunks_exact` yields exactly `stamp_count`
     // records because the span above is exactly that many strides long.
     let stamp_waits: Vec<StampWait> = bytes[PACKET_HEADER_LEN as usize..min_payload_off as usize]
-        .chunks_exact(PACKET_STAMP_LEN as usize)
+        .as_chunks::<{ PACKET_STAMP_LEN as usize }>()
+        .0
+        .iter()
         .map(|rec| StampWait {
             index: ld32(rec),
             value: ld32(&rec[4..]),
@@ -2435,7 +2455,22 @@ pub(crate) fn note_access_modes(state: &DeviceState, built: &reims_vgpu_core::se
     // draw found nothing published; only the pipeline's *state* tells the two
     // causes apart — an executor that has not answered yet, and one whose
     // answer a withdrawal or a retirement threw away. Once per slot.
+    //
+    // A pipeline whose executor has not answered *yet* is the expected case
+    // and stays off the failure channel. The guest writes its pipelines into
+    // its own object list with no creation command, so the first packet that
+    // binds one is where this device first learns it exists: the walk of that
+    // packet runs before the table holds an entry, and translation finishes
+    // tens of milliseconds after admission (a driven macos-13 boot: slot 13
+    // walked at t=33640, ready at t=33674). That packet orders conservatively,
+    // which is correct, and nothing an earlier step could do would change it.
+    // Only an answer that was given and then lost — a pipeline the table holds
+    // as ready, refused or retired with nothing published — is a failure.
     if let Some(id) = census.first_unanswered_pipeline {
+        if awaiting_first_answer(state.pipeline_state_of(id)) {
+            note_store_route("draw_usage_awaiting_translation");
+            return;
+        }
         if crate::observe::first_sight("draw_usage_no_stage", u64::from(id.slot.0)) {
             crate::observe::fail(format!(
                 "draw_usage_no_stage slot={} gen={} model_pipeline={} (a draw bound this \
@@ -2446,6 +2481,20 @@ pub(crate) fn note_access_modes(state: &DeviceState, built: &reims_vgpu_core::se
                 state.pipeline_state(id).unwrap_or("unleased"),
             ));
         }
+    }
+}
+
+/// Whether a pipeline that published nothing is still owed its first answer.
+///
+/// `None` is a pipeline the table has not been told of yet — the walk of the
+/// packet that first binds it runs before that packet declares it — and the
+/// three states before `Ready` are an executor still working. `Ready` with
+/// nothing published, `Refused` and `Retired` are answers that will not come.
+fn awaiting_first_answer(state: Option<reims_vgpu_core::pipeline::PipelineState>) -> bool {
+    use reims_vgpu_core::pipeline::PipelineState as S;
+    match state {
+        None | Some(S::Declared | S::Translating | S::Compiling) => true,
+        Some(S::Ready | S::Refused | S::Retired) => false,
     }
 }
 
@@ -6706,6 +6755,16 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     host.enqueue(HostAction::irq_gfx());
 }
 
+/// One refresh tick's question to the shared VBL grid: the slot the last pulse
+/// claimed, when this tick runs, and the grid's period — the three inputs
+/// [`claim_display_vbl`] decides on, carried together because every caller has
+/// all three and no caller has a reason to pass them apart.
+pub(crate) struct VblTick<'a> {
+    pub(crate) last_us: &'a std::sync::atomic::AtomicU64,
+    pub(crate) now_us: u64,
+    pub(crate) interval_us: u64,
+}
+
 /// Atomically claim the next display VBL for either the locked or lock-free
 /// poll path. A single shared timestamp makes the cadence independent of device
 /// lock contention and prevents both paths from signaling the same interval.
@@ -7044,9 +7103,7 @@ pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
     display_index: u32,
     intr_disp: &std::sync::atomic::AtomicU32,
     page_size: usize,
-    last_us: &std::sync::atomic::AtomicU64,
-    now_us: u64,
-    interval_us: u64,
+    tick: VblTick<'_>,
 ) {
     let mut mask_le = [0u8; 4];
     if host
@@ -7069,7 +7126,7 @@ pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
     if !vbl && !transaction {
         return;
     }
-    if !claim_display_vbl(last_us, now_us, interval_us) {
+    if !claim_display_vbl(tick.last_us, tick.now_us, tick.interval_us) {
         return;
     }
 
@@ -7125,9 +7182,11 @@ fn signal_display_vbl_at<H: HostMemory + HostOps>(
         state.display.display_index,
         &state.gfx.interrupt_status_disp,
         page_size,
-        last_us,
-        now_us,
-        state.display.refresh.interval_us(),
+        VblTick {
+            last_us,
+            now_us,
+            interval_us: state.display.refresh.interval_us(),
+        },
     );
 }
 

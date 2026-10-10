@@ -37,6 +37,7 @@ static ALLOCATOR: Counting = Counting::new();
 
 fn id(slot: u32) -> ResourceId {
     ResourceId {
+        task: reims_vgpu_core::identity::TaskId(0),
         slot: ObjectListRef(slot),
         generation: SlotGeneration(1),
     }

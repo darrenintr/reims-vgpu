@@ -32,6 +32,7 @@ static ALLOCATOR: Counting = Counting::new();
 fn buffer(id: u32) -> BufferBinding {
     BufferBinding {
         buffer: Some(ResourceId {
+            task: reims_vgpu_core::identity::TaskId(0),
             slot: ObjectListRef(id),
             generation: SlotGeneration(1),
         }),

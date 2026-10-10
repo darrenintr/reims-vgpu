@@ -275,6 +275,50 @@ pub fn note_registry_levels(state: &crate::model::DeviceState) {
 pub struct BoundBuffers {
     held: HashMap<Key, BoundBuffer>,
     packed: HashMap<(u32, u32), PackedBufferResolution>,
+    /// Packed aliases dropped since the last [`Self::take_released`]: each one's
+    /// retired import and the host view it was built on.
+    released: Vec<PackedRelease>,
+}
+
+/// What dropping one packed alias owes the rest of the device.
+///
+/// A packed alias is a host view of scattered guest pages plus an import made
+/// over that view. Dropping the resolution used to drop only the map entry, so
+/// neither half was ever released: the import stayed live in the backend, and
+/// the view stayed mapped until device exit. Every guest map, unmap or delete
+/// over a packed resource then rebuilt it with a fresh view — one kernel
+/// mapping per scattered page — so a desktop session grew QEMU's mappings from
+/// 18 000 to 48 000 in six minutes while the work per batch grew with them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedRelease {
+    pub import: crate::runtime::guest_ram::ImportId,
+    /// `(host_base, len)` of the view, exactly as `map_pages` returned it.
+    pub view: (usize, usize),
+}
+
+impl PackedBufferResolution {
+    /// Retire what this resolution owns, if it owns anything.
+    ///
+    /// Only an alias owns its import: a packed window whose pages were one run
+    /// resolves against the RAMBlock import, which the whole device shares and
+    /// which lives for the VM, and that host view is a direct RAMBlock pointer
+    /// with nothing to unmap.
+    fn release(self) -> Option<PackedRelease> {
+        let Self::Available(buffer) = self else {
+            return None;
+        };
+        if buffer.import.gpa_base().is_some() {
+            return None;
+        }
+        buffer.import.retire();
+        Some(PackedRelease {
+            import: buffer.import.id(),
+            view: (
+                buffer.import.host_base(),
+                usize::try_from(buffer.import.len()).ok()?,
+            ),
+        })
+    }
 }
 
 impl BoundBuffers {
@@ -348,7 +392,42 @@ impl BoundBuffers {
     }
 
     pub fn insert_packed(&mut self, task_id: u32, buffer_ref: u32, packed: PackedBufferResolution) {
-        self.packed.insert((task_id, buffer_ref), packed);
+        if let Some(old) = self.packed.insert((task_id, buffer_ref), packed) {
+            if let Some(release) = old.release() {
+                // Offset binds sliced from the old alias carry host pointers
+                // into the view about to be unmapped, so they go with it.
+                self.held
+                    .retain(|k, _| k.task != task_id || k.buffer_ref != buffer_ref);
+                self.released.push(release);
+            }
+        }
+    }
+
+    /// Drop the packed resolutions `keep` rejects, releasing what each owns.
+    fn retire_packed(
+        &mut self,
+        mut keep: impl FnMut(&(u32, u32), &PackedBufferResolution) -> bool,
+    ) {
+        let mut dropped = Vec::new();
+        self.packed.retain(|key, packed| {
+            let kept = keep(key, packed);
+            if !kept {
+                dropped.push(packed.clone());
+            }
+            kept
+        });
+        self.released.extend(
+            dropped
+                .into_iter()
+                .filter_map(PackedBufferResolution::release),
+        );
+    }
+
+    /// The packed aliases dropped since the last call, for
+    /// [`crate::runtime::mapper::flush_retired_views`] to retire in the backend
+    /// and unmap.
+    pub fn take_released(&mut self) -> Vec<PackedRelease> {
+        std::mem::take(&mut self.released)
     }
 
     /// Drop everything held for one task.
@@ -358,7 +437,7 @@ impl BoundBuffers {
     pub fn retire_task(&mut self, task_id: u32) -> usize {
         let before = self.held.len();
         self.held.retain(|k, _| k.task != task_id);
-        self.packed.retain(|(task, _), _| *task != task_id);
+        self.retire_packed(|(task, _), _| *task != task_id);
         before - self.held.len()
     }
 
@@ -391,7 +470,9 @@ impl BoundBuffers {
         let before = self.held.len();
         self.held
             .retain(|k, _| k.task != task_id || k.buffer_ref != buffer_ref);
-        self.packed.remove(&(task_id, buffer_ref));
+        if let Some(old) = self.packed.remove(&(task_id, buffer_ref)) {
+            self.released.extend(old.release());
+        }
         before - self.held.len()
     }
 
@@ -402,15 +483,14 @@ impl BoundBuffers {
         let before = self.held.len();
         self.held
             .retain(|k, b| k.task != task_id || !b.overlaps(gva, len));
-        self.packed
-            .retain(|(task, _), b| *task != task_id || !b.overlaps(gva, len));
+        self.retire_packed(|(task, _), b| *task != task_id || !b.overlaps(gva, len));
         before - self.held.len()
     }
 
     /// Drop everything. Device reset, where no guest state survives.
     pub fn clear(&mut self) {
         self.held.clear();
-        self.packed.clear();
+        self.retire_packed(|_, _| false);
     }
 
     /// How many resolutions are held, for the census.
@@ -558,6 +638,71 @@ mod tests {
         assert!(b.packed(1, 8).is_some(), "unrelated alias answer");
         assert_eq!(b.retire_ref(1, 8), 0);
         assert!(b.packed(1, 8).is_none());
+    }
+
+    fn alias(gva: u64) -> PackedBufferResolution {
+        PackedBufferResolution::Available(PackedBuffer {
+            gva,
+            size: 0x2000,
+            head: 0,
+            import: Arc::new(
+                crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                    0x7f00_0000_0000 + gva as usize,
+                    0x2000,
+                    0x1000,
+                )
+                .expect("aligned allocation"),
+            ),
+            gpas: Arc::new(Vec::new()),
+            runs: Arc::new(Vec::new()),
+            pages: Arc::new(Vec::new()),
+        })
+    }
+
+    /// Every way a packed alias leaves the registry retires its import and
+    /// hands back its view: replacement, the reference, the range and the task.
+    /// Before this, all four only dropped the map entry, and the view stayed
+    /// mapped until device exit.
+    #[test]
+    fn a_dropped_packed_alias_retires_its_import_and_returns_its_view() {
+        let mut b = BoundBuffers::default();
+        let first = alias(0x1_0000);
+        let PackedBufferResolution::Available(ref held) = first else {
+            unreachable!()
+        };
+        let first_import = Arc::clone(&held.import);
+        b.insert_packed(1, 7, first);
+        b.insert(1, 7, 0x100, None, bound(0x1_0100, 0x100));
+        b.insert_packed(1, 7, alias(0x2_0000));
+        assert!(
+            b.get(1, 7, 0x100, None).is_none(),
+            "a bind sliced from the old alias does not outlive its view"
+        );
+        assert!(
+            first_import.is_retired(),
+            "replacement retires the old alias"
+        );
+        assert_eq!(
+            b.take_released(),
+            vec![PackedRelease {
+                import: first_import.id(),
+                view: (0x7f00_0001_0000, 0x2000),
+            }]
+        );
+        b.insert_packed(1, 8, alias(0x3_0000));
+        b.insert_packed(2, 9, alias(0x4_0000));
+        assert_eq!(b.retire_ref(1, 7), 0);
+        assert_eq!(b.retire_range(1, 0x3_0800, 0x10), 0);
+        assert_eq!(b.retire_task(2), 0);
+        let views: Vec<_> = b.take_released().iter().map(|r| r.view.0).collect();
+        assert_eq!(
+            views,
+            vec![0x7f00_0002_0000, 0x7f00_0003_0000, 0x7f00_0004_0000]
+        );
+        assert!(
+            b.take_released().is_empty(),
+            "each release is handed out once"
+        );
     }
 
     #[test]

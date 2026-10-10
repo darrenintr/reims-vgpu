@@ -1025,6 +1025,7 @@ mod resting_tests {
 
     fn name(slot: u32) -> ResourceId {
         ResourceId {
+            task: crate::identity::TaskId(0),
             slot: crate::identity::ObjectListRef(slot),
             generation: crate::identity::SlotGeneration(1),
         }
@@ -1104,6 +1105,7 @@ mod tests {
 
     fn id(slot: u32) -> ResourceId {
         ResourceId {
+            task: crate::identity::TaskId(0),
             slot: ObjectListRef(slot),
             generation: SlotGeneration::default(),
         }
@@ -1528,6 +1530,7 @@ mod tests {
         assert_eq!(t.get(id(1)).unwrap().state, PipelineState::Translating);
         // A reused slot is a different id, and declares cleanly.
         let reused = ResourceId {
+            task: crate::identity::TaskId(0),
             slot: ObjectListRef(1),
             generation: SlotGeneration::default().next(),
         };

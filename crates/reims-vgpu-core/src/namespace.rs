@@ -69,12 +69,14 @@
 //! been set for is whichever object shared the low half of an address.
 
 use crate::access::BackingId;
-use crate::identity::{ObjectListRef, ResourceId, SlotGeneration};
+use crate::identity::{ObjectListRef, ResourceId, SlotGeneration, TaskId};
 use std::collections::HashMap;
 
 /// Why a namespace operation did not happen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
+    /// A name from another task cannot address this namespace.
+    WrongTask { named: TaskId, current: TaskId },
     /// Nothing has ever been declared in this slot.
     NotDeclared { slot: ObjectListRef },
     /// The slot holds a different generation. The name is stale: whatever the
@@ -92,6 +94,7 @@ impl Refusal {
     #[must_use]
     pub const fn slug(self) -> &'static str {
         match self {
+            Self::WrongTask { .. } => "namespace_wrong_task",
             Self::NotDeclared { .. } => "namespace_not_declared",
             Self::StaleGeneration { .. } => "namespace_stale_generation",
             Self::Deleted { .. } => "namespace_deleted",
@@ -261,9 +264,10 @@ struct Slot {
     outstanding: usize,
 }
 
-/// One session generation's object namespace.
-#[derive(Debug, Default)]
+/// One task's object namespace. Every issued name carries this task.
+#[derive(Debug)]
 pub struct Namespace {
+    task: TaskId,
     slots: HashMap<ObjectListRef, Slot>,
     /// Backings detached from a slot by a delete or a replacement, still held
     /// by accepted work, counted *per backing* rather than per detachment.
@@ -291,8 +295,15 @@ pub struct Namespace {
 
 impl Namespace {
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(task: TaskId) -> Self {
+        Self {
+            task,
+            slots: HashMap::new(),
+            retiring: HashMap::new(),
+            live_by_backing: HashMap::new(),
+            resolved: 0,
+            refused: 0,
+        }
     }
 
     /// Declare an object into a slot.
@@ -355,9 +366,14 @@ impl Namespace {
         // held would otherwise be told to free the storage its own new
         // occupant is using.
         Declared {
-            id: ResourceId { slot, generation },
+            id: ResourceId {
+                task: self.task,
+                slot,
+                generation,
+            },
             displaced: displaced.map(|old| Displaced {
                 id: ResourceId {
+                    task: self.task,
                     slot,
                     generation: old.generation,
                 },
@@ -371,8 +387,15 @@ impl Namespace {
     /// # Errors
     ///
     /// The one check that refused: never declared, deleted, or a different
-    /// generation than the caller named.
+    /// generation or task than the caller named.
     pub fn resolve(&mut self, name: ResourceId) -> Result<Lease, Refusal> {
+        if name.task != self.task {
+            self.refused += 1;
+            return Err(Refusal::WrongTask {
+                named: name.task,
+                current: self.task,
+            });
+        }
         let refusal = match self.slots.get(&name.slot) {
             None => Refusal::NotDeclared { slot: name.slot },
             Some(slot) if slot.generation != name.generation => Refusal::StaleGeneration {
@@ -406,7 +429,11 @@ impl Namespace {
             self.refused += 1;
             return Err(Refusal::NotDeclared { slot });
         };
-        self.resolve(ResourceId { slot, generation })
+        self.resolve(ResourceId {
+            task: self.task,
+            slot,
+            generation,
+        })
     }
 
     /// Record that accepted work holds this lease, and hand back the claim.
@@ -594,7 +621,7 @@ impl Namespace {
     pub fn outstanding(&self, name: ResourceId) -> usize {
         self.slots
             .get(&name.slot)
-            .filter(|s| s.generation == name.generation)
+            .filter(|s| name.task == self.task && s.generation == name.generation)
             .map_or(0, |s| s.outstanding)
     }
 
@@ -615,6 +642,7 @@ impl Namespace {
             .iter()
             .filter(|(_, s)| !s.deleted)
             .map(|(slot, s)| ResourceId {
+                task: self.task,
                 slot: *slot,
                 generation: s.generation,
             })
@@ -665,6 +693,7 @@ impl crate::resolve::RefResolver for Namespace {
         let slot = ObjectListRef(object_ref);
         let held = self.slots.get(&slot)?;
         (!held.deleted).then_some(ResourceId {
+            task: self.task,
             slot,
             generation: held.generation,
         })
@@ -675,6 +704,26 @@ impl crate::resolve::RefResolver for Namespace {
 mod tests {
     use super::*;
     use crate::resolve::RefResolver as _;
+
+    #[test]
+    fn a_name_carries_its_task_and_cannot_mutate_another_tasks_same_slot() {
+        let mut first = Namespace::new(TaskId(14));
+        let mut second = Namespace::new(TaskId(15));
+        let a = first.declare(ObjectListRef(11), Some(BackingId(100))).id;
+        let b = second.declare(ObjectListRef(11), Some(BackingId(200))).id;
+        assert_eq!(a.slot, b.slot);
+        assert_eq!(a.generation, b.generation);
+        assert_ne!(a, b);
+        let refusal = Refusal::WrongTask {
+            named: TaskId(14),
+            current: TaskId(15),
+        };
+        assert_eq!(second.resolve(a), Err(refusal));
+        assert_eq!(second.delete(a), Err(refusal));
+        assert_eq!(second.replace_physical(a, BackingId(300)), Err(refusal));
+        assert_eq!(second.resource(11), Some(b));
+        assert_eq!(second.resolve(b).unwrap().backing(), Some(BackingId(200)));
+    }
 
     fn slot(n: u32) -> ObjectListRef {
         ObjectListRef(n)
@@ -707,7 +756,7 @@ mod tests {
     /// [`crate::access::BackingId`] rules out.
     #[test]
     fn a_name_that_owns_no_storage_resolves_and_hands_nothing_back() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let id = fresh(ns.declare(slot(1), None));
 
         let lease = ns.resolve(id).expect("a sampler is a live name");
@@ -756,7 +805,7 @@ mod tests {
     /// top of them.
     #[test]
     fn a_slot_that_stops_owning_storage_still_hands_back_what_it_held() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let held = fresh(ns.declare(slot(1), Some(backing(10))));
 
         let over = ns.declare(slot(1), None);
@@ -793,7 +842,7 @@ mod tests {
     /// The invariant the module exists for.
     #[test]
     fn deleting_stops_resolution_and_leaves_accepted_work_alone() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let id = fresh(ns.declare(slot(1), Some(backing(10))));
         let lease = ns.resolve(id).expect("live");
         let lease = ns.acquire(lease);
@@ -821,7 +870,7 @@ mod tests {
 
     #[test]
     fn deleting_an_unused_object_frees_it_at_once() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let id = fresh(ns.declare(slot(1), Some(backing(10))));
         assert_eq!(
             ns.delete(id),
@@ -843,7 +892,7 @@ mod tests {
     #[test]
     fn a_claim_taken_after_its_name_went_still_holds_the_storage() {
         // Deleted with nothing outstanding, so the namespace kept no counter.
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let id = fresh(ns.declare(slot(1), Some(backing(10))));
         let lease = ns.resolve(id).expect("live");
         assert_eq!(
@@ -869,7 +918,7 @@ mod tests {
 
         // Redeclared into the same storage: the claim is still owed, and the
         // handback is not, because a live name answers for those bytes.
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let first = fresh(ns.declare(slot(1), Some(backing(10))));
         let lease = ns.resolve(first).expect("live");
         assert_eq!(
@@ -892,7 +941,7 @@ mod tests {
     /// it.
     #[test]
     fn a_reused_slot_refuses_the_name_that_used_to_live_there() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let first = fresh(ns.declare(slot(1), Some(backing(10))));
         assert_eq!(
             ns.delete(first).expect("live"),
@@ -920,7 +969,7 @@ mod tests {
     /// keep resolving the previous occupant forever.
     #[test]
     fn a_live_slot_is_redeclared_and_its_occupant_is_displaced() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let first = fresh(ns.declare(slot(1), Some(backing(10))));
 
         let over = ns.declare(slot(1), Some(backing(11)));
@@ -958,7 +1007,7 @@ mod tests {
     /// across a delete or a replacement — a claim holds a backing, not a slot.
     #[test]
     fn a_redeclaration_leaves_accepted_work_reading_the_old_backing() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let first = fresh(ns.declare(slot(1), Some(backing(10))));
         let held = ns.resolve(first).expect("live");
         let held = ns.acquire(held);
@@ -987,7 +1036,7 @@ mod tests {
     /// its own declaration is using is never reported free.
     #[test]
     fn redeclaring_a_slot_at_the_same_backing_frees_nothing() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let first = fresh(ns.declare(slot(1), Some(backing(10))));
         let over = ns.declare(slot(1), Some(backing(10)));
         assert_ne!(over.id, first, "a new declaration is a new generation");
@@ -1010,7 +1059,7 @@ mod tests {
     /// the same storage back to two callers.
     #[test]
     fn redeclaring_over_a_deleted_slot_displaces_nothing() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let first = fresh(ns.declare(slot(1), Some(backing(10))));
         assert_eq!(
             ns.delete(first),
@@ -1026,7 +1075,7 @@ mod tests {
     /// Work planned against the old bytes keeps reading the old bytes.
     #[test]
     fn replacing_the_memory_moves_the_name_and_not_the_accepted_work() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let id = fresh(ns.declare(slot(1), Some(backing(10))));
         let old = ns.resolve(id).expect("live");
         let old = ns.acquire(old);
@@ -1054,7 +1103,7 @@ mod tests {
     /// Two uses of one backing, released one at a time.
     #[test]
     fn a_detached_backing_survives_until_its_last_use_retires() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let id = fresh(ns.declare(slot(1), Some(backing(10))));
         let a = ns.resolve(id).expect("live");
         let a = ns.acquire(a);
@@ -1075,7 +1124,7 @@ mod tests {
     /// Deleting twice would hand two callers the same teardown.
     #[test]
     fn deleting_twice_is_refused() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let id = fresh(ns.declare(slot(1), Some(backing(10))));
         assert_eq!(
             ns.delete(id).expect("live").backing(),
@@ -1087,8 +1136,9 @@ mod tests {
 
     #[test]
     fn a_name_that_was_never_declared_refuses_by_its_own_reason() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let name = ResourceId {
+            task: crate::identity::TaskId(0),
             slot: slot(4),
             generation: SlotGeneration(1),
         };
@@ -1113,7 +1163,7 @@ mod tests {
     /// cannot read as a valid name.
     #[test]
     fn the_first_declaration_does_not_use_the_default_generation() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let id = fresh(ns.declare(slot(1), Some(backing(10))));
         assert_ne!(id.generation, SlotGeneration::default());
     }
@@ -1126,7 +1176,7 @@ mod tests {
     /// generation, so work still carrying the old id no longer names it.
     #[test]
     fn a_ref_resolves_to_the_slots_live_occupant_and_its_generation() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         assert_eq!(ns.resource(1), None, "nothing has been declared");
         let first = fresh(ns.declare(slot(1), Some(backing(10))));
         assert_eq!(ns.resource(1), Some(first));
@@ -1157,7 +1207,7 @@ mod tests {
     /// and a reader has to be able to tell them apart.
     #[test]
     fn resolving_for_identity_is_not_a_lease() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let id = fresh(ns.declare(slot(1), Some(backing(10))));
         let before = ns.census();
         assert_eq!(ns.resource(1), Some(id));
@@ -1180,7 +1230,7 @@ mod tests {
     /// the heap's backing — so a delete of one of them must hand nothing back.
     #[test]
     fn a_backing_two_names_share_is_not_handed_back_when_one_of_them_goes() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let b = backing(7);
         let a = fresh(ns.declare(slot(1), Some(b)));
         let c = fresh(ns.declare(slot(2), Some(b)));
@@ -1221,7 +1271,7 @@ mod tests {
     /// release can ever deliver.
     #[test]
     fn a_delete_another_live_name_answers_for_says_so() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let b = backing(7);
         let a = fresh(ns.declare(slot(1), Some(b)));
         let c = fresh(ns.declare(slot(2), Some(b)));
@@ -1237,7 +1287,7 @@ mod tests {
     /// same storage back.
     #[test]
     fn a_backing_a_name_returns_to_is_handed_back_once() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let b = backing(7);
         let id = fresh(ns.declare(slot(1), Some(b)));
         let lease = ns.resolve(id).expect("live");
@@ -1275,7 +1325,7 @@ mod tests {
     /// pay them off.
     #[test]
     fn a_redeclared_slot_does_not_absorb_the_previous_occupants_release() {
-        let mut ns = Namespace::new();
+        let mut ns = Namespace::new(TaskId(0));
         let b = backing(7);
         let first = fresh(ns.declare(slot(1), Some(b)));
         let lease = ns.resolve(first).expect("live");
@@ -1376,7 +1426,7 @@ mod tests {
 
         for seed in 0..384u64 {
             let mut rng = Rng::new(seed);
-            let mut ns = Namespace::new();
+            let mut ns = Namespace::new(TaskId(0));
             let mut shadow: HashMap<ObjectListRef, ShadowSlot> = HashMap::new();
             // Claims whose occupancy has let go of them: per backing, because
             // several names may have shared it.
@@ -1444,6 +1494,7 @@ mod tests {
                         );
                         let expected = displaced.map(|old| Displaced {
                             id: ResourceId {
+                                task: crate::identity::TaskId(0),
                                 slot: sl,
                                 generation: old.generation,
                             },
@@ -1675,6 +1726,7 @@ mod tests {
                             .iter()
                             .filter(|(_, s)| !s.deleted)
                             .map(|(sl, s)| ResourceId {
+                                task: crate::identity::TaskId(0),
                                 slot: *sl,
                                 generation: s.generation,
                             })
@@ -1816,6 +1868,7 @@ mod tests {
             Refusal::StaleGeneration { .. } => *stale += 1,
             Refusal::Deleted { .. } => *deleted += 1,
             Refusal::NotDeclared { .. } => *undeclared += 1,
+            Refusal::WrongTask { .. } => panic!("history only issues names in its own task"),
         }
     }
 }
