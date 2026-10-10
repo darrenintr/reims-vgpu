@@ -569,9 +569,17 @@ pub fn device_window_stop(id: u64) -> bool {
                     .field("id", id)
                     .fail();
             }
-            // A panic in the window thread; the default panic hook already wrote
-            // its message to stderr, and there is no guest command to decline.
-            Err(_) => {}
+            // A panic in the window thread. The default hook has written the
+            // location to stderr; the typed record keeps the message on the
+            // always-on channel, since a lost window is not visible otherwise.
+            Err(payload) => {
+                let error = crate::host_window::present::WindowError::ThreadPanicked(
+                    crate::observe::panic::payload_text(payload.as_ref()),
+                );
+                crate::observe::Emit::decline("host_window_run", &error)
+                    .field("id", id)
+                    .fail();
+            }
         }
     }
     true
