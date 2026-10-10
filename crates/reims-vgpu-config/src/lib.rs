@@ -1300,6 +1300,29 @@ choices! {
 pub const RAIL: &str = "REIMS_VGPU_RAIL";
 }
 
+// Test-harness inputs, not switches. They name where the wire oracle's capture
+// lives and whether its absence is fatal to a build. The device never reads
+// them, so they stay off `ALL` and off the boot line, and the rule above about
+// what an override may do does not apply to them. They are declared here so
+// that no crate in the workspace parses an environment variable on its own.
+
+/// Directory the wire oracle's captured fixtures are read from. Unset means the
+/// crate's own `fixtures/` directory.
+pub const WIRE_FIXTURES_DIR: &str = "REIMS_WIRE_FIXTURES_DIR";
+
+/// Presence makes a missing capture a build failure rather than a skipped suite.
+pub const WIRE_FIXTURES_REQUIRED: &str = "REIMS_WIRE_FIXTURES_REQUIRED";
+
+/// Where [`WIRE_FIXTURES_DIR`] points, or `None` when it is unset or not Unicode.
+pub fn wire_fixtures_dir() -> Option<String> {
+    std::env::var(WIRE_FIXTURES_DIR).ok()
+}
+
+/// Whether [`WIRE_FIXTURES_REQUIRED`] is present at all, empty or not.
+pub fn wire_fixtures_required() -> bool {
+    std::env::var_os(WIRE_FIXTURES_REQUIRED).is_some()
+}
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and

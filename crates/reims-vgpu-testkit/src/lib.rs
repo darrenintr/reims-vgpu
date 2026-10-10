@@ -53,8 +53,8 @@ use serde_json::Value;
 /// happens to sit.
 #[must_use]
 pub fn fixtures_dir() -> String {
-    std::env::var("REIMS_WIRE_FIXTURES_DIR")
-        .unwrap_or_else(|_| format!("{}/../reims-vgpu-wire/fixtures", env!("CARGO_MANIFEST_DIR")))
+    reims_vgpu_config::wire_fixtures_dir()
+        .unwrap_or_else(|| format!("{}/../reims-vgpu-wire/fixtures", env!("CARGO_MANIFEST_DIR")))
 }
 
 /// Apple's captured records.
@@ -133,8 +133,8 @@ pub fn probe_wire_fixtures(default_dir: &str) {
     println!("cargo:rustc-check-cfg=cfg(wire_fixtures)");
     println!("cargo:rustc-check-cfg=cfg(wire_inventory)");
 
-    let dir = std::env::var("REIMS_WIRE_FIXTURES_DIR").unwrap_or_else(|_| default_dir.to_string());
-    let required = std::env::var("REIMS_WIRE_FIXTURES_REQUIRED").is_ok();
+    let dir = reims_vgpu_config::wire_fixtures_dir().unwrap_or_else(|| default_dir.to_string());
+    let required = reims_vgpu_config::wire_fixtures_required();
 
     let mut absent = false;
 

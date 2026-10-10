@@ -13,3 +13,6 @@ name = "reims_vgpu_testkit"
 # supports would make one of them unable to use it.
 [dependencies]
 serde_json = "1"
+# Where the capture lives and whether it is required. Operator inputs are parsed
+# in one place, and that place has no dependencies.
+reims-vgpu-config = { path = "../reims-vgpu-config" }
