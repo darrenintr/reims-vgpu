@@ -258,6 +258,12 @@ pub enum ResolveRefusal {
     /// list is a barrier that orders less than the guest asked for, which is
     /// worse than one that did not happen.
     ArenaOverflow { wanted: usize },
+    /// A bind's run of slots passes the top of the `u32` slot index space.
+    ///
+    /// The slot numbers are the guest's and nothing upstream bounds them, so
+    /// `first` plus the entry count can wrap. The model does not guess where
+    /// the tail went.
+    BindSlotsOverflow { first: u32, count: usize },
 }
 
 impl ResolveRefusal {
@@ -269,6 +275,7 @@ impl ResolveRefusal {
             Self::UnknownRef { .. } => "resolve_ref_names_no_object",
             Self::UndefinedOrdinal { .. } => "resolve_field_ordinal_undefined",
             Self::ArenaOverflow { .. } => "resolve_list_exceeds_arena_window",
+            Self::BindSlotsOverflow { .. } => "resolve_bind_slots_exceed_index_space",
         }
     }
 }
@@ -623,6 +630,24 @@ fn window(at: usize, count: usize) -> Result<(u32, u32), ResolveRefusal> {
     Ok((start, len))
 }
 
+/// Check that `count` slots from `first` all exist in the guest's `u32` slot
+/// index space.
+///
+/// The run is the guest's, and the slot numbers are not bounded by anything
+/// upstream. A run that passes `u32::MAX` has no slot for its tail, and
+/// applying the head while dropping the tail binds less than the record asked
+/// for, which is worse than refusing it.
+fn slots(first: u32, count: usize) -> Result<(), ResolveRefusal> {
+    // One past the last slot, in a type wide enough that the sum cannot wrap.
+    let end = u64::try_from(count)
+        .ok()
+        .and_then(|count| count.checked_add(u64::from(first)));
+    match end {
+        Some(end) if end <= u64::from(u32::MAX) + 1 => Ok(()),
+        _ => Err(ResolveRefusal::BindSlotsOverflow { first, count }),
+    }
+}
+
 /// Append resolved buffer bindings and name the window.
 ///
 /// `stride` is the operation's, not the entry's: the record's opcode decides
@@ -631,8 +656,10 @@ fn window(at: usize, count: usize) -> Result<(u32, u32), ResolveRefusal> {
 fn append_buffer_binds(
     arenas: &mut ExecArenas,
     resolver: &impl RefResolver,
+    first: u32,
     entries: &[BufferBind],
 ) -> Result<BindSpan, ResolveRefusal> {
+    slots(first, entries.len())?;
     let (start, len) = window(arenas.buffer_bindings.len(), entries.len())?;
     let mark = arenas.buffer_bindings.len();
     arenas.buffer_bindings.reserve(entries.len());
@@ -656,8 +683,10 @@ fn append_buffer_binds(
 fn append_stride_binds(
     arenas: &mut ExecArenas,
     resolver: &impl RefResolver,
+    first: u32,
     entries: &[BufferStrideBind],
 ) -> Result<BindSpan, ResolveRefusal> {
+    slots(first, entries.len())?;
     let (start, len) = window(arenas.buffer_bindings.len(), entries.len())?;
     let mark = arenas.buffer_bindings.len();
     arenas.buffer_bindings.reserve(entries.len());
@@ -681,8 +710,10 @@ fn append_stride_binds(
 fn append_object_binds(
     arenas: &mut ExecArenas,
     resolver: &impl RefResolver,
+    first: u32,
     entries: &[RefBind],
 ) -> Result<BindSpan, ResolveRefusal> {
+    slots(first, entries.len())?;
     let (start, len) = window(arenas.object_bindings.len(), entries.len())?;
     let mark = arenas.object_bindings.len();
     arenas.object_bindings.reserve(entries.len());
@@ -709,8 +740,10 @@ fn append_object_binds(
 fn append_sampler_lod_binds(
     arenas: &mut ExecArenas,
     resolver: &impl RefResolver,
+    first: u32,
     entries: &[SamplerLodBind],
 ) -> Result<BindSpan, ResolveRefusal> {
+    slots(first, entries.len())?;
     let (start, len) = window(arenas.object_bindings.len(), entries.len())?;
     let mark = arenas.object_bindings.len();
     arenas.object_bindings.reserve(entries.len());
@@ -760,7 +793,7 @@ pub fn compute(
         ComputeRecord::BindBuffers(protocol_compute::BindBuffers { first, entries }) => {
             ComputeOp::BindBuffers {
                 first,
-                entries: append_buffer_binds(arenas, resolver, entries)?,
+                entries: append_buffer_binds(arenas, resolver, first, entries)?,
             }
         }
         ComputeRecord::BindBuffersWithStride(protocol_compute::BindBuffersWithStride {
@@ -768,18 +801,18 @@ pub fn compute(
             entries,
         }) => ComputeOp::BindBuffersWithStride {
             first,
-            entries: append_stride_binds(arenas, resolver, entries)?,
+            entries: append_stride_binds(arenas, resolver, first, entries)?,
         },
         ComputeRecord::BindTextures(protocol_compute::BindTextures { first, entries }) => {
             ComputeOp::BindTextures {
                 first,
-                entries: append_object_binds(arenas, resolver, entries)?,
+                entries: append_object_binds(arenas, resolver, first, entries)?,
             }
         }
         ComputeRecord::BindSamplers(protocol_compute::BindSamplers { first, entries }) => {
             ComputeOp::BindSamplers {
                 first,
-                entries: append_object_binds(arenas, resolver, entries)?,
+                entries: append_object_binds(arenas, resolver, first, entries)?,
             }
         }
         ComputeRecord::BindSamplersWithLod(protocol_compute::BindSamplersWithLod {
@@ -787,7 +820,7 @@ pub fn compute(
             entries,
         }) => ComputeOp::BindSamplersWithLod {
             first,
-            entries: append_sampler_lod_binds(arenas, resolver, entries)?,
+            entries: append_sampler_lod_binds(arenas, resolver, first, entries)?,
         },
         ComputeRecord::RebindBufferOffset(protocol_compute::RebindBufferOffset {
             index,
@@ -1035,14 +1068,14 @@ pub fn render(
         }) => RenderOp::BindBuffers {
             stage,
             first,
-            entries: append_buffer_binds(arenas, resolver, entries)?,
+            entries: append_buffer_binds(arenas, resolver, first, entries)?,
         },
         RenderRecord::BindBuffersWithStride(protocol_render::BindBuffersWithStride {
             first,
             entries,
         }) => RenderOp::BindBuffersWithStride {
             first,
-            entries: append_stride_binds(arenas, resolver, entries)?,
+            entries: append_stride_binds(arenas, resolver, first, entries)?,
         },
         RenderRecord::BindTextures(protocol_render::BindTextures {
             stage,
@@ -1051,7 +1084,7 @@ pub fn render(
         }) => RenderOp::BindTextures {
             stage,
             first,
-            entries: append_object_binds(arenas, resolver, entries)?,
+            entries: append_object_binds(arenas, resolver, first, entries)?,
         },
         RenderRecord::BindSamplers(protocol_render::BindSamplers {
             stage,
@@ -1060,7 +1093,7 @@ pub fn render(
         }) => RenderOp::BindSamplers {
             stage,
             first,
-            entries: append_object_binds(arenas, resolver, entries)?,
+            entries: append_object_binds(arenas, resolver, first, entries)?,
         },
         RenderRecord::BindSamplersWithLod(protocol_render::BindSamplersWithLod {
             stage,
@@ -1069,7 +1102,7 @@ pub fn render(
         }) => RenderOp::BindSamplersWithLod {
             stage,
             first,
-            entries: append_sampler_lod_binds(arenas, resolver, entries)?,
+            entries: append_sampler_lod_binds(arenas, resolver, first, entries)?,
         },
         RenderRecord::RebindBufferOffset(protocol_render::RebindBufferOffset {
             stage,
@@ -1607,6 +1640,37 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// A bind run that would pass the top of the slot index space is refused
+    /// whole. Applying the head and cutting the tail short binds less than the
+    /// record asked for, and leaves nothing in the arena to say so.
+    #[test]
+    fn a_bind_run_past_the_top_of_the_slot_space_is_refused_whole() {
+        let live = Live(vec![5151]);
+        let mut arenas = ExecArenas::default();
+        let entries = [buffer_entry(5151, 0), buffer_entry(5151, 0)];
+        let record = ComputeRecord::BindBuffers(protocol_compute::BindBuffers {
+            first: u32::MAX,
+            entries: &entries,
+        });
+        let refused = compute(&record, &live, &mut arenas).expect_err("the run wraps");
+        assert_eq!(
+            refused,
+            ResolveRefusal::BindSlotsOverflow {
+                first: u32::MAX,
+                count: 2,
+            }
+        );
+        assert!(arenas.buffer_bindings.is_empty());
+
+        // The last slot is still a slot: one entry at u32::MAX is in range.
+        let last = [buffer_entry(5151, 0)];
+        let record = ComputeRecord::BindBuffers(protocol_compute::BindBuffers {
+            first: u32::MAX,
+            entries: &last,
+        });
+        assert!(compute(&record, &live, &mut arenas).is_ok());
     }
 
     /// A nonzero ref that names nothing is still a refusal. Only zero is an
@@ -2304,6 +2368,10 @@ mod tests {
                 value: 9,
             },
             ResolveRefusal::ArenaOverflow { wanted: 2 },
+            ResolveRefusal::BindSlotsOverflow {
+                first: u32::MAX,
+                count: 2,
+            },
         ];
         // The list above must name every variant this module raises. Spelled
         // out here without a wildcard so that adding a variant stops the build
@@ -2313,7 +2381,8 @@ mod tests {
                 ResolveRefusal::Decode(_)
                 | ResolveRefusal::UnknownRef { .. }
                 | ResolveRefusal::UndefinedOrdinal { .. }
-                | ResolveRefusal::ArenaOverflow { .. } => {}
+                | ResolveRefusal::ArenaOverflow { .. }
+                | ResolveRefusal::BindSlotsOverflow { .. } => {}
             }
         }
         let mut seen: Vec<&str> = mine.iter().map(|r| r.reason()).collect();
