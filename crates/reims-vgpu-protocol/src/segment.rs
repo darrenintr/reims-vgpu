@@ -404,8 +404,12 @@ impl<'a> SegmentStream<'a> {
                 remaining: remaining as u32,
             });
         }
-        let header = segment_header(&self.bytes[self.cursor..])
-            .expect("the allocation is present, and the fields are shorter than it");
+        let Ok(header) = segment_header(&self.bytes[self.cursor..]) else {
+            return Err(FramingRefusal::ShortHeader {
+                at,
+                remaining: remaining as u32,
+            });
+        };
         let length = header.length.get();
         let length_usize = length as usize;
         if length_usize < SEGMENT_HEADER_LEN {
@@ -444,8 +448,9 @@ impl<'a> SegmentStream<'a> {
                 if window.len() != PROTECTION_OPTIONS_ENVELOPE_LEN {
                     return Err(FramingRefusal::EnvelopeWindowNotItsPayload { at, length });
                 }
-                let envelope = protection_options_envelope(window)
-                    .expect("the window is exactly the payload's length");
+                let Ok(envelope) = protection_options_envelope(window) else {
+                    return Err(FramingRefusal::EnvelopeWindowNotItsPayload { at, length });
+                };
                 SegmentBody::ProtectionEnvelope {
                     options: envelope.protection_options.get(),
                 }
