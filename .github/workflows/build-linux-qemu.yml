@@ -33,7 +33,7 @@ jobs:
             libpipewire-0.3-dev libpulse-dev libasound2-dev \
             libcapstone-dev libgnutls28-dev libgcrypt20-dev \
             libfdt-dev liburing-dev libseccomp-dev libusb-1.0-0-dev \
-            libcap-ng-dev zlib1g-dev libzstd-dev liblz4-dev libbzip2-dev \
+            libcap-ng-dev zlib1g-dev libzstd-dev liblz4-dev libbz2-dev \
             libvulkan1 llvm spirv-tools zstd
       - name: Build Reims PCI GOP ROM
         run: bash crates/reims-vgpu-efi/scripts/reims-vgpu-efi-rom/reims-vgpu-efi-rom.sh
