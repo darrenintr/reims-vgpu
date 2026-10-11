@@ -586,6 +586,10 @@ pub enum WindowError {
     /// operator can see what the parse rejected. The one variant here that does
     /// not end anything.
     FullscreenValue(String),
+    /// The window thread panicked. Known only at its join, where the payload is
+    /// all that remains: the default panic hook has already written the location
+    /// to stderr. The window is gone, and this is the record of it.
+    ThreadPanicked(String),
 }
 
 impl WindowError {
@@ -601,7 +605,8 @@ impl WindowError {
             | Self::AttachDisplayHandle(d)
             | Self::AttachWindowHandle(d)
             | Self::AttachPresenter(d)
-            | Self::FullscreenValue(d) => Some(d),
+            | Self::FullscreenValue(d)
+            | Self::ThreadPanicked(d) => Some(d),
             Self::AlreadyOwned { .. }
             | Self::NoRegisteredWindow { .. }
             | Self::WrongOwner { .. } => None,
@@ -629,6 +634,7 @@ impl crate::observe::Decline for WindowError {
             Self::AttachWindowHandle(_) => "window_attach_window_handle",
             Self::AttachPresenter(_) => "window_attach_presenter",
             Self::FullscreenValue(_) => "window_fullscreen_unrecognized",
+            Self::ThreadPanicked(_) => "window_thread_panicked",
         }
     }
 
@@ -2402,6 +2408,7 @@ mod tests {
             WindowError::AttachWindowHandle("no window handle".into()),
             WindowError::AttachPresenter("swapchain unavailable".into()),
             WindowError::FullscreenValue("borderless please".into()),
+            WindowError::ThreadPanicked("index out of bounds".into()),
         ]
     }
 
@@ -2420,6 +2427,7 @@ mod tests {
             WindowError::AttachWindowHandle(_) => "AttachWindowHandle",
             WindowError::AttachPresenter(_) => "AttachPresenter",
             WindowError::FullscreenValue(_) => "FullscreenValue",
+            WindowError::ThreadPanicked(_) => "ThreadPanicked",
         }
     }
 
@@ -2479,14 +2487,14 @@ mod tests {
     /// drawn. Re-adding a presenter here means re-adding that family, and this
     /// count is what makes that a deliberate act.
     ///
-    /// The eleven: building the event loop, running it (one variant per entry
+    /// The twelve: building the event loop, running it (one variant per entry
     /// point), the three ways the single process window can be claimed by the
     /// wrong device, creating the native window, the three steps of the
-    /// presenter attach, and the geometry the operator asked for being
-    /// unreadable. That
-    /// last one is the only variant that ends nothing, and it belongs here for
-    /// the same reason as the rest: it is a statement about bringing the window
-    /// up, made once, before there is a window.
+    /// presenter attach, the geometry the operator asked for being unreadable,
+    /// and the window thread panicking. The last two are the only variants that
+    /// do not come from bringing the window up, and neither adds a rail: the
+    /// unreadable geometry ends nothing, and the thread panic is found at the
+    /// join that ends the window.
     #[test]
     fn the_window_types_only_its_own_lifecycle_refusals() {
         use crate::observe::Decline as _;
@@ -2499,7 +2507,7 @@ mod tests {
         );
         assert_eq!(
             names.len(),
-            11,
+            12,
             "WindowError carries {} variants; a presenter-shaped family here is \
              a second rail that no fail line distinguishes",
             names.len()
