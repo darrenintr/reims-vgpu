@@ -46,10 +46,12 @@
 //!
 //! The `air.*` functions the kernel calls are given bodies (math as LLVM
 //! intrinsics, conversions as casts, the threadgroup barrier as OpenCL's
-//! `barrier`, relaxed read-modify-write atomics as `atomicrmw`). A kernel calling
-//! one this module does not know is refused by name, as is any argument kind it
-//! does not carry yet: textures, samplers, threadgroup-memory parameters,
-//! argument buffers, SIMD-group builtins.
+//! `barrier`, relaxed read-modify-write atomics as `atomicrmw`, and 2D texture
+//! reads, writes, size queries and sampler-argument sampling as OpenCL image
+//! built-ins; see [`textures`]). A kernel calling one this module does not know
+//! is refused by name, as is any argument kind it does not carry yet:
+//! threadgroup-memory parameters, argument buffers, SIMD-group builtins, and
+//! textures that are not plain 2D or samplers declared `constexpr`.
 
 use metal2vulkan::reflect::{ResourceKind, ShaderReflection};
 
@@ -284,6 +286,107 @@ pub fn reflection_for(
                 })
             })
             .collect::<Result<Vec<_>, ClspvRefusal>>()?;
+    let mut bindings = bindings;
+    for t in &adapted.textures {
+        use metal2vulkan::meta::{TextureComponent, TextureDimension, TextureFormat, TextureShape};
+        use metal2vulkan::reflect::ResourceAccess;
+        use textures::Component;
+        let writable = t.access.writable();
+        let band = if writable {
+            layout.storage_textures
+        } else {
+            layout.sampled_textures
+        };
+        let binding = band
+            .binding(t.metal_index)
+            .ok_or_else(|| ClspvRefusal::Interface {
+                detail: format!("texture index {} is past its band", t.metal_index),
+            })?;
+        let component = match t.component {
+            Component::Float | Component::Half => TextureComponent::Float,
+            Component::Uint | Component::Ushort => TextureComponent::Uint,
+            Component::Int | Component::Short => TextureComponent::Sint,
+        };
+        // The declared storage format the dispatcher specializes against the
+        // bound surface: the same defaults metal2vulkan declares for each
+        // component, so the bind-time rules see the declarations they expect.
+        let storage_format = writable.then_some(match t.component {
+            Component::Float => TextureFormat::R32f,
+            Component::Half => TextureFormat::Rgba16f,
+            Component::Uint => TextureFormat::Rgba8ui,
+            Component::Ushort => TextureFormat::Rgba16ui,
+            Component::Int => TextureFormat::Rgba8i,
+            Component::Short => TextureFormat::Rgba16i,
+        });
+        bindings.push(ResourceBinding {
+            kind: if writable {
+                ResourceKind::StorageImage
+            } else {
+                ResourceKind::Texture
+            },
+            metal_index: t.metal_index,
+            descriptor: Some(DescriptorLocation {
+                set: layout.set,
+                binding,
+                count: 1,
+            }),
+            param_index: Some(t.param),
+            stage_input_location: None,
+            address_space: None,
+            declared_size: None,
+            extent: None,
+            footprint: None,
+            type_layout: None,
+            type_name: None,
+            texture_shape: Some(TextureShape {
+                dimension: TextureDimension::D2,
+                arrayed: false,
+                multisampled: false,
+                component,
+                writable,
+                array_ref: false,
+                array_length: None,
+                storage_format,
+            }),
+            embedded_source: None,
+            access: Some(if writable {
+                ResourceAccess::Storage
+            } else {
+                ResourceAccess::Sampled
+            }),
+            static_sampler: None,
+        });
+    }
+    for smp in &adapted.samplers {
+        let binding =
+            layout
+                .samplers
+                .binding(smp.metal_index)
+                .ok_or_else(|| ClspvRefusal::Interface {
+                    detail: format!("sampler index {} is past its band", smp.metal_index),
+                })?;
+        bindings.push(ResourceBinding {
+            kind: ResourceKind::Sampler,
+            metal_index: smp.metal_index,
+            descriptor: Some(DescriptorLocation {
+                set: layout.set,
+                binding,
+                count: 1,
+            }),
+            param_index: Some(smp.param),
+            stage_input_location: None,
+            address_space: None,
+            declared_size: None,
+            extent: None,
+            footprint: None,
+            type_layout: None,
+            type_name: None,
+            texture_shape: None,
+            embedded_source: None,
+            access: None,
+            static_sampler: None,
+        });
+    }
     Ok(ShaderReflection {
         reflection_version: REFLECTION_VERSION,
         descriptor_layout: layout,
@@ -324,6 +427,13 @@ pub struct Adapted {
     /// The kernel's buffers, in wrapper-argument order (`interface[ordinal]`
     /// is the buffer `buffers[ordinal]` names).
     pub interface: Vec<KernelBuffer>,
+    /// The kernel's texture arguments.
+    pub textures: Vec<textures::KernelTexture>,
+    /// The kernel's sampler arguments.
+    pub samplers: Vec<textures::KernelSampler>,
+    /// `ordinals[n]` is the AIR parameter the wrapper's argument `n` carries,
+    /// whatever its kind. The region struct is the argument after the last.
+    pub ordinals: Vec<u32>,
     /// The kernel's own name, unquoted and without `@`.
     pub kernel_name: String,
     /// The AIR `target datalayout`, kept in the module and reported.
@@ -332,7 +442,7 @@ pub struct Adapted {
 
 impl Adapted {
     fn region_ordinal(&self) -> u32 {
-        self.buffers.len() as u32
+        self.ordinals.len() as u32
     }
 }
 
@@ -362,6 +472,8 @@ struct AirArg {
     access: Option<metal2vulkan::reflect::ResourceAccess>,
     buffer_size: Option<u32>,
     type_size: Option<u32>,
+    /// `air.arg_type_name`: what a texture's access and component are read from.
+    type_name: Option<String>,
 }
 
 /// Rewrite AIR disassembly into IR clspv compiles: a `spir_kernel` wrapper named
@@ -402,6 +514,21 @@ pub fn adapt(ll: &str) -> Result<Adapted, ClspvRefusal> {
         }
     }
 
+    // Which parameters are texture or sampler handles, by position.
+    let mut handle_kinds = Vec::with_capacity(args.len());
+    for arg in &args {
+        handle_kinds.push(match arg.kind.as_str() {
+            "air.texture" => Some(textures::Handle::Image(
+                textures::parse_texture(arg.index, arg.type_name.as_deref())?.0,
+            )),
+            "air.sampler" => Some(textures::Handle::Sampler),
+            _ => None,
+        });
+    }
+    let mut handles = std::collections::HashMap::new();
+    let mut used_textures = textures::UsedVariants::new();
+    let mut in_body = false;
+
     let mut out = String::with_capacity(ll.len() + 4096);
     let mut define_params = None;
     let mut air_decls = Vec::new();
@@ -424,11 +551,27 @@ pub fn adapt(ll: &str) -> Result<Adapted, ClspvRefusal> {
             continue;
         }
         if trimmed.starts_with("define ") && define_names(trimmed, &name) {
-            let (renamed, params) = rename_define(trimmed, &name)?;
+            let (renamed, params, names) = rename_define(trimmed, &name, &handle_kinds)?;
+            for (kind, value) in handle_kinds.iter().zip(&names) {
+                if let Some(kind) = kind {
+                    handles.insert(value.clone(), *kind);
+                }
+            }
             define_params = Some(params);
             out.push_str(&renamed);
             out.push('\n');
+            in_body = true;
             continue;
+        }
+        if in_body {
+            if trimmed == "}" {
+                in_body = false;
+            } else if !handles.is_empty() {
+                let rewritten = textures::rewrite_body_line(line, &handles, &mut used_textures)?;
+                out.push_str(&strip_alias_attachments(&rewritten));
+                out.push('\n');
+                continue;
+            }
         }
         if trimmed.starts_with('!') {
             // Metadata that named the kernel (the node `!air.kernel` listed,
@@ -456,15 +599,34 @@ pub fn adapt(ll: &str) -> Result<Adapted, ClspvRefusal> {
     }
 
     let mut decls = Declarations::new(&defined);
+    let symbol_of = |decl: &str| {
+        decl.find("@air.").and_then(|at| {
+            decl[at..]
+                .find('(')
+                .map(|open| decl[at + 1..at + open].to_owned())
+        })
+    };
     for decl in &air_decls {
+        // Texture functions are defined per image access below, from the uses
+        // the body rewrite recorded; an unused one needs no body.
+        if symbol_of(decl).is_some_and(|s| textures::is_texture_function(&s)) {
+            continue;
+        }
         out.push_str(&air_definition(decl, &mut decls)?);
     }
-    let (wrapper, interface) = wrapper(&name, &params, &args, &mut decls)?;
-    let buffers = interface.iter().map(|b| b.param).collect();
+    for (renamed, (original, access)) in &used_textures {
+        let decl = air_decls
+            .iter()
+            .find(|d| symbol_of(d).as_deref() == Some(original.as_str()))
+            .ok_or_else(|| shape(format!("no declaration of {original}")))?;
+        out.push_str(&textures::definition(renamed, decl, *access, &mut decls)?);
+    }
+    let built = wrapper(&name, &params, &args, &mut decls)?;
+    let buffers = built.buffers.iter().map(|b| b.param).collect();
     out.push_str(&format!(
         "\n%m2v.region = type {{ [{REGION_WORDS} x i32] }}\n"
     ));
-    out.push_str(&wrapper);
+    out.push_str(&built.text);
     out.push_str(&decls.finish());
     let datalayout = ll.lines().find_map(|l| {
         l.strip_prefix("target datalayout = \"")
@@ -475,7 +637,10 @@ pub fn adapt(ll: &str) -> Result<Adapted, ClspvRefusal> {
     Ok(Adapted {
         ir: out,
         buffers,
-        interface,
+        interface: built.buffers,
+        textures: built.textures,
+        samplers: built.samplers,
+        ordinals: built.ordinals,
         kernel_name,
         datalayout,
     })
@@ -497,21 +662,53 @@ fn define_names(line: &str, name: &str) -> bool {
     line.contains(&format!("{name}("))
 }
 
-/// The kernel's definition under its body name, and its parameter types.
-fn rename_define(line: &str, name: &str) -> Result<(String, Vec<String>), ClspvRefusal> {
+/// The kernel's definition under its body name with texture and sampler
+/// parameters retyped as handles, its parameter types (as declared), and its
+/// parameter names.
+fn rename_define(
+    line: &str,
+    name: &str,
+    handles: &[Option<textures::Handle>],
+) -> Result<(String, Vec<String>, Vec<String>), ClspvRefusal> {
     let at = line
         .find(&format!("{name}("))
         .ok_or_else(|| shape(format!("definition of {name} not found")))?;
     let open = at + name.len();
     let close = matching_paren(line, open)
         .ok_or_else(|| shape(format!("unbalanced parameter list for {name}")))?;
-    let params = split_top(&line[open + 1..close])
-        .into_iter()
+    let raw = split_top(&line[open + 1..close]);
+    let params = raw
+        .iter()
         .map(|p| param_type(p).map(str::to_owned))
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| shape(format!("unparsed parameter list for {name}")))?;
-    let renamed = format!("{}{}{}", &line[..at], body_name(name), &line[open..]);
-    Ok((renamed, params))
+    let names = raw
+        .iter()
+        .map(|p| {
+            p.split_whitespace()
+                .last()
+                .filter(|t| t.starts_with('%'))
+                .map(str::to_owned)
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| shape(format!("unnamed parameter in {name}")))?;
+    let list = raw
+        .iter()
+        .zip(&names)
+        .enumerate()
+        .map(|(i, (p, n))| match handles.get(i).copied().flatten() {
+            Some(handle) => format!("{} {n}", handle.llvm_type()),
+            None => (*p).to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let renamed = format!(
+        "{}{}({list}){}",
+        &line[..at],
+        body_name(name),
+        &line[close + 1..]
+    );
+    Ok((renamed, params, names))
 }
 
 /// The type at the front of one parameter: `ptr addrspace(1)`, `<3 x i32>`, `i32`.
@@ -571,6 +768,12 @@ fn air_arg(node: &str) -> Result<AirArg, ClspvRefusal> {
         access,
         buffer_size: int_after("air.buffer_size"),
         type_size: int_after("air.arg_type_size"),
+        type_name: fields
+            .iter()
+            .position(|f| metadata_string(f) == Some("air.arg_type_name"))
+            .and_then(|at| fields.get(at + 1))
+            .and_then(|v| metadata_string(v))
+            .map(str::to_owned),
     })
 }
 
@@ -632,8 +835,11 @@ fn wrapper(
     params: &[String],
     args: &[AirArg],
     decls: &mut Declarations<'_>,
-) -> Result<(String, Vec<KernelBuffer>), ClspvRefusal> {
+) -> Result<Wrapper, ClspvRefusal> {
     let mut sig = Vec::new();
+    let mut textures_out = Vec::new();
+    let mut samplers_out = Vec::new();
+    let mut ordinals = Vec::new();
     let mut body = String::new();
     let mut call_args = Vec::new();
     let mut buffers = Vec::new();
@@ -683,6 +889,36 @@ fn wrapper(
                 buffer_size: arg.buffer_size,
                 type_size: arg.type_size,
             });
+            ordinals.push(arg.index);
+            continue;
+        }
+        if arg.kind == "air.texture" || arg.kind == "air.sampler" {
+            let metal_index = arg
+                .location_index
+                .ok_or_else(|| shape(format!("{} {} names no index", arg.kind, arg.index)))?;
+            let (ty, value) = if arg.kind == "air.texture" {
+                let (access, component) =
+                    textures::parse_texture(arg.index, arg.type_name.as_deref())?;
+                textures_out.push(textures::KernelTexture {
+                    param: arg.index,
+                    metal_index,
+                    access,
+                    component,
+                });
+                (access.image_type(), format!("%m2v.tex{}", arg.index))
+            } else {
+                samplers_out.push(textures::KernelSampler {
+                    param: arg.index,
+                    metal_index,
+                });
+                (
+                    textures::SAMPLER_TYPE.to_owned(),
+                    format!("%m2v.smp{}", arg.index),
+                )
+            };
+            sig.push(format!("{ty} {value}"));
+            call_args.push(format!("{ty} {value}"));
+            ordinals.push(arg.index);
             continue;
         }
         let Some(b) = builtin(&arg.kind) else {
@@ -778,7 +1014,22 @@ fn wrapper(
         body_name(name),
         call_args.join(", ")
     );
-    Ok((text, buffers))
+    Ok(Wrapper {
+        text,
+        buffers,
+        textures: textures_out,
+        samplers: samplers_out,
+        ordinals,
+    })
+}
+
+/// The wrapper kernel's text and the arguments it carries, in order.
+struct Wrapper {
+    text: String,
+    buffers: Vec<KernelBuffer>,
+    textures: Vec<textures::KernelTexture>,
+    samplers: Vec<textures::KernelSampler>,
+    ordinals: Vec<u32>,
 }
 
 fn region_word(body: &mut String, fresh: &mut impl FnMut(&str) -> String, word: u32) -> String {
@@ -1220,14 +1471,17 @@ mod reflection_op {
     pub const ARGUMENT_INFO: u32 = 2;
     pub const ARGUMENT_STORAGE_BUFFER: u32 = 3;
     pub const ARGUMENT_POD_PUSH_CONSTANT: u32 = 7;
+    pub const ARGUMENT_SAMPLED_IMAGE: u32 = 8;
+    pub const ARGUMENT_STORAGE_IMAGE: u32 = 9;
+    pub const ARGUMENT_SAMPLER: u32 = 10;
     pub const SPEC_CONSTANT_WORKGROUP_SIZE: u32 = 12;
     pub const PROPERTY_REQUIRED_WORKGROUP_SIZE: u32 = 24;
     pub const SPEC_CONSTANT_SUBGROUP_MAX_SIZE: u32 = 25;
     pub const WORKGROUP_VARIABLE_SIZE: u32 = 42;
 }
 
-/// Check clspv's module against `reflection` and move its buffers to the
-/// descriptors metal2vulkan assigned them.
+/// Check clspv's module against `reflection` and move its buffers, images and
+/// samplers to the descriptors the reflection assigns them.
 pub fn conform(
     spirv: &[u8],
     adapted: &Adapted,
@@ -1303,22 +1557,36 @@ pub fn conform(
         use reflection_op::*;
         match *inst {
             KERNEL | ARGUMENT_INFO | SPEC_CONSTANT_SUBGROUP_MAX_SIZE | WORKGROUP_VARIABLE_SIZE => {}
-            ARGUMENT_STORAGE_BUFFER if operands.len() >= 4 => {
+            ARGUMENT_STORAGE_BUFFER
+            | ARGUMENT_SAMPLED_IMAGE
+            | ARGUMENT_STORAGE_IMAGE
+            | ARGUMENT_SAMPLER
+                if operands.len() >= 4 =>
+            {
+                // The resource kind the reflection must give this argument:
+                // clspv's descriptor class and the dispatcher's have to agree,
+                // or the descriptor written at bind time is the wrong type.
+                let kind = match *inst {
+                    ARGUMENT_STORAGE_BUFFER => ResourceKind::Buffer,
+                    ARGUMENT_SAMPLED_IMAGE => ResourceKind::Texture,
+                    ARGUMENT_STORAGE_IMAGE => ResourceKind::StorageImage,
+                    _ => ResourceKind::Sampler,
+                };
                 let ordinal = value(operands[1])?;
                 let from = (value(operands[2])?, value(operands[3])?);
                 let param = *adapted
-                    .buffers
+                    .ordinals
                     .get(ordinal as usize)
-                    .ok_or_else(|| iface(format!("storage buffer at ordinal {ordinal}")))?;
+                    .ok_or_else(|| iface(format!("{kind:?} at ordinal {ordinal}")))?;
                 let to = reflection
                     .bindings
                     .iter()
-                    .find(|b| b.kind == ResourceKind::Buffer && b.param_index == Some(param))
+                    .find(|b| b.kind == kind && b.param_index == Some(param))
                     .and_then(|b| b.descriptor)
                     .map(|d| (d.set, d.binding))
                     .ok_or_else(|| {
                         iface(format!(
-                            "metal2vulkan assigns parameter {param} no descriptor"
+                            "the reflection gives parameter {param} no {kind:?} descriptor"
                         ))
                     })?;
                 remap.insert(from, to);
@@ -1374,6 +1642,7 @@ fn spirv_string(words: &[u32]) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+mod textures;
 mod tool;
 
 #[cfg(test)]

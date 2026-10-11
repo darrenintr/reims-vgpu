@@ -47,10 +47,21 @@ compute contract:
   work-item functions plus the 48-byte dispatch-region push constant;
 - known `air.*` calls (math, conversions, the threadgroup barrier, relaxed
   `atomicrmw`) get bodies;
+- textures (`m2v_clspv/textures.rs`): a texture or sampler parameter becomes an
+  OpenCL image (`target("spirv.Image", ...)`, access read-only, write-only or
+  read-write) or sampler handle; each `air.*_texture_2d` call is renamed per
+  image access and given a body over `read_image*`, `write_image*`,
+  `get_image_width/height` and sampled `read_image*`. Carried: 2D `float`,
+  `half`, `uint`, `ushort`, `int`, `short` textures with `read`, `write`,
+  `read_write` and `sample` access; read/write and size queries at level 0;
+  sampling through a sampler argument at explicit level 0 with no offset;
 - `reflection_for` builds the `ShaderReflection` the dispatcher binds with from
   the AIR metadata: buffer `n` at set 0 binding `n`, access from `air.read` /
-  `air.read_write`, a `constant T&` object's size from `air.buffer_size`, and the
-  exact-thread dispatch contract. The reflection *type* is still metal2vulkan's,
+  `air.read_write`, a `constant T&` object's size from `air.buffer_size`; a read
+  or sampled texture at binding `32 + n`, a written one at `480 + n` with the
+  declared storage format the dispatcher specializes to the bound surface
+  (`R32f` for float, `Rgba16f` half, `Rgba8ui` uint, and so on, as metal2vulkan
+  declares), a sampler at `160 + n`; and the exact-thread dispatch contract. The reflection *type* is still metal2vulkan's,
   because the whole dispatcher (shared with graphics) speaks it; none of
   metal2vulkan's translation or analysis runs for a kernel, and the route runs
   `llvm-dis`, `clspv` and `spirv-val` through its own runner (`m2v_clspv/tool.rs`);
@@ -60,11 +71,13 @@ compute contract:
 
 **What this branch loses against metal2vulkan, by design of the request.** A
 kernel the route cannot translate is declined (`compute_vk_translate
-step=kernel_clspv_*`), with no fallback: kernels with textures or samplers,
-threadgroup-memory parameters, argument buffers, SIMD-group functions,
-non-relaxed atomics, or an `air.*` function the adapter has no body for. The
-handoff above says the Simulator's compute passes use storage images; those will
-be declined here until the route carries textures. Buffer footprints are not
+step=kernel_clspv_*`), with no fallback: kernels with constexpr samplers,
+textures that are not plain 2D (arrays, 1D, 3D, cube, depth, multisample,
+texture buffers), a non-zero texture level or sample offset, threadgroup-memory
+parameters, argument buffers, SIMD-group functions, non-relaxed atomics, or an
+`air.*` function the adapter has no body for. The Simulator's storage-image
+compute passes are 2D, so they are within reach now; only a boot will say
+whether they use anything still refused. Buffer footprints are not
 computed either, so every bound buffer is staged whole (more bytes, never
 wrong). A host with no clspv (`REIMS_VGPU_CLSPV` unset) declines every kernel
 with `kernel_clspv_binary_unset`; the Linux bundle the CI builds does not ship
@@ -78,14 +91,17 @@ How to run it:
   line). Every kernel the route serves logs `kernel_clspv used entry=...`.
 
 Verified off-VM, on lavapipe:
-- `tests/vk_kernel_clspv.rs` translates six kernels with both metal2vk (module
-  and reflection from `compile_kernel`) and metal2vulkan (oracle only), and runs
-  each with its own reflection's dispatch plan. Five write byte-identical
-  buffers (partial edge regions, threadgroup memory with barriers, 16-bit
-  builtins, relaxed atomics). On `math_convert` metal2vk matches an exact
+- `tests/vk_kernel_clspv.rs` translates eleven kernels with both metal2vk
+  (module and reflection from `compile_kernel`) and metal2vulkan (oracle only),
+  and runs each with its own reflection's dispatch plan and the storage-format
+  specialization the dispatcher applies. Ten write byte-identical buffers and
+  images (partial edge regions, threadgroup memory with barriers, 16-bit
+  builtins, relaxed atomics, float/uint/half texture reads and writes, a
+  `read_write` texture, size queries, sampler-argument sampling), each also
+  checked against known values. On `math_convert` metal2vk matches an exact
   round-to-nearest-even reference and **metal2vulkan rounds two float-to-half
   conversions toward zero** (5.562072 to 5.5586, not 5.5625).
-- The whole reims-vgpu suite with `REIMS_VGPU_CLSPV` set: 2337 passed, the same
+- The whole reims-vgpu suite with `REIMS_VGPU_CLSPV` set: 2345 passed, the same
   four failing as on master in this container (missing `vendor/qemu` checkout,
   lavapipe limits). The device path served `compute_mul3add1` and returned the
   expected values. Without clspv the same suite passes except that kernel, whose

@@ -359,3 +359,119 @@ fn the_kernel_reflection_comes_from_the_air() {
         "the dispatcher's guard accepts the description"
     );
 }
+
+/// Texture and sampler arguments become OpenCL image and sampler handles, and
+/// the description puts each in its band: a read or sampled texture at
+/// `32 + n` as a sampled image, a written one at `480 + n` as a storage image
+/// with the declared format the dispatcher specializes, a sampler at `160 + n`.
+#[test]
+fn texture_kernels_describe_their_images_and_samplers() {
+    use metal2vulkan::meta::TextureFormat;
+    let describe = |name: &str| {
+        let adapted =
+            adapt(&fixture_ll_in("clspv", name)).unwrap_or_else(|r| panic!("{name}: {r:?}"));
+        let r = reflection_for(&adapted, [4, 4, 1]).expect("reflects");
+        assert_eq!(
+            crate::runtime::spirv_bind::census_reflection_wellformed(&r, 0),
+            0,
+            "{name}"
+        );
+        (adapted, r)
+    };
+    let shape = |r: &ShaderReflection| -> Vec<_> {
+        r.bindings
+            .iter()
+            .map(|b| {
+                (
+                    b.kind,
+                    b.metal_index,
+                    b.descriptor.map(|d| d.binding),
+                    b.texture_shape.as_ref().and_then(|s| s.storage_format),
+                )
+            })
+            .collect()
+    };
+
+    let (copy, r) = describe("tex_copy.air");
+    assert!(copy
+        .ir
+        .contains("target(\"spirv.Image\", void, 1, 0, 0, 0, 0, 0, 0) %m2v.tex0"));
+    assert!(copy.ir.contains("@_Z11read_imagef14ocl_image2d_roDv2_i"));
+    assert!(copy
+        .ir
+        .contains("@_Z12write_imagef14ocl_image2d_woDv2_iDv4_f"));
+    assert!(copy.ir.contains("@_Z15get_image_width14ocl_image2d_ro"));
+    assert_eq!(
+        shape(&r),
+        vec![
+            (ResourceKind::Buffer, 0, Some(0), None),
+            (ResourceKind::Texture, 0, Some(32), None),
+            (
+                ResourceKind::StorageImage,
+                1,
+                Some(481),
+                Some(TextureFormat::R32f)
+            ),
+        ]
+    );
+
+    let (_, r) = describe("tex_rw.air");
+    assert_eq!(
+        shape(&r),
+        vec![(
+            ResourceKind::StorageImage,
+            0,
+            Some(480),
+            Some(TextureFormat::R32f)
+        )]
+    );
+    let (_, r) = describe("tex_half.air");
+    assert!(shape(&r).contains(&(
+        ResourceKind::StorageImage,
+        0,
+        Some(480),
+        Some(TextureFormat::Rgba16f)
+    )));
+    let (_, r) = describe("tex_uint.air");
+    assert!(shape(&r).contains(&(
+        ResourceKind::StorageImage,
+        1,
+        Some(481),
+        Some(TextureFormat::Rgba8ui)
+    )));
+
+    let (sample, r) = describe("tex_sample.air");
+    assert!(sample
+        .ir
+        .contains("@_Z11read_imagef14ocl_image2d_ro11ocl_samplerDv2_f"));
+    assert!(shape(&r).contains(&(ResourceKind::Sampler, 0, Some(160), None)));
+}
+
+/// A constexpr sampler is Apple's packed constant, not an argument; the route
+/// does not decode it yet and says so.
+#[test]
+fn a_constexpr_sampler_is_refused_by_name() {
+    assert_eq!(
+        adapt(&fixture_ll_in("clspv", "tex_sample_const.air")).unwrap_err(),
+        ClspvRefusal::Intrinsic {
+            name: "air.sample_texture_2d.v4f32 (constexpr sampler)".into()
+        }
+    );
+}
+
+/// A texture handle may only be passed to the AIR texture functions the route
+/// defines; handed to anything else it is refused before clspv sees it.
+#[test]
+fn a_texture_passed_to_a_helper_is_refused() {
+    let ll = module(
+        "ptr addrspace(1) %t",
+        "ptr addrspace(1) %t",
+        &["i32 0, !\"air.texture\", !\"air.location_index\", i32 0, i32 1, !\"air.read\", !\"air.arg_type_name\", !\"texture2d<float, read>\""],
+        "",
+    );
+    assert!(
+        matches!(adapt(&ll), Err(ClspvRefusal::Argument { kind, .. }) if kind.contains("passed to")),
+        "{:?}",
+        adapt(&ll).err()
+    );
+}

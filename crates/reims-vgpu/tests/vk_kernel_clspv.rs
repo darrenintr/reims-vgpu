@@ -439,3 +439,342 @@ fn the_clspv_module_follows_the_reflections_descriptors_or_is_refused() {
     );
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+// ---------------------------------------------------------------------------
+// Textures and samplers.
+// ---------------------------------------------------------------------------
+
+use reims_vgpu::backend::vulkan::engine::{
+    ComputeSampledImageResource, ComputeSampledSource, ComputeStorageImageResource,
+    SamplerResource, StorageImageFormat, StorageImageSeed,
+};
+use reims_vgpu::runtime::spirv_bind::{specialize_image_formats, ImageFormat};
+
+/// The images and samplers one texture dispatch binds, and the storage-image
+/// formats the dispatcher would specialize the module to for them.
+struct Images {
+    sampled: Vec<ComputeSampledImageResource>,
+    storage: Vec<ComputeStorageImageResource>,
+    samplers: Vec<SamplerResource>,
+    specialize: Vec<(u32, ImageFormat)>,
+}
+
+fn sampled(
+    binding: u32,
+    format: StorageImageFormat,
+    w: u32,
+    h: u32,
+    bytes: Vec<u8>,
+) -> ComputeSampledImageResource {
+    ComputeSampledImageResource {
+        binding,
+        array_element: 0,
+        descriptor_count: 1,
+        format,
+        width: w,
+        height: h,
+        mip_levels: 1,
+        source: ComputeSampledSource::Bytes(bytes),
+    }
+}
+
+fn storage(
+    binding: u32,
+    format: StorageImageFormat,
+    w: u32,
+    h: u32,
+    seed: Vec<u8>,
+) -> ComputeStorageImageResource {
+    ComputeStorageImageResource {
+        binding,
+        array_element: 0,
+        descriptor_count: 1,
+        format,
+        width: w,
+        height: h,
+        seed: StorageImageSeed::Host(seed),
+        destination: Default::default(),
+        residency: None,
+    }
+}
+
+/// One module with images: `(buffers, storage images)` read back.
+#[allow(clippy::too_many_arguments)]
+fn run_images(
+    label: &str,
+    mut spirv: Vec<u32>,
+    reflection: &ShaderReflection,
+    local_size: [u32; 3],
+    threads: [u32; 3],
+    buffers: &[(u32, Vec<u8>)],
+    images: Images,
+) -> Option<(Buffers, Buffers)> {
+    specialize_image_formats(&mut spirv, &images.specialize)
+        .unwrap_or_else(|e| panic!("{label}: specialize: {e:?}"));
+    let dispatch = reflection
+        .kernel_dispatch
+        .unwrap_or(KernelDispatch::safe_default());
+    let KernelDispatch::ThreadsDynamic {
+        offset: push_offset,
+    } = dispatch
+    else {
+        panic!("{label}: dispatch contract {dispatch:?}");
+    };
+    let plan = dispatch.plan(local_size, Some(threads)).expect("plan");
+    let req = ComputeRequest {
+        spirv,
+        entry: "main".into(),
+        dispatch: ComputeDispatch::Regions {
+            push_offset,
+            threadgroups_per_grid: plan.threadgroups_per_grid,
+            regions: plan
+                .regions
+                .iter()
+                .map(|r| ComputeDispatchRegion {
+                    local_size: r.local_size,
+                    group_count: r.group_count,
+                    push_constants: plan.push_constants(*r),
+                })
+                .collect(),
+        },
+        storage_buffers: buffers
+            .iter()
+            .map(|(binding, bytes)| ComputeBufferResource {
+                binding: *binding,
+                bytes: bytes.clone(),
+                writable: true,
+            })
+            .collect(),
+        sampled_images: images.sampled,
+        samplers: images.samplers,
+        storage_images: images.storage,
+    };
+    match engine::execute_compute_request(device(), &req) {
+        Ok(out) => Some((
+            out.buffers.into_iter().map(|b| b.bytes).collect(),
+            out.images
+                .iter()
+                .map(|i| i.bytes().expect("host readback").to_vec())
+                .collect(),
+        )),
+        Err(e) => {
+            let s = e.to_string();
+            let lower = s.to_ascii_lowercase();
+            if lower.contains("no vulkan") || lower.contains("vk_engine_init") {
+                eprintln!("SKIP {label}: no GPU ({s})");
+                None
+            } else {
+                panic!("{label}: {s}");
+            }
+        }
+    }
+}
+
+/// Both emitters over the same images; asserts they wrote the same bytes and
+/// returns metal2vk's `(buffers, storage images)`.
+fn image_parity(
+    path: &str,
+    local_size: [u32; 3],
+    threads: [u32; 3],
+    buffers: &[(u32, Vec<u8>)],
+    images: impl Fn() -> Images,
+) -> Option<(Buffers, Buffers)> {
+    let _g = session();
+    let pair = translate(path, local_size)?;
+    let m2v = run_images(
+        &format!("{path} metal2vulkan"),
+        pair.metal2vulkan,
+        &pair.m2v_reflection,
+        local_size,
+        threads,
+        buffers,
+        images(),
+    )?;
+    let clspv = run_images(
+        &format!("{path} metal2vk"),
+        pair.clspv,
+        &pair.clspv_reflection,
+        local_size,
+        threads,
+        buffers,
+        images(),
+    )?;
+    assert_eq!(clspv, m2v, "{path}: the two emitters wrote different bytes");
+    Some(clspv)
+}
+
+fn texels_f32(w: u32, h: u32, f: impl Fn(u32, u32, u32) -> f32) -> Vec<f32> {
+    let mut v = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..4 {
+                v.push(f(x, y, c));
+            }
+        }
+    }
+    v
+}
+
+/// A sampled read, a storage write and the size query.
+#[test]
+fn tex_copy_reads_writes_and_sizes() {
+    let src = texels_f32(4, 4, |x, y, c| (x + 4 * y) as f32 + c as f32 * 0.125);
+    let Some((bufs, imgs)) = image_parity(
+        "clspv/tex_copy.air",
+        [2, 2, 1],
+        [4, 4, 1],
+        &[(0, u32s(&[0, 0]))],
+        || Images {
+            sampled: vec![sampled(
+                32,
+                StorageImageFormat::Rgba32Float,
+                4,
+                4,
+                f32s(&src),
+            )],
+            storage: vec![storage(
+                481,
+                StorageImageFormat::Rgba32Float,
+                4,
+                4,
+                vec![0; 4 * 4 * 16],
+            )],
+            samplers: vec![],
+            specialize: vec![(481, ImageFormat::Rgba32Float)],
+        },
+    ) else {
+        return;
+    };
+    let want: Vec<f32> = src.iter().map(|v| v * 2.0 + 0.25).collect();
+    assert_eq!(read_f32(&imgs[0]), want);
+    assert_eq!(read_u32(&bufs[0]), vec![4, 4]);
+}
+
+/// uint read and write, components reversed and incremented.
+#[test]
+fn tex_uint_reverses_components() {
+    let src: Vec<u32> = (0..4 * 4 * 4).collect();
+    let Some((_, imgs)) =
+        image_parity("clspv/tex_uint.air", [4, 4, 1], [4, 4, 1], &[], || Images {
+            sampled: vec![sampled(
+                32,
+                StorageImageFormat::Rgba32Uint,
+                4,
+                4,
+                u32s(&src),
+            )],
+            storage: vec![storage(
+                481,
+                StorageImageFormat::Rgba32Uint,
+                4,
+                4,
+                vec![0; 4 * 4 * 16],
+            )],
+            samplers: vec![],
+            specialize: vec![(481, ImageFormat::Rgba32Uint)],
+        })
+    else {
+        return;
+    };
+    let want: Vec<u32> = src
+        .chunks(4)
+        .flat_map(|t| [t[3] + 1, t[2] + 1, t[1] + 1, t[0] + 1])
+        .collect();
+    assert_eq!(read_u32(&imgs[0]), want);
+}
+
+/// A half texture written from float data that half represents exactly.
+#[test]
+fn tex_half_writes_halves() {
+    let input = texels_f32(8, 8, |x, y, c| (x as f32 - y as f32) * 0.5 + c as f32);
+    let Some((_, imgs)) = image_parity(
+        "clspv/tex_half.air",
+        [8, 8, 1],
+        [8, 8, 1],
+        &[(0, f32s(&input))],
+        || Images {
+            sampled: vec![],
+            storage: vec![storage(
+                480,
+                StorageImageFormat::Rgba16Float,
+                8,
+                8,
+                vec![0; 8 * 8 * 8],
+            )],
+            samplers: vec![],
+            specialize: vec![(480, ImageFormat::Rgba16Float)],
+        },
+    ) else {
+        return;
+    };
+    let got: Vec<u16> = imgs[0]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect();
+    assert_eq!(got.len(), input.len());
+    for (i, (h, f)) in got.iter().zip(&input).enumerate() {
+        // Every input is a multiple of 0.5 below 16, so its half bits are exact.
+        let sign = if *f < 0.0 { 0x8000 } else { 0 };
+        let a = f.abs();
+        let want = if a == 0.0 {
+            sign
+        } else {
+            let e = a.log2().floor() as i32;
+            let mant = ((a / 2f32.powi(e) - 1.0) * 1024.0).round() as u16;
+            sign | (((e + 15) as u16) << 10) | mant
+        };
+        assert_eq!(*h, want, "texel component {i}: {f}");
+    }
+}
+
+/// A read_write texture updated in place.
+#[test]
+fn tex_rw_updates_in_place() {
+    let seed = texels_f32(4, 4, |x, y, c| (x * 10 + y) as f32 + c as f32 * 0.5);
+    let Some((_, imgs)) = image_parity("clspv/tex_rw.air", [4, 4, 1], [4, 4, 1], &[], || Images {
+        sampled: vec![],
+        storage: vec![storage(
+            480,
+            StorageImageFormat::Rgba32Float,
+            4,
+            4,
+            f32s(&seed),
+        )],
+        samplers: vec![],
+        specialize: vec![(480, ImageFormat::Rgba32Float)],
+    }) else {
+        return;
+    };
+    let want: Vec<f32> = seed.iter().map(|v| v + 1.0).collect();
+    assert_eq!(read_f32(&imgs[0]), want);
+}
+
+/// Sampling through a sampler argument at texel centres, which a linear
+/// filter returns exactly.
+#[test]
+fn tex_sample_returns_the_texel_at_each_centre() {
+    let src = texels_f32(8, 8, |x, y, c| (x + 8 * y) as f32 * 0.25 + c as f32);
+    let Some((bufs, _)) = image_parity(
+        "clspv/tex_sample.air",
+        [8, 8, 1],
+        [8, 8, 1],
+        &[(0, vec![0; 8 * 8 * 16])],
+        || Images {
+            sampled: vec![sampled(
+                32,
+                StorageImageFormat::Rgba32Float,
+                8,
+                8,
+                f32s(&src),
+            )],
+            storage: vec![],
+            samplers: vec![SamplerResource::normalized_default(160)],
+            specialize: vec![],
+        },
+    ) else {
+        return;
+    };
+    assert_eq!(read_f32(&bufs[0]), src);
+}
