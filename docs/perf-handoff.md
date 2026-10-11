@@ -147,3 +147,39 @@ Fixed in `3790fe2c` and `a69f8482`. Still open, each confirmed against the code:
   3532 (backing page count).
 - ICB rail findings (`runtime/icb`, `draw/metal/icb.rs`) are latent: ICB command memory
   is never bound outside tests.
+
+## Running the remaining work with parallel Haiku 5.5 subagents
+
+What worked on 2026-10-11, and the counts to use for each kind of task. The lead
+session (Opus) owns every edit, test run and commit; Haiku agents report.
+
+**Rules that made it work**
+
+- Haiku agents are **read-only** (`Explore` type). Ten agents editing one checkout
+  collide; one owner applying verified findings does not. If an agent must edit,
+  give it its own `isolation: "worktree"` and a file set no other agent touches.
+- One slice per agent, sized to fit its context: about 20-40k lines of non-test code.
+  Larger slices come back "partially read", so each report must list files fully
+  read vs partially read.
+- Ask for `file:line`, a concrete failure scenario for a bug, and a cost for a
+  performance finding. No style nits. The lead verifies every finding against the
+  code before acting: about one in five Haiku findings was wrong or not reachable
+  (for example ICB findings, which are latent because ICB memory is never bound).
+- Give agents data, not just code: a copy of `/tmp/reims-vgpu-fail.log` in a
+  scratch directory, and the user's symptom.
+- GPU tests run serially. Agents never run `cargo test` on the GPU suites at the
+  same time as the lead.
+
+**How many to send**
+
+| Task | Haiku agents | Split |
+|---|---|---|
+| Live-log triage after a boot (what is slow, error loops) | 6-10 | one per log signal: refusals, imports, sampled binds, shader compile, present path, guest-page mapping, logging cost, backing churn, compute/Store writeback |
+| Whole-tree audit for bugs and per-frame cost | 10 | `runtime/draw`; `exec`+`icb`; `drain`+`decode`; compute+blit; `objects`+`mapper`+`mapping_write`+`render_writeback`; top-level `runtime/*.rs`; `model`+`device`+`qemu`+`host_window`+QEMU C shim; Vulkan engine core (`exec.rs`, `exec_compute.rs`, `mod.rs`, `types.rs`, `caches.rs`); Vulkan pools + `reims-vgpu-vulkan`; the small crates |
+| Sampled-texture path rewrite (next step) | 3 for mapping, then 0 | before the rewrite: one maps every producer of `SampledSource` in `runtime/draw`, one maps the engine side (`find_cached_sampled`, `find_sampled_by_identity`, `acquire_sampled*`, `admit_sampled_entry`), one maps the guest-write signals (`gather_witness`, write ledger, dirty tracking). The rewrite itself is one owner: it crosses all three and must stay coherent |
+| 4x MSAA in the Simulator | 2 for mapping, then 0 | one for the request side (`runtime/draw/vulkan.rs` Store/Load/resolve), one for the engine (`exec.rs` resolve and registry). Implement serially by the plan's seven steps |
+| Deferred audit fixes (list above) | 0-4 | independent items in disjoint files can go to worktree agents, one item each (for example: the engine error-path leaks; the vblank thread join; the per-row blit copies). Anything in `draw/vulkan.rs` or `drain/mod.rs` stays with the lead: those files are touched by most changes |
+| Verifying a live run (frame rate, census, refusals) | 1 | reading one log does not split well |
+
+More than 10 at once added no coverage: slices began to overlap and reports
+repeated each other. Below 6 for a full audit left large files only grep-read.
