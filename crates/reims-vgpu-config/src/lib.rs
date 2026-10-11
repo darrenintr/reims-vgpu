@@ -1242,6 +1242,21 @@ pub const COLOR_GENERAL: &str = "REIMS_VGPU_COLOR_GENERAL";
 /// outcome a tiling compositor already produces. `host_window::present`'s
 /// `WindowMode` owns both halves.
 pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
+
+/// `on` compiles compute kernels through the metal2vk route — clspv, fed the
+/// guest's AIR after `runtime::m2v_clspv` rewrites it into the OpenCL-shaped IR
+/// clspv reads — instead of metal2vulkan's own SPIR-V emitter. Unset and `off`
+/// keep metal2vulkan.
+///
+/// A measurement arm, in the sense the `both` rail is one: it exists to compare
+/// two code generators on the same guest kernels. It grants no capability.
+/// metal2vulkan still translates every kernel first, because its reflection is
+/// the interface the dispatcher binds against; the clspv module is used only
+/// when it validates and matches that interface exactly (bindings, the
+/// dispatch-region push constants, the workgroup-size spec ids). Any refusal
+/// runs the metal2vulkan module and names the reason on the failure channel.
+/// It needs [`CLSPV`] to name the binary; on without it is refused by name.
+pub const KERNEL_CLSPV: &str = "REIMS_VGPU_KERNEL_CLSPV";
 }
 
 counts! {
@@ -1321,6 +1336,18 @@ pub fn wire_fixtures_dir() -> Option<String> {
 /// Whether [`WIRE_FIXTURES_REQUIRED`] is present at all, empty or not.
 pub fn wire_fixtures_required() -> bool {
     std::env::var_os(WIRE_FIXTURES_REQUIRED).is_some()
+}
+
+/// Path of the patched clspv binary the [`KERNEL_CLSPV`] route runs.
+///
+/// A tool location rather than a switch: it widens nothing on its own, and the
+/// route it serves is off unless [`KERNEL_CLSPV`] asks for it. Reported on the
+/// boot line raw, so a run is attributable to the binary it used.
+pub const CLSPV: &str = "REIMS_VGPU_CLSPV";
+
+/// Where [`CLSPV`] points, or `None` when it is unset, empty or not Unicode.
+pub fn clspv_path() -> Option<String> {
+    std::env::var(CLSPV).ok().filter(|v| !v.trim().is_empty())
 }
 
 /// What one variable says, including the two ways it says nothing usable.
@@ -1517,6 +1544,10 @@ pub fn report_line() -> String {
             .unwrap_or_else(|| "unset".to_owned());
         out.push_str(&format!(" {}={raw}", short.to_ascii_lowercase()));
     }
+    out.push_str(&format!(
+        " clspv={}",
+        clspv_path().unwrap_or_else(|| "unset".to_owned())
+    ));
     out
 }
 

@@ -888,7 +888,63 @@ fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedSha
             reflected: reflection.local_size,
         });
     }
+    // The metal2vk route, when asked for: clspv's module in place of
+    // metal2vulkan's, held to the reflection above. A refusal keeps
+    // metal2vulkan's module and says why, once per kernel.
+    if let Some(clspv) = kernel_clspv_binary() {
+        match crate::runtime::m2v_clspv::compile(&clspv, &path, &tmp, &reflection) {
+            Ok(clspv_spirv) => {
+                crate::runtime::drain::note_store_route("kernel_clspv_used");
+                // Live, because route counters only count under test: once per
+                // translated kernel, which is what says the arm ran at all.
+                crate::observe::off(format!(
+                    "kernel_clspv used entry={} words={} metal2vulkan_words={}",
+                    reflection.entry_point.as_deref().unwrap_or("?"),
+                    clspv_spirv.len() / 4,
+                    spirv.len() / 4
+                ));
+                // No `repair_layout`: that pass corrects metal2vulkan's own
+                // vector-allocation offsets, and clspv lays memory out from the
+                // AIR datalayout the adapter keeps.
+                validate_reflection(&reflection, Stage::Kernel)?;
+                crate::runtime::spirv_bind::log_folded_function_constants(&reflection);
+                return Ok(CachedShader::new(clspv_spirv, Arc::new(reflection)));
+            }
+            Err(refusal) => {
+                crate::runtime::drain::note_store_route("kernel_clspv_refused");
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                air.hash(&mut hasher);
+                crate::observe::Emit::decline("kernel_clspv", &refusal).fail_once(hasher.finish());
+            }
+        }
+    }
     finish_translated(spirv, reflection, Stage::Kernel)
+}
+
+/// The clspv binary the metal2vk kernel route runs, when that route was asked
+/// for and can run; `None` keeps metal2vulkan's emitter.
+///
+/// Read once: the answer is per process, like every operator switch. Asking for
+/// the route without naming the binary is refused by name, once, rather than
+/// ignored.
+fn kernel_clspv_binary() -> Option<String> {
+    static BINARY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            if crate::config::switch(crate::config::KERNEL_CLSPV) != crate::config::Switch::On {
+                return None;
+            }
+            let path = crate::config::clspv_path();
+            if path.is_none() {
+                crate::observe::Emit::decline(
+                    "kernel_clspv",
+                    &crate::runtime::m2v_clspv::ClspvRefusal::BinaryUnset,
+                )
+                .fail_once(0);
+            }
+            path
+        })
+        .clone()
 }
 
 /// Post-emit ABI reconciliation + package the translated shader with its reflection.

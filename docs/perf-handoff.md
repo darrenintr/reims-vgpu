@@ -29,16 +29,69 @@ commits of translator, validation and corpus work. The only API change this repo
 met was a new `TextureFormat::Rgba16i`, mapped to an unsupported storage format
 in `spirv_bind::reflected_storage_image_format`. Needed before trusting it: the
 conformance battery on the guest rail and a live boot, because this changes the
-SPIR-V every guest shader becomes. (`joshuaswarren/metal2vk` was looked at and
-is not a replacement: it compiles Metal *source* compute kernels through
-clang/clspv, while this device receives compiled AIR for every stage.)
+SPIR-V every guest shader becomes. metal2vulkan stays the translator for every
+vertex and fragment shader; metal2vk can serve compute kernels only, through the
+route below.
+
+## Compute kernels through metal2vk's clspv: `REIMS_VGPU_KERNEL_CLSPV` (committed, not live-tested)
+
+[metal2vk](https://github.com/joshuaswarren/metal2vk) compiles Metal compute
+*source* through clang and a patched clspv. The guest sends compiled AIR, so
+`runtime/m2v_clspv.rs` supplies the missing front half: it disassembles the AIR,
+keeps the kernel body untouched under a new name, and wraps it in a `main`
+`spir_kernel` that computes each Metal builtin from OpenCL work-item functions
+plus metal2vulkan's 48-byte dispatch-region push constant. Known `air.*` calls
+(math, conversions, the threadgroup barrier, relaxed `atomicrmw`) get bodies;
+anything else (textures, samplers, threadgroup-memory parameters, argument
+buffers, SIMD-group builtins, non-relaxed atomics) is refused by name.
+
+metal2vulkan still translates every kernel first: its reflection is the interface
+the dispatcher binds. The clspv module is used only if it matches that interface
+(buffers moved to the reflection's descriptors, push constant at offset 0 and 48
+bytes, workgroup size on spec ids 0..2, one `main` entry) and passes `spirv-val`;
+otherwise metal2vulkan's module runs and `kernel_clspv reason=...` names why on
+the failure channel. An adopted module logs `kernel_clspv used entry=...`.
+
+How to run it:
+- Build clspv the way metal2vk's README says (commit `f2b01dd`, then
+  `metal2vk/tools/apply-clspv-patches.sh`, then `ninja clspv`; about 1.5 h on 4
+  cores, ~15 GB of disk during the build).
+- `REIMS_VGPU_KERNEL_CLSPV=on REIMS_VGPU_CLSPV=/path/to/clspv` on the QEMU
+  process. The boot line reports both.
+
+Verified off-VM, on lavapipe:
+- `tests/vk_kernel_clspv.rs` runs six kernels through both emitters with the
+  dispatch plan the reflection prescribes. Five write byte-identical buffers
+  (partial edge regions, threadgroup memory with barriers, 16-bit builtins,
+  relaxed atomics). On `math_convert` the clspv module matches an exact
+  round-to-nearest-even reference and **metal2vulkan rounds two float-to-half
+  conversions toward zero** (5.562072 to 5.5586, not 5.5625): a metal2vulkan
+  defect worth reporting upstream.
+- With the switch on, the whole reims-vgpu suite passes as it does with it off,
+  and the device path adopted the clspv module for `compute_mul3add1` and
+  produced `[4, 7, 10, 13]`.
+- The test kernels live in `tests/fixtures/clspv/*.metal`; their AIR is compiled
+  on a macOS runner by `.github/workflows/compile-clspv-fixtures.yml` (run it
+  after editing a kernel; it prints each module as base64 in the log).
+
+Not verified: a live guest. The guest's own kernels may use what the route
+refuses, which only a boot with the switch on will show (count
+`kernel_clspv used` against `kernel_clspv reason=`). Two clspv quirks found on
+the way are handled in the adapter: OpenCL C++ mode turns on module-scope push
+constants that collide with the dispatch region (the route uses `CL1.2`), and
+InstCombine turns two 16-bit lanes of `get_local_size` into a `<6 x i16>` load
+clspv aborts on (the lanes go through a value-preserving `umin` first).
 
 ## Sampled-texture rewrite, step 1: the identity-miss census (committed, not live-read)
 
-Every guest-gather bind that moves bytes now emits exactly one `sampled_miss_*`
-store route at the engine's miss site (`engine/exec.rs`, the `GuestRuns` arm),
-joining the witness's answer to the cache's. The routes sum to
-`sampled_gather_unretained + sampled_gather_unvouched`.
+Every guest-gather bind that moves bytes is named by exactly one cause at the
+engine's miss site (`engine/exec.rs`, the `GuestRuns` arm), joining the
+witness's answer to the cache's. Live, it is the once-a-second line
+`sampled_miss_census window_ms=... gathers=N <cause>=<count>/<kb> ...` in
+`/tmp/reims-vgpu-fail.log`, listing only the causes that occurred. (The
+`sampled_miss_*` store routes carry the same names but, like every store route,
+count only under `cfg(test)`; the first version of this census relied on them
+alone and would have printed nothing live.)
 
 - `sampled_miss_spent_*`: the witness spent the generation, so the miss was
   compulsory. The suffix is the refusal: `new_window` (first sight of the key, or
@@ -67,7 +120,7 @@ Code: `GatherAnswer` / `GatherSpent` in `runtime/gather_witness.rs` (built in
 `sampled_identity_miss_route` (in `engine/pools/submission_and_buffers.rs`) names
 the route. Owner tests: `each_spent_generation_names_the_refusal_that_spent_it`,
 `a_gathered_miss_names_its_cause`, `the_identity_miss_routes_partition_the_gathers`.
-Next: boot, open the genie, and read the `sampled_miss_*` split from
+Next: boot, open the genie, and read the `sampled_miss_census` lines from
 `/tmp/reims-vgpu-fail.log` before designing the owner.
 
 

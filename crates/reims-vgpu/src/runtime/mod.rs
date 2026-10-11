@@ -89,6 +89,8 @@ pub mod ingress;
 pub mod input;
 /// Process-global metal2vulkan SPIR-V cache (AIR content hash → SPIR-V).
 pub mod m2v_cache;
+/// The metal2vk compute route: guest AIR compiled by clspv, held to metal2vulkan's interface.
+pub mod m2v_clspv;
 /// IOSurface mapper capture + page-table resolve.
 pub mod mapper;
 /// Write host BGRA into guest mapping pages (render writeback).
