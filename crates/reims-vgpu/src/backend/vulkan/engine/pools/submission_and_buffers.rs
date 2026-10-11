@@ -4261,51 +4261,55 @@ impl ResourcePools {
         &mut self,
         key: SampledKey,
         identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
-    ) -> Option<SampledSlot> {
-        let id = identity?;
-        // Counted after the `identity?`, so the route bands the lookups this arm
-        // actually suppressed rather than every call — a bind with no identity
-        // could not have hit at any setting.
+    ) -> Result<SampledSlot, IdentityLookupMiss> {
+        let id = identity.ok_or(IdentityLookupMiss::NoIdentity)?;
+        // Counted after the absent identity, so the route bands the lookups this
+        // arm actually suppressed rather than every call — a bind with no
+        // identity could not have hit at any setting.
         if !sampled_identity_enabled() {
             crate::runtime::drain::note_store_route("sampled_identity_off");
-            return None;
+            return Err(IdentityLookupMiss::Off);
         }
         let index = self
             .sampled_cache
             .iter()
-            .position(|entry| entry.slot.key() == key && entry.identity == Some(id))?;
+            .position(|entry| entry.slot.key() == key && entry.identity == Some(id))
+            .ok_or(IdentityLookupMiss::NotHeld(id))?;
         let mut entry = self.sampled_cache.remove(index);
         entry.last_touch_ms = self.idle_clock_ms;
         entry.hits = entry.hits.saturating_add(1);
         let handles = entry.slot.handles();
         self.sampled_cache.push(entry);
-        Some(handles)
+        Ok(handles)
     }
 
     /// The guest-gather rail's lookup: the complete image key, and identity as
     /// the only content evidence there is.
+    ///
+    /// A miss says which of its causes it was, so the caller can join it to the
+    /// witness's answer for the same bind (see [`sampled_identity_miss_route`]).
     pub(crate) fn find_gathered_sampled(
         &mut self,
         key: SampledKey,
         identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
         counters: &EngineCounters,
-    ) -> Option<SampledSlot> {
-        let Some(handles) = self.find_sampled_by_identity(key, identity) else {
+    ) -> Result<SampledSlot, GatheredMiss> {
+        let handles = match self.find_sampled_by_identity(key, identity) {
+            Ok(handles) => handles,
+            Err(IdentityLookupMiss::NoIdentity) => return Err(GatheredMiss::NoIdentity),
+            Err(IdentityLookupMiss::Off) => return Err(GatheredMiss::IdentityOff),
             // A miss the caps caused is the only kind worth banding, and the
             // ledger is what tells the two apart: a window it remembers was
             // here and was evicted, and one it does not is either content this
             // cache has never held or content evicted longer ago than the
             // instrument can see. Those are opposite findings and the second
             // route says which.
-            if let Some(id) = identity {
-                self.note_sampled_reach(key, id);
-            }
-            return None;
+            Err(IdentityLookupMiss::NotHeld(id)) => return Err(self.note_sampled_reach(key, id)),
         };
         counters
             .sampled_identity_hits
             .fetch_add(1, Ordering::Relaxed);
-        Some(handles)
+        Ok(handles)
     }
 
     /// Band how much cache would have turned this miss into a hit.
@@ -4317,7 +4321,7 @@ impl ResourcePools {
         &self,
         key: SampledKey,
         identity: crate::backend::vulkan::engine::SampledContentIdentity,
-    ) {
+    ) -> GatheredMiss {
         let mut bytes = self.sampled_cache_bytes;
         // The two halves of a cache entry's name fail for different reasons, so
         // the walk asks about them separately. A window whose content identity
@@ -4341,13 +4345,15 @@ impl ResourcePools {
             crate::runtime::drain::note_store_route(count_route);
             crate::runtime::drain::note_store_route(byte_route);
             crate::runtime::drain::note_store_route(victim.route.route());
-            return;
+            return GatheredMiss::Evicted;
         }
-        crate::runtime::drain::note_store_route(if identity_elsewhere {
-            "sampled_reach_identity_other_key"
+        if identity_elsewhere {
+            crate::runtime::drain::note_store_route("sampled_reach_identity_other_key");
+            GatheredMiss::OtherKey
         } else {
-            "sampled_reach_beyond_ledger"
-        });
+            crate::runtime::drain::note_store_route("sampled_reach_beyond_ledger");
+            GatheredMiss::BeyondLedger
+        }
     }
 
     pub(crate) fn find_cached_sampled(
@@ -4363,7 +4369,7 @@ impl ResourcePools {
         // `SAMPLED_VICTIM_LEDGER` and reads `beyond_ledger` 6 704 times on a
         // driven macos-26 boot.
         super::sampled_working_set::note_wanted(key, identity, content.len());
-        if let Some(handles) = self.find_sampled_by_identity(key, identity) {
+        if let Ok(handles) = self.find_sampled_by_identity(key, identity) {
             counters
                 .sampled_identity_hits
                 .fetch_add(1, Ordering::Relaxed);
@@ -4835,6 +4841,78 @@ fn sampled_reach_bands(distance: usize, bytes: usize) -> (&'static str, &'static
     (count, bytes)
 }
 
+/// Why the identity-only lookup found nothing, before the reach ledger is asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdentityLookupMiss {
+    /// The bind named no identity, so no setting could have found one.
+    NoIdentity,
+    /// [`crate::config::SAMPLED_IDENTITY`] switched the lookup off.
+    Off,
+    /// The cache holds nothing under this key and identity.
+    NotHeld(crate::backend::vulkan::engine::SampledContentIdentity),
+}
+
+/// The cache's half of why a guest-gather bind found no retained image.
+///
+/// The last three are the reach ledger's answers, as
+/// [`ResourcePools::note_sampled_reach`] routes them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GatheredMiss {
+    NoIdentity,
+    IdentityOff,
+    /// The ledger remembers this key and identity being evicted.
+    Evicted,
+    /// The ledger remembers the identity under a different image key.
+    OtherKey,
+    /// Never held, or evicted further back than the ledger reaches.
+    BeyondLedger,
+}
+
+/// One census route per guest-gather bind that moved bytes, joining the
+/// witness's answer to the cache's.
+///
+/// The census carries both halves already, and they cannot be joined from it:
+/// the witness routes (`gw_*`) count every bind a producer asked about,
+/// including binds whose draw was declined before reaching the engine, and the
+/// reach routes count only lookups that carried an identity. Neither says what
+/// share of the gathers that ran were the witness refusing to vouch and what
+/// share were a vouched image the cache had lost, and the sampled-texture
+/// rewrite's design depends on that split. Taken once per gather, so the
+/// `sampled_miss_*` routes sum to `sampled_gather_unretained +
+/// sampled_gather_unvouched`.
+///
+/// A spent answer is a compulsory miss whatever the cache says (a fresh
+/// generation names nothing it can hold), so it is named by the witness's cause
+/// alone. Only a vouched answer is named by the cache.
+pub(crate) fn sampled_identity_miss_route(
+    answer: crate::runtime::gather_witness::GatherAnswer,
+    miss: GatheredMiss,
+) -> &'static str {
+    use crate::runtime::gather_witness::{GatherAnswer, GatherSpent, RearmWhy, UnarmedCause};
+    match answer {
+        GatherAnswer::Spent { why, .. } => match why {
+            GatherSpent::Unwitnessed => "sampled_miss_spent_unwitnessed",
+            GatherSpent::Rearm(RearmWhy::New) => "sampled_miss_spent_new_window",
+            GatherSpent::Rearm(RearmWhy::PagesMoved) => "sampled_miss_spent_pages_moved",
+            GatherSpent::Rearm(RearmWhy::SpanMoved) => "sampled_miss_spent_span_moved",
+            GatherSpent::Unarmed(UnarmedCause::Untracked) => "sampled_miss_spent_untracked",
+            GatherSpent::Unarmed(UnarmedCause::Arming) => "sampled_miss_spent_arming",
+            GatherSpent::Unarmed(UnarmedCause::NoBaseline) => "sampled_miss_spent_no_baseline",
+            GatherSpent::GuestStore => "sampled_miss_spent_guest_store",
+            GatherSpent::HostWrite => "sampled_miss_spent_host_write",
+            GatherSpent::GuestStoreAndHostWrite => "sampled_miss_spent_guest_store_host_write",
+            GatherSpent::AuditDisagreed => "sampled_miss_spent_audit",
+        },
+        GatherAnswer::Vouched => match miss {
+            GatheredMiss::NoIdentity => "sampled_miss_lost_no_identity",
+            GatheredMiss::IdentityOff => "sampled_miss_lost_identity_off",
+            GatheredMiss::Evicted => "sampled_miss_lost_evicted",
+            GatheredMiss::OtherKey => "sampled_miss_lost_other_key",
+            GatheredMiss::BeyondLedger => "sampled_miss_lost_beyond_ledger",
+        },
+    }
+}
+
 /// Which quarter of [`TARGET_POOL_MAX_ENTRIES`] the scratch target pool is
 /// occupying, as a census route name.
 ///
@@ -5201,7 +5279,7 @@ mod recycle_tests {
             assert!(
                 pools
                     .find_gathered_sampled(*key, Some(*id), &counters)
-                    .is_some(),
+                    .is_ok(),
                 "the entries have to be bindable first, or the test proves nothing"
             );
         }
@@ -5217,7 +5295,7 @@ mod recycle_tests {
             assert!(
                 pools
                     .find_gathered_sampled(*key, Some(*id), &counters)
-                    .is_none(),
+                    .is_err(),
                 "an image no command buffer filled must not answer a bind"
             );
         }
@@ -5341,7 +5419,7 @@ mod recycle_tests {
         assert!(
             pools
                 .find_gathered_sampled(key, Some(identity), &counters)
-                .is_none(),
+                .is_err(),
             "nothing has filled this window yet"
         );
 
@@ -5370,7 +5448,7 @@ mod recycle_tests {
         assert!(
             pools
                 .find_gathered_sampled(key, Some(identity), &counters)
-                .is_some(),
+                .is_ok(),
             "the next draw must find the window the in-flight submission gathered, \
              or it imports every byte of it a second time"
         );
@@ -5429,6 +5507,103 @@ mod recycle_tests {
             Some(false),
             "findable by its bytes"
         );
+    }
+
+    /// A gathered lookup that finds nothing says which of its causes it was,
+    /// because the miss census joins exactly that to the witness's answer.
+    #[test]
+    fn a_gathered_miss_names_its_cause() {
+        let mut pools = ResourcePools::new();
+        let counters = EngineCounters::default();
+        let id = |generation| crate::backend::vulkan::engine::SampledContentIdentity {
+            key: 7,
+            generation,
+        };
+        let small = null_slot(8, 8).key();
+        let large = null_slot(16, 16).key();
+        assert!(pools
+            .admit_sampled_entry(
+                null_slot(8, 8),
+                &SampledRetainContent::Gathered { len: 256 },
+                Some(id(1)),
+            )
+            .is_empty());
+
+        assert!(pools
+            .find_gathered_sampled(small, Some(id(1)), &counters)
+            .is_ok());
+        assert_eq!(
+            pools.find_gathered_sampled(small, None, &counters).err(),
+            Some(GatheredMiss::NoIdentity)
+        );
+        assert_eq!(
+            pools
+                .find_gathered_sampled(small, Some(id(2)), &counters)
+                .err(),
+            Some(GatheredMiss::BeyondLedger),
+            "a generation nothing retained"
+        );
+
+        pools.evict_sampled_entry(0, SampledVictimRoute::Cap);
+        assert_eq!(
+            pools
+                .find_gathered_sampled(small, Some(id(1)), &counters)
+                .err(),
+            Some(GatheredMiss::Evicted)
+        );
+        assert_eq!(
+            pools
+                .find_gathered_sampled(large, Some(id(1)), &counters)
+                .err(),
+            Some(GatheredMiss::OtherKey),
+            "the ledger holds this identity under the 8x8 key only"
+        );
+    }
+
+    /// The miss routes partition the gathers: a spent answer is named by the
+    /// witness's cause whatever the cache said, a vouched one by the cache, and
+    /// no two causes share a route.
+    #[test]
+    fn the_identity_miss_routes_partition_the_gathers() {
+        use crate::runtime::gather_witness::{GatherAnswer, GatherSpent, RearmWhy, UnarmedCause};
+        let misses = [
+            GatheredMiss::NoIdentity,
+            GatheredMiss::IdentityOff,
+            GatheredMiss::Evicted,
+            GatheredMiss::OtherKey,
+            GatheredMiss::BeyondLedger,
+        ];
+        let causes = [
+            GatherSpent::Unwitnessed,
+            GatherSpent::Rearm(RearmWhy::New),
+            GatherSpent::Rearm(RearmWhy::PagesMoved),
+            GatherSpent::Rearm(RearmWhy::SpanMoved),
+            GatherSpent::Unarmed(UnarmedCause::Untracked),
+            GatherSpent::Unarmed(UnarmedCause::Arming),
+            GatherSpent::Unarmed(UnarmedCause::NoBaseline),
+            GatherSpent::GuestStore,
+            GatherSpent::HostWrite,
+            GatherSpent::GuestStoreAndHostWrite,
+            GatherSpent::AuditDisagreed,
+        ];
+        let mut routes = std::collections::HashSet::new();
+        for why in causes {
+            let named = |nameable, miss| {
+                sampled_identity_miss_route(GatherAnswer::Spent { why, nameable }, miss)
+            };
+            let route = named(true, GatheredMiss::BeyondLedger);
+            assert!(route.starts_with("sampled_miss_spent_"), "{route}");
+            for miss in misses {
+                assert_eq!(named(true, miss), route, "{why:?} is compulsory");
+                assert_eq!(named(false, miss), route, "{why:?} is compulsory");
+            }
+            assert!(routes.insert(route), "{route} names two causes");
+        }
+        for miss in misses {
+            let route = sampled_identity_miss_route(GatherAnswer::Vouched, miss);
+            assert!(route.starts_with("sampled_miss_lost_"), "{route}");
+            assert!(routes.insert(route), "{route} names two causes");
+        }
     }
 
     /// A gather the witness proved unnameable carries no identity, and the cache

@@ -4112,7 +4112,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     .sampled_gpu_binds
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            SampledSource::GuestRuns(src, vouch) => {
+            SampledSource::GuestRuns(src, answer) => {
                 if let Some(direct) = src.direct_image.as_ref() {
                     if let Some(bound) = unsafe {
                         pools.acquire_guest_sampled(
@@ -4155,30 +4155,37 @@ pub(crate) unsafe fn execute_draw_inner(
                 // the bytes to compare them is the cost being removed. A
                 // declined direct image carries no identity, so this lookup
                 // misses without touching the copied-content ledger.
-                if let Some(image) = pools.find_gathered_sampled(
+                let miss = match pools.find_gathered_sampled(
                     SampledKey::of(resource),
                     resource.identity,
                     counters,
                 ) {
-                    counters.note_sampled_gather_skipped(src.total_len);
-                    sampled.push(PreparedSampled::Cached {
-                        binding: resource.binding,
-                        array_element: resource.array_element,
-                        image,
-                    });
-                    continue;
-                }
+                    Ok(image) => {
+                        counters.note_sampled_gather_skipped(src.total_len);
+                        sampled.push(PreparedSampled::Cached {
+                            binding: resource.binding,
+                            array_element: resource.array_element,
+                            image,
+                        });
+                        continue;
+                    }
+                    Err(miss) => miss,
+                };
                 // The elision did not fire, and the two reasons it can fail want
                 // opposite fixes: no vouch to spend, or a vouch with nothing
                 // left to spend it on. Taken here because this is the only point
                 // holding both the witness's answer and the cache's.
                 //
-                // The witness's answer is `vouch`; the identity names the
+                // The witness's answer is `answer`; the identity names the
                 // content it judged. A direct source that reached this point
                 // was declined by the backend and carries neither copied
-                // content nor a vouchable identity, so `Fresh` correctly names
-                // the required conservative gather.
-                counters.note_sampled_gather_unskipped(*vouch);
+                // content nor a vouchable identity, so `UNWITNESSED` (which
+                // reads `Fresh`) correctly names the required conservative
+                // gather. The route joins the witness's cause to the cache's.
+                counters.note_sampled_gather_unskipped(answer.vouch());
+                crate::runtime::drain::note_store_route(super::pools::sampled_identity_miss_route(
+                    *answer, miss,
+                ));
                 let img = pools.acquire_sampled(ctx, SampledKey::of(resource), counters)?;
                 // Everything from here to the end of this arm moves bytes;
                 // everything above it in `AcquireSampled` decides which image
@@ -7260,7 +7267,7 @@ mod tests {
                     },
                     // No witness ran for a synthetic source, so nothing vouches:
                     // the gather is the only disposition this fixture can take.
-                    crate::runtime::gather_witness::GatherVouch::Fresh,
+                    crate::runtime::gather_witness::GatherAnswer::UNWITNESSED,
                 ),
                 byte_origin: Default::default(),
                 format: crate::backend::vulkan::translate::pixel::vk_texel_layout(

@@ -22,6 +22,43 @@
 - 3D: 4x MSAA passes are still refused (see below); a design plan exists in
   this session's notes and is summarised in that section.
 
+## Sampled-texture rewrite, step 1: the identity-miss census (committed, not live-read)
+
+Every guest-gather bind that moves bytes now emits exactly one `sampled_miss_*`
+store route at the engine's miss site (`engine/exec.rs`, the `GuestRuns` arm),
+joining the witness's answer to the cache's. The routes sum to
+`sampled_gather_unretained + sampled_gather_unvouched`.
+
+- `sampled_miss_spent_*`: the witness spent the generation, so the miss was
+  compulsory. The suffix is the refusal: `new_window` (first sight of the key, or
+  its witness entry was dropped), `pages_moved`, `span_moved`, `untracked`,
+  `arming`, `no_baseline`, `guest_store`, `host_write`,
+  `guest_store_host_write`, `audit`, or `unwitnessed` (a declined direct image).
+- `sampled_miss_lost_*`: the witness vouched, but the cache did not have the
+  image: `evicted` (in the victim ledger), `other_key` (the ledger holds the
+  identity under another image key), `beyond_ledger` (never retained, or evicted
+  long ago), `identity_off`, `no_identity`.
+
+How to read it during the genie, and what each answer means for the rewrite:
+- `new_window` dominant: the guest presents the content under new keys
+  (new mapping ids or GVAs) every frame. A per-identity owner keyed the way the
+  witness keys windows will not help; the identity has to come from something
+  more stable (the guest resource/IOSurface).
+- `host_write` dominant: our own writeback refuses the vouch. Name that writer
+  or stop writing those pages; the rewrite alone will not fix it.
+- `guest_store` dominant: the guest really repaints; the gathers are needed.
+- `lost_*` dominant: the cache is the lever, and one image per identity
+  (retained until the guest releases the resource) is the right rewrite.
+
+Code: `GatherAnswer` / `GatherSpent` in `runtime/gather_witness.rs` (built in
+`note_gather`), carried through `SampledSourceRequest::GuestRuns` and
+`SampledSource::GuestRuns`. `find_gathered_sampled` returns `GatheredMiss`, and
+`sampled_identity_miss_route` (in `engine/pools/submission_and_buffers.rs`) names
+the route. Owner tests: `each_spent_generation_names_the_refusal_that_spent_it`,
+`a_gathered_miss_names_its_cause`, `the_identity_miss_routes_partition_the_gathers`.
+Next: boot, open the genie, and read the `sampled_miss_*` split from
+`/tmp/reims-vgpu-fail.log` before designing the owner.
+
 
 Pathway: x86 macOS 13.7.8 guest, Linux KVM, PCI, Vulkan rail on RX 7600 / RADV.
 Goal set by the user: at least 30 fps and response within 30 ms, iOS Simulator included.

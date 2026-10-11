@@ -882,7 +882,7 @@ pub(super) enum SampledSourceRequest {
         /// Consecutive depth planes carried by the source window.
         u32,
         Option<LinearSampleIdentity>,
-        crate::runtime::gather_witness::GatherVouch,
+        crate::runtime::gather_witness::GatherAnswer,
         pixel_format::SwizzlePlan,
     ),
 }
@@ -3496,7 +3496,7 @@ pub(super) fn direct_linear_sample_from_packed(
         format,
         1,
         None,
-        crate::runtime::gather_witness::GatherVouch::Fresh,
+        crate::runtime::gather_witness::GatherAnswer::UNWITNESSED,
         native_components,
     ))
 }
@@ -4826,7 +4826,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                     sampled_vk_format,
                     planes,
                     seen.identity.map(LinearSampleIdentity::from),
-                    seen.vouch,
+                    seen.answer,
                     native_components,
                 ),
             ));
@@ -4883,7 +4883,7 @@ pub(super) fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             sampled_vk_format,
             planes,
             seen.identity.map(LinearSampleIdentity::from),
-            seen.vouch,
+            seen.answer,
             native_components,
         ),
     ))
@@ -4983,7 +4983,7 @@ pub(super) fn try_mapper_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
             sampled_vk_format,
             1,
             None,
-            crate::runtime::gather_witness::GatherVouch::Fresh,
+            crate::runtime::gather_witness::GatherAnswer::UNWITNESSED,
             pixel_format::swizzle_identity(),
         ));
     }
@@ -5017,7 +5017,7 @@ pub(super) fn try_mapper_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
         sampled_vk_format,
         1,
         seen.identity.map(LinearSampleIdentity::from),
-        seen.vouch,
+        seen.answer,
         // Identity: this rail admitted the format only after checking its plan
         // was identity, so there is nothing to fold in.
         pixel_format::swizzle_identity(),
@@ -5110,7 +5110,7 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
             sampled_vk_format,
             1,
             None,
-            crate::runtime::gather_witness::GatherVouch::Fresh,
+            crate::runtime::gather_witness::GatherAnswer::UNWITNESSED,
             pixel_format::swizzle_identity(),
         ));
     }
@@ -5144,7 +5144,7 @@ pub(super) fn try_ref_texture_sample_zero_copy<M: HostMemory + HostOps>(
         sampled_vk_format,
         1,
         seen.identity.map(LinearSampleIdentity::from),
-        seen.vouch,
+        seen.answer,
         // Identity: this rail admitted the format only after checking its plan
         // was identity, so there is nothing to fold in.
         pixel_format::swizzle_identity(),

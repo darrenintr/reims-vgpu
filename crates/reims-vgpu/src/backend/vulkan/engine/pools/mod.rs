@@ -3615,6 +3615,7 @@ pub mod buffer_gather_working_set;
 mod images_and_registry;
 pub mod sampled_working_set;
 mod submission_and_buffers;
+pub(crate) use submission_and_buffers::sampled_identity_miss_route;
 /// The lease's own extent travels with its pointer; see [`ReadbackLease`].
 pub(crate) use submission_and_buffers::ReadbackLease;
 mod teardown;

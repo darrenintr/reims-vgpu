@@ -2318,11 +2318,11 @@ pub enum SampledSource {
     /// CPU read or hash is required on either GPU route.
     ///
     /// A copy is elided where a retained image already answers to the bind's
-    /// identity, which is what [`crate::runtime::gather_witness::GatherVouch`]
+    /// identity, which is what [`crate::runtime::gather_witness::GatherAnswer`]
     /// says is possible. Resource-owned direct images carry no copied-content
     /// identity. If the backend declines one, the copy fallback therefore runs
     /// conservatively instead of reusing content that was never witnessed.
-    GuestRuns(GuestRunSource, crate::runtime::gather_witness::GatherVouch),
+    GuestRuns(GuestRunSource, crate::runtime::gather_witness::GatherAnswer),
 }
 
 /// One packed-contiguous guest-RAM span (a direct RAMBlock alias from

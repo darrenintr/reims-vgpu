@@ -1233,7 +1233,7 @@ impl crate::observe::decline::Decline for GatherWitnessFault {
 pub struct GatherOutcome {
     /// What the engine looks the retained image up under, and retains under.
     ///
-    /// `None` exactly when [`Self::vouch`] is [`GatherVouch::Unreachable`]: the
+    /// `None` exactly when [`Self::answer`] is [`GatherVouch::Unreachable`]: the
     /// witness has proved no later bind can name this generation, so offering it
     /// would only fill the sampled cache with an image nothing can find. The
     /// engine already declines to admit an identity-less gather
@@ -1244,8 +1244,9 @@ pub struct GatherOutcome {
     /// is decided beside the assignment that spends the generation and means
     /// "can the generation be named again".
     pub identity: Option<GatheredIdentity>,
-    /// Whether that identity can name an image the cache already holds.
-    pub vouch: GatherVouch,
+    /// Whether that identity can name an image the cache already holds
+    /// ([`GatherAnswer::vouch`]), and if not, which refusal spent it.
+    pub answer: GatherAnswer,
 }
 
 /// Record one zero-copy sampled gather against the guest-write witness, and
@@ -1440,7 +1441,7 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
             key: key.content_key(),
             generation: seen.generation,
         }),
-        vouch: seen.vouch,
+        answer: GatherAnswer::of(&seen),
     }
 }
 
@@ -1492,6 +1493,106 @@ impl GatherVouch {
     /// again. False only for [`GatherVouch::Unreachable`].
     pub fn nameable(self) -> bool {
         !matches!(self, Self::Unreachable)
+    }
+}
+
+/// Why a bind's generation was spent, so a lookup that had to miss can say what
+/// made it miss.
+///
+/// [`GatherVouch`] answers whether a miss was compulsory; this answers which of
+/// the witness's refusals made it so. The engine's miss site holds the cache's
+/// half of the story and nothing of the witness's, and the sampled-texture
+/// rewrite turns on the split: a window whose key is new every bind
+/// ([`RearmWhy::New`]) wants a stable identity, one the guest repaints
+/// ([`Self::GuestStore`]) wants nothing, and one this device's own writeback
+/// refuses ([`Self::HostWrite`]) wants that writer named.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GatherSpent {
+    /// No witness ran for this source: a resource-owned direct image carries no
+    /// copied content to witness, and a synthetic fixture names no guest RAM.
+    Unwitnessed,
+    /// First sight of the window, or its pages or span moved.
+    Rearm(RearmWhy),
+    /// The hypervisor half had no generation to compare.
+    Unarmed(UnarmedCause),
+    /// The hypervisor saw a guest store into the pages.
+    GuestStore,
+    /// This device wrote pages of the window.
+    HostWrite,
+    /// Both of the above on one bind.
+    GuestStoreAndHostWrite,
+    /// Both halves vouched and the content audit found the bytes moved.
+    AuditDisagreed,
+}
+
+/// The witness's whole answer for one bind: kept, or spent and why.
+///
+/// A spent answer carries whether its fresh generation can be named again,
+/// which is what [`GatherVouch`] splits into `Fresh` and `Unreachable`. Spelled
+/// as one enum so a vouched answer cannot carry a reason for being spent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GatherAnswer {
+    /// The generation the entry carried in survives; see [`GatherVouch::Vouched`].
+    Vouched,
+    /// A fresh generation was spent this bind.
+    Spent {
+        why: GatherSpent,
+        /// False exactly for [`GatherVouch::Unreachable`].
+        nameable: bool,
+    },
+}
+
+impl GatherAnswer {
+    /// A source no witness ran for. Its gather can be retained under a later
+    /// bind's identity, so it reads [`GatherVouch::Fresh`], as it always has.
+    pub const UNWITNESSED: Self = Self::Spent {
+        why: GatherSpent::Unwitnessed,
+        nameable: true,
+    };
+
+    pub fn vouch(self) -> GatherVouch {
+        match self {
+            Self::Vouched => GatherVouch::Vouched,
+            Self::Spent { nameable: true, .. } => GatherVouch::Fresh,
+            Self::Spent {
+                nameable: false, ..
+            } => GatherVouch::Unreachable,
+        }
+    }
+
+    /// Read off the observation, never re-derived elsewhere: the vouch is the
+    /// one [`observe`] decided beside the generation, and the verdict and
+    /// detail say which refusal spent it.
+    fn of(seen: &GatherObservation) -> Self {
+        if seen.vouch.is_vouched() {
+            return Self::Vouched;
+        }
+        let why = match seen.verdict {
+            GatherVerdict::Rearmed => {
+                GatherSpent::Rearm(seen.detail.rearm.map_or(RearmWhy::New, |r| r.why))
+            }
+            GatherVerdict::Unarmed => {
+                GatherSpent::Unarmed(seen.detail.unarmed.unwrap_or(UnarmedCause::NoBaseline))
+            }
+            // Both halves were quiet and the generation was spent anyway: only
+            // a disagreeing audit does that.
+            GatherVerdict::Vouched => GatherSpent::AuditDisagreed,
+            GatherVerdict::Refused {
+                guest_wrote: true,
+                host_wrote_pages: true,
+            } => GatherSpent::GuestStoreAndHostWrite,
+            GatherVerdict::Refused {
+                guest_wrote: true,
+                host_wrote_pages: false,
+            } => GatherSpent::GuestStore,
+            GatherVerdict::Refused {
+                guest_wrote: false, ..
+            } => GatherSpent::HostWrite,
+        };
+        Self::Spent {
+            why,
+            nameable: seen.vouch.nameable(),
+        }
     }
 }
 
@@ -2075,6 +2176,68 @@ mod tests {
         assert_eq!(
             (guest_wrote.generation, guest_wrote.vouch),
             (13, GatherVouch::Fresh)
+        );
+    }
+
+    /// The answer the engine's miss census reads names the refusal that spent
+    /// each generation, and never contradicts the vouch [`observe`] decided.
+    ///
+    /// One bind per cause, in the order a window meets them: first sight, a
+    /// quiet bind, this device's write, a guest store, both at once, then the
+    /// same key over different pages.
+    #[test]
+    fn each_spent_generation_names_the_refusal_that_spent_it() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut w = GatherWitness::default();
+        let mut buf = vec![0xa5u8; PAGE];
+        let host_wrote = WitnessReadings {
+            pages_wrote: Some(crate::runtime::host_writes::HostWriteVerdict::Overlap),
+            ..QUIET
+        };
+        let answer = |w: &mut GatherWitness,
+                      host: &mut crate::runtime::host::FakeHost,
+                      buf: &[u8],
+                      gpas: &[u64],
+                      readings,
+                      fresh| {
+            let runs = [run_over(buf)];
+            let seen = observe(w, host, KEY, one_page(gpas, &runs), readings, fresh);
+            let answer = GatherAnswer::of(&seen);
+            assert_eq!(answer.vouch(), seen.vouch, "the answer restates the vouch");
+            answer
+        };
+        let spent = |why| GatherAnswer::Spent {
+            why,
+            nameable: true,
+        };
+
+        assert_eq!(
+            answer(&mut w, &mut host, &buf, &GPAS, QUIET, 10),
+            spent(GatherSpent::Rearm(RearmWhy::New))
+        );
+        assert_eq!(
+            answer(&mut w, &mut host, &buf, &GPAS, QUIET, 11),
+            GatherAnswer::Vouched
+        );
+        assert_eq!(
+            answer(&mut w, &mut host, &buf, &GPAS, host_wrote, 12),
+            spent(GatherSpent::HostWrite)
+        );
+        buf[3] ^= 0xff;
+        host.guest_wrote_page(GPAS[0]);
+        assert_eq!(
+            answer(&mut w, &mut host, &buf, &GPAS, QUIET, 13),
+            spent(GatherSpent::GuestStore)
+        );
+        host.guest_wrote_page(GPAS[0]);
+        assert_eq!(
+            answer(&mut w, &mut host, &buf, &GPAS, host_wrote, 14),
+            spent(GatherSpent::GuestStoreAndHostWrite)
+        );
+        let moved = [GPAS[0] + PAGE as u64];
+        assert_eq!(
+            answer(&mut w, &mut host, &buf, &moved, QUIET, 15),
+            spent(GatherSpent::Rearm(RearmWhy::PagesMoved))
         );
     }
 
