@@ -1,0 +1,62 @@
+name: Compile clspv-route compute fixtures (macOS)
+
+# The metal2vk compute route reads guest AIR, and AIR only comes out of Apple's
+# Metal compiler. This compiles the route's own test kernels
+# (crates/reims-vgpu/tests/fixtures/clspv/*.metal) on a macOS runner, checks the
+# result against the committed .air files, and prints each module as base64 so a
+# Linux checkout can recover it from the log.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/compile-clspv-fixtures.yml'
+      - 'crates/reims-vgpu/tests/fixtures/clspv/**'
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Compile
+        working-directory: crates/reims-vgpu/tests/fixtures/clspv
+        run: |
+          set -euo pipefail
+          xcrun -sdk macosx metal --version
+          mkdir -p "$RUNNER_TEMP/air"
+          for src in *.metal; do
+            name="${src%.metal}"
+            xcrun -sdk macosx metal -c -mmacosx-version-min=13.0 "$src" -o "$RUNNER_TEMP/air/$name.air"
+          done
+          ls -l "$RUNNER_TEMP/air"
+      - name: Print modules
+        run: |
+          set -euo pipefail
+          for air in "$RUNNER_TEMP"/air/*.air; do
+            name="$(basename "$air")"
+            echo "BEGIN-AIR $name $(shasum -a 256 "$air" | cut -d' ' -f1)"
+            base64 -i "$air" | fold -w 76
+            echo "END-AIR $name"
+          done
+      - name: Compare with committed modules
+        working-directory: crates/reims-vgpu/tests/fixtures/clspv
+        run: |
+          set -uo pipefail
+          for air in "$RUNNER_TEMP"/air/*.air; do
+            name="$(basename "$air")"
+            if [ -f "$name" ] && cmp -s "$air" "$name"; then
+              echo "same: $name"
+            else
+              echo "::warning::$name differs from the committed module (or is not committed yet)"
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clspv-fixtures-air
+          path: ${{ runner.temp }}/air
