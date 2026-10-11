@@ -75,6 +75,25 @@ pub enum ComputeValidationDecline {
         actual: usize,
         expected: usize,
     },
+    /// A guest seed whose row pitch is narrower than one row of the image, or
+    /// has no byte count.
+    StorageGuestSeedRowStride {
+        binding: u32,
+        row_length_texels: u32,
+    },
+    /// A guest seed window whose length is not exactly what its rows reach:
+    /// short, the copy would read past it; long, it names bytes it never reads.
+    StorageGuestSeedLength {
+        binding: u32,
+        actual: u64,
+        expected: u64,
+    },
+    /// A guest seed whose runs do not add up to the window they claim.
+    StorageGuestSeedCoverage {
+        binding: u32,
+        covered: u64,
+        declared: u64,
+    },
 }
 
 impl Decline for ComputeValidationDecline {
@@ -108,6 +127,13 @@ impl Decline for ComputeValidationDecline {
             }
             Self::StorageZeroGeometry { .. } => "vk_compute_validate_storage_zero_geometry",
             Self::StorageBytesLength { .. } => "vk_compute_validate_storage_bytes_length",
+            Self::StorageGuestSeedRowStride { .. } => {
+                "vk_compute_validate_storage_guest_seed_row_stride"
+            }
+            Self::StorageGuestSeedLength { .. } => "vk_compute_validate_storage_guest_seed_length",
+            Self::StorageGuestSeedCoverage { .. } => {
+                "vk_compute_validate_storage_guest_seed_coverage"
+            }
         }
     }
 
@@ -166,6 +192,31 @@ impl Decline for ComputeValidationDecline {
                 ("binding", binding.to_string()),
                 ("actual", actual.to_string()),
                 ("expected", expected.to_string()),
+            ],
+            Self::StorageGuestSeedRowStride {
+                binding,
+                row_length_texels,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("row_length_texels", row_length_texels.to_string()),
+            ],
+            Self::StorageGuestSeedLength {
+                binding,
+                actual,
+                expected,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("actual", actual.to_string()),
+                ("expected", expected.to_string()),
+            ],
+            Self::StorageGuestSeedCoverage {
+                binding,
+                covered,
+                declared,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("covered", covered.to_string()),
+                ("declared", declared.to_string()),
             ],
             Self::InvalidSamplerLod {
                 binding,
@@ -257,6 +308,20 @@ mod tests {
                 actual: 3,
                 expected: 4,
             },
+            ComputeValidationDecline::StorageGuestSeedRowStride {
+                binding: 34,
+                row_length_texels: 1,
+            },
+            ComputeValidationDecline::StorageGuestSeedLength {
+                binding: 34,
+                actual: 39,
+                expected: 40,
+            },
+            ComputeValidationDecline::StorageGuestSeedCoverage {
+                binding: 34,
+                covered: 39,
+                declared: 40,
+            },
         ]
     }
 
@@ -280,7 +345,9 @@ mod tests {
         // for a request to get wrong.
         // Up from 16: an exact-thread launch is decomposed into regions, and
         // both ways that decomposition can carry no work are their own reason.
-        assert_eq!(before, 18, "the compute validator's reason census moved");
+        // Up from 18: a storage seed read from guest pages carries a window,
+        // and its pitch, length and coverage are each checked.
+        assert_eq!(before, 21, "the compute validator's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate compute-validation slug");
     }
 

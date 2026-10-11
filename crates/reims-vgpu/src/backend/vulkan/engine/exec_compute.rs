@@ -16,7 +16,7 @@ use super::pools::{BufferSlot, ResourcePools, StorageImageKey, StorageImageSlot}
 use super::types::{
     ComputeBufferOutput, ComputeDispatch, ComputeDispatchPayload, ComputeOutput, ComputeRequest,
     ComputeResidentSampleBind, ComputeSampledImageResource, ComputeSampledSource,
-    ComputeStorageResidency, DrawError, TargetIdentity,
+    ComputeStorageResidency, DrawError, StorageImageSeed, TargetIdentity,
 };
 use super::vk_call::{VkCall, VkOp};
 
@@ -32,7 +32,7 @@ struct PreparedStorageImage {
     binding: u32,
     array_element: u32,
     slot: StorageImageSlot,
-    seed: Option<BufferSlot>,
+    seed: Option<SeedCopy>,
     dst: ComputeImageDst,
     len: usize,
     width: u32,
@@ -42,6 +42,16 @@ struct PreparedStorageImage {
     /// slot, and whatever the compute-storage registry recorded for a resident.
     initial_access: super::pools::ResidentAccess,
     residency: Option<ComputeStorageResidency>,
+}
+
+/// Where a storage image's seed copy reads from: a host staging slot, the
+/// guest-RAM import itself, or a slot a GPU gather filled. One shape for all
+/// three, so the recording below has no arm per origin.
+struct SeedCopy {
+    buffer: vk::Buffer,
+    offset: u64,
+    /// `bufferRowLength`; 0 for tight rows.
+    row_length_texels: u32,
 }
 
 /// One prepared sampled input: a transient sampled-only image seeded either
@@ -120,6 +130,54 @@ enum ComputeImageDst {
     /// bound is the type, which is the whole argument in
     /// `runtime/guest_ram.rs`.
     Direct(super::GuestCopyPlan),
+}
+
+/// A guest seed must be exactly the window the copy reads: `height - 1` rows at
+/// its pitch plus one tight row, with runs that cover all of it. The copy reads
+/// `bufferRowLength` texels per row, so a pitch narrower than a row would read
+/// the next row's texels and a short window would read past the buffer.
+fn validate_storage_guest_seed(
+    img: &super::types::ComputeStorageImageResource,
+    source: &super::types::GuestRunSource,
+) -> Result<(), DrawError> {
+    let texel = img.format.bytes_per_texel() as u64;
+    let tight_row = u64::from(img.width) * texel;
+    let stride = if source.row_length_texels == 0 {
+        tight_row
+    } else {
+        u64::from(source.row_length_texels) * texel
+    };
+    if stride < tight_row {
+        return Err(DrawError::ComputeValidation(
+            ComputeValidationDecline::StorageGuestSeedRowStride {
+                binding: img.binding,
+                row_length_texels: source.row_length_texels,
+            },
+        ));
+    }
+    // Every factor is a u32 widened by a texel size of at most 16 bytes, so
+    // neither product can overflow a u64.
+    let expected = u64::from(img.height.saturating_sub(1)) * stride + tight_row;
+    if source.total_len != expected {
+        return Err(DrawError::ComputeValidation(
+            ComputeValidationDecline::StorageGuestSeedLength {
+                binding: img.binding,
+                actual: source.total_len,
+                expected,
+            },
+        ));
+    }
+    let covered: u64 = source.runs.iter().map(|run| run.len()).sum();
+    if covered != source.total_len {
+        return Err(DrawError::ComputeValidation(
+            ComputeValidationDecline::StorageGuestSeedCoverage {
+                binding: img.binding,
+                covered,
+                declared: source.total_len,
+            },
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
@@ -275,17 +333,23 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        let expected = (img.width as usize)
-            .saturating_mul(img.height as usize)
-            .saturating_mul(img.format.bytes_per_texel());
-        if img.bytes.len() != expected {
-            return Err(DrawError::ComputeValidation(
-                ComputeValidationDecline::StorageBytesLength {
-                    binding: img.binding,
-                    actual: img.bytes.len(),
-                    expected,
-                },
-            ));
+        // Host bytes owe a tight length, a guest window the exact reach of its
+        // rows, and a resident seed nothing.
+        match &img.seed {
+            StorageImageSeed::Host(bytes) => {
+                let expected = img.tight_len();
+                if bytes.len() != expected {
+                    return Err(DrawError::ComputeValidation(
+                        ComputeValidationDecline::StorageBytesLength {
+                            binding: img.binding,
+                            actual: bytes.len(),
+                            expected,
+                        },
+                    ));
+                }
+            }
+            StorageImageSeed::Guest(source) => validate_storage_guest_seed(img, source)?,
+            StorageImageSeed::Resident => {}
         }
     }
     Ok(())
@@ -787,8 +851,9 @@ pub(crate) unsafe fn execute_compute_inner(
         sampler_handles.push((sampler.binding, handle));
     }
 
-    // Storage images: device-local + staging seed upload + readback buffer.
+    // Storage images: device-local + seed copy + readback buffer.
     let mut simg_slots = Vec::with_capacity(req.storage_images.len());
+    let mut guest_gathers: Vec<super::exec::PendingGuestGather> = Vec::new();
     for resource in &req.storage_images {
         let key = StorageImageKey {
             width: resource.width,
@@ -814,43 +879,66 @@ pub(crate) unsafe fn execute_compute_inner(
                 false,
             )
         };
-        if resource.seed_skipped {
-            let Some(residency) = resource.residency else {
-                return Err(DrawError::ComputeExecution(
-                    ComputeExecutionDecline::SeedSkippedWithoutResidency {
-                        binding: resource.binding,
-                        width: resource.width,
-                        height: resource.height,
-                    },
-                ));
-            };
-            if !generation_match {
-                // The caller verified the resident generation at stage time
-                // and skipped the guest read; seeding the zero placeholder now
-                // would silently corrupt the chain. Named failure instead.
-                return Err(DrawError::ComputeExecution(
-                    ComputeExecutionDecline::ResidentSeedGenerationLost {
-                        binding: resource.binding,
-                        identity: residency.identity,
-                        expected_generation: residency.seed_generation,
-                    },
-                ));
+        let seed = match &resource.seed {
+            StorageImageSeed::Resident => {
+                let Some(residency) = resource.residency else {
+                    return Err(DrawError::ComputeExecution(
+                        ComputeExecutionDecline::SeedSkippedWithoutResidency {
+                            binding: resource.binding,
+                            width: resource.width,
+                            height: resource.height,
+                        },
+                    ));
+                };
+                if !generation_match {
+                    // The caller verified the resident generation at stage
+                    // time and read nothing; seeding nothing now would silently
+                    // corrupt the chain. Named failure instead.
+                    return Err(DrawError::ComputeExecution(
+                        ComputeExecutionDecline::ResidentSeedGenerationLost {
+                            binding: resource.binding,
+                            identity: residency.identity,
+                            expected_generation: residency.seed_generation,
+                        },
+                    ));
+                }
+                None
             }
-        }
-        let st = if generation_match {
-            None
-        } else {
-            let staging = pools.acquire_staging(ctx, resource.bytes.len() as u64, counters)?;
-            pools.write_staging(ctx, &staging, &resource.bytes)?;
-            counters.note_compute_storage_seed_upload(resource.bytes.len() as u64);
-            Some(staging)
+            // A resident already at the seed generation holds these bytes.
+            _ if generation_match => None,
+            StorageImageSeed::Host(bytes) => {
+                let staging = pools.acquire_staging(ctx, bytes.len() as u64, counters)?;
+                pools.write_staging(ctx, &staging, bytes)?;
+                counters.note_compute_storage_seed_upload(bytes.len() as u64);
+                Some(SeedCopy {
+                    buffer: staging.buffer,
+                    offset: 0,
+                    row_length_texels: 0,
+                })
+            }
+            StorageImageSeed::Guest(source) => {
+                let texels = unsafe {
+                    super::exec::guest_window_texels(
+                        ctx,
+                        pools,
+                        counters,
+                        source,
+                        &mut guest_gathers,
+                    )?
+                };
+                Some(SeedCopy {
+                    buffer: texels.buffer(),
+                    offset: texels.offset(),
+                    row_length_texels: source.row_length_texels,
+                })
+            }
         };
         // Where the output goes is the caller's decision, not this rail's: a
         // request that named guest pages licensed them first, and one that did
         // not gets the pooled readback and the device→host crossing with it.
         let dst = match &resource.destination {
             super::types::ComputeImageDestination::Host => ComputeImageDst::Readback(
-                pools.acquire_readback_extra(ctx, resource.bytes.len() as u64, counters)?,
+                pools.acquire_readback_extra(ctx, resource.tight_len() as u64, counters)?,
             ),
             super::types::ComputeImageDestination::GuestPages { target, .. } => {
                 match unsafe {
@@ -880,7 +968,7 @@ pub(crate) unsafe fn execute_compute_inner(
                         }
                         ComputeImageDst::Readback(pools.acquire_readback_extra(
                             ctx,
-                            resource.bytes.len() as u64,
+                            resource.tight_len() as u64,
                             counters,
                         )?)
                     }
@@ -891,9 +979,9 @@ pub(crate) unsafe fn execute_compute_inner(
             binding: resource.binding,
             array_element: resource.array_element,
             slot: img,
-            seed: st,
+            seed,
             dst,
-            len: resource.bytes.len(),
+            len: resource.tight_len(),
             width: resource.width,
             height: resource.height,
             initial_access,
@@ -1155,11 +1243,12 @@ pub(crate) unsafe fn execute_compute_inner(
 
     // Upload storage-image misses, or transition a generation-matched resident
     // image directly from the prior readback layout into GENERAL.
+    unsafe { super::exec::record_guest_gathers_for_transfer(ctx, cb, &guest_gathers) };
     for prepared in &simg_slots {
         let img = &prepared.slot;
         let range = super::color_subresource_range();
         let (src_stage, src_access) = prepared.initial_access.source_scope();
-        if let Some(st) = &prepared.seed {
+        if let Some(seed) = &prepared.seed {
             let barrier = [vk::ImageMemoryBarrier::default()
                 .src_access_mask(src_access)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -1177,6 +1266,8 @@ pub(crate) unsafe fn execute_compute_inner(
                 &barrier,
             );
             let copy = [vk::BufferImageCopy::default()
+                .buffer_offset(seed.offset)
+                .buffer_row_length(seed.row_length_texels)
                 .image_subresource(super::color_subresource_layers())
                 .image_extent(vk::Extent3D {
                     width: prepared.width,
@@ -1185,7 +1276,7 @@ pub(crate) unsafe fn execute_compute_inner(
                 })];
             ctx.device.cmd_copy_buffer_to_image(
                 cb,
-                st.buffer,
+                seed.buffer,
                 img.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &copy,
@@ -1833,6 +1924,74 @@ mod tests {
         );
     }
 
+    /// Each seed source owes its own check: host bytes a tight length, a guest
+    /// window the exact reach of its rows at its pitch with runs covering it,
+    /// and a resident nothing at all.
+    #[test]
+    fn every_storage_seed_source_is_validated_on_its_own_terms() {
+        use super::super::types::{GuestRun, GuestRunSource};
+        let guest = |declared: u64, covered: u64, row_length_texels: u32| {
+            StorageImageSeed::Guest(GuestRunSource {
+                runs: std::sync::Arc::new(vec![
+                    GuestRun::whole(0x1000, covered).expect("a fixture run covers its span")
+                ]),
+                source_offset: 0,
+                total_len: declared,
+                row_length_texels,
+                pages: None,
+                direct_image: None,
+            })
+        };
+        let req = |seed: StorageImageSeed| ComputeRequest {
+            spirv: vec![0x0723_0203],
+            entry: "main".into(),
+            dispatch: ComputeDispatch::Workgroups([1, 1, 1]),
+            storage_images: vec![ComputeStorageImageResource {
+                destination: Default::default(),
+                binding: 34,
+                array_element: 0,
+                descriptor_count: 1,
+                format: StorageImageFormat::Bgra8Unorm,
+                width: 4,
+                height: 2,
+                seed,
+                residency: None,
+            }],
+            ..Default::default()
+        };
+        let slug = |seed| match validate_compute(&req(seed)) {
+            Err(DrawError::ComputeValidation(decline)) => decline.slug(),
+            Err(other) => panic!("expected typed compute validation, got {other}"),
+            Ok(()) => "ok",
+        };
+
+        assert_eq!(slug(StorageImageSeed::Host(vec![0; 32])), "ok");
+        assert_eq!(
+            slug(StorageImageSeed::Host(vec![0; 31])),
+            "vk_compute_validate_storage_bytes_length"
+        );
+        assert_eq!(slug(StorageImageSeed::Resident), "ok");
+        // Tight: two 16-byte rows. Padded: one 24-byte pitch plus a tight row.
+        assert_eq!(slug(guest(32, 32, 0)), "ok");
+        assert_eq!(slug(guest(40, 40, 6)), "ok");
+        assert_eq!(
+            slug(guest(40, 40, 3)),
+            "vk_compute_validate_storage_guest_seed_row_stride"
+        );
+        assert_eq!(
+            slug(guest(39, 39, 6)),
+            "vk_compute_validate_storage_guest_seed_length"
+        );
+        assert_eq!(
+            slug(guest(48, 48, 6)),
+            "vk_compute_validate_storage_guest_seed_length"
+        );
+        assert_eq!(
+            slug(guest(40, 39, 6)),
+            "vk_compute_validate_storage_guest_seed_coverage"
+        );
+    }
+
     #[test]
     fn sampled_and_storage_images_keep_distinct_descriptor_access() {
         let mut req = ComputeRequest {
@@ -1858,9 +2017,8 @@ mod tests {
                 format: StorageImageFormat::Rgba8Uint,
                 width: 1,
                 height: 1,
-                bytes: vec![0; 4],
+                seed: StorageImageSeed::Host(vec![0; 4]),
                 residency: None,
-                seed_skipped: false,
             }],
             ..Default::default()
         };

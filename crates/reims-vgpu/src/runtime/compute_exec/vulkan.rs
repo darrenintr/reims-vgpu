@@ -291,11 +291,11 @@ pub(crate) struct VulkanStage {
     /// can register the resident it produced under the same key.
     pub(crate) residency: Option<ComputeStorageResidencyCandidate>,
     /// What the engine could already serve for this binding, so the stage-time
-    /// guest read was skipped and `bytes` is a zero placeholder.
+    /// guest read was skipped.
     ///
     /// [`ResidentServe::Seed`] — a storage binding whose resident the engine
-    /// holds at a verified generation; it must never be seeded from the
-    /// placeholder. [`ResidentServe::Sample`] — a sampled input whose window is
+    /// holds at a verified generation; `bytes` is empty and the engine seeds
+    /// nothing (`StorageImageSeed::Resident`). [`ResidentServe::Sample`] — a sampled input whose window is
     /// a prior dispatch's storage output; the engine seeds the sampled image by
     /// copy-on-sample from that resident, again never from the bytes.
     ///
@@ -313,6 +313,12 @@ pub(crate) struct VulkanStage {
     /// be uploaded into a multisample image at all. The engine binds this
     /// target's own view.
     pub(crate) multisample_target: Option<crate::backend::vulkan::engine::TargetIdentity>,
+    /// The guest window a storage binding's seed lives in, when staging left
+    /// the read to this rail: `bytes` is then empty and [`storage_seed`] reads
+    /// the window on the GPU, or on the CPU where the pages do not resolve to
+    /// runs. Exclusive with `serve` by construction — staging defers only a
+    /// seed nothing serves.
+    pub(crate) guest_seed: Option<MappingSeedWindow>,
 }
 
 impl RailStage for VulkanStage {
@@ -329,8 +335,102 @@ impl RailStage for VulkanStage {
             residency,
             serve,
             multisample_target: None,
+            guest_seed: None,
         }
     }
+
+    /// This rail reads guest pages on the GPU, so a storage seed costs no CPU
+    /// read and no host buffer at staging. See [`storage_seed`].
+    fn defers_seed_read() -> bool {
+        true
+    }
+
+    fn with_guest_seed(self, window: MappingSeedWindow) -> Self {
+        Self {
+            guest_seed: Some(window),
+            ..self
+        }
+    }
+}
+
+/// What a staged storage binding's image holds before the dispatch.
+///
+/// In the order the sources exclude each other: a resident the engine verified
+/// at stage time, then a guest window staging left to this rail, then the bytes
+/// staging read. A deferred window that does not resolve to guest runs is read
+/// on the CPU here, exactly as staging would have read it.
+pub(super) fn storage_seed<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    t: &mut StagedTexture<VulkanStage>,
+    held: crate::backend::vulkan::engine::StorageImageFormat,
+) -> Result<crate::backend::vulkan::engine::StorageImageSeed, ComputeStatus> {
+    use crate::backend::vulkan::engine::StorageImageSeed;
+    if t.rail
+        .serve
+        .as_ref()
+        .and_then(ResidentServe::seed_generation)
+        .is_some()
+    {
+        return Ok(StorageImageSeed::Resident);
+    }
+    let Some(seed) = t.rail.guest_seed else {
+        return Ok(StorageImageSeed::Host(std::mem::take(&mut t.bytes)));
+    };
+    let MappingSeedWindow {
+        mapping_id,
+        window,
+        width,
+        height,
+    } = seed;
+    // The copy reinterprets the guest's texels as the held format, so the GPU
+    // read is only the CPU read's equal where the texel sizes agree; otherwise
+    // the CPU bytes go on to the engine's own length refusal.
+    if u64::from(window.bpp) == held.bytes_per_texel() as u64 {
+        if let Some(source) = crate::runtime::draw::vulkan::mapping_window_source(
+            state,
+            host,
+            mapping_id,
+            window.base_off,
+            u64::from(window.bpr),
+            width,
+            height,
+            u64::from(window.bpp),
+        ) {
+            crate::runtime::drain::note_store_route("compute_seed_guest_runs");
+            return Ok(StorageImageSeed::Guest(source));
+        }
+    }
+    crate::runtime::drain::note_store_route("compute_seed_guest_cpu");
+    let tight = width
+        .checked_mul(window.bpp)
+        .ok_or(ComputeStatus::Unsupported("stage_tex_tight_bpr_overflow"))?;
+    let need = host_alloc_len(u64::from(tight).saturating_mul(u64::from(height)))
+        .ok_or(ComputeStatus::Unsupported("stage_tex_host_len"))?;
+    let mut bytes = vec![0u8; need];
+    if !mapping_write::read_rect_raw_at(
+        state,
+        host,
+        mapping_id,
+        window,
+        mapping_write::Rect {
+            origin_x: 0,
+            origin_y: 0,
+            width,
+            height,
+        },
+        &mut bytes,
+        tight,
+    ) {
+        crate::observe::fail(format!(
+            "compute_stage_tex mapper_ref_texture_fail reason=read mapping={mapping_id} {width}x{height} off={} bpr={} span_end={}",
+            window.base_off, window.bpr, window.span_end
+        ));
+        return Err(ComputeStatus::GuestIo(
+            "compute_stage_tex_mapper_ref_texture_read",
+        ));
+    }
+    Ok(StorageImageSeed::Host(bytes))
 }
 
 /// Bound on mirror entries per mapping: a ping-pong canvas needs 2, planar
@@ -1207,7 +1307,10 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 format: shader_fmt,
                 width: t.width,
                 height: t.height,
-                bytes: std::mem::take(&mut t.bytes),
+                seed: match storage_seed(state, host, t, shader_fmt) {
+                    Ok(seed) => seed,
+                    Err(status) => return status,
+                },
                 // The guest window this output belongs to is on `t.writeback`,
                 // so the destination is decided from the window rather than
                 // from anything about this dispatch. `Host` needs no host
@@ -1224,12 +1327,6 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                         ),
                     }
                 }),
-                seed_skipped: t
-                    .rail
-                    .serve
-                    .as_ref()
-                    .and_then(ResidentServe::seed_generation)
-                    .is_some(),
             });
         } else {
             let Some(sampled_fmt) = mtl_to_engine_sampled(t.pixel_format) else {
@@ -2131,6 +2228,7 @@ fn multisample_sampled_texture<M: HostMemory + HostOps>(
             residency: None,
             serve: None,
             multisample_target: Some(identity),
+            guest_seed: None,
         },
     })
 }

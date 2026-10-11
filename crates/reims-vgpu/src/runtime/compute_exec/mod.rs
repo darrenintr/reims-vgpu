@@ -1377,7 +1377,8 @@ pub(crate) trait RailStage: Sized {
     /// from. `residency` is the storage-mirror window the staging corresponds
     /// to, for a storage binding and `None` for anything else, and `serve` is
     /// what the running rail said it could already serve for that window —
-    /// which is also why `bytes` may be a zero placeholder.
+    /// which is also why `bytes` may be empty (a served storage seed) or a zero
+    /// placeholder (a served sampled input).
     ///
     /// Three arguments rather than one struct of them because a rail that keeps
     /// no residency mirror ignores the last two, and an ignored *argument* is
@@ -1388,6 +1389,32 @@ pub(crate) trait RailStage: Sized {
         residency: Option<ComputeStorageResidencyCandidate>,
         serve: Option<ResidentServe>,
     ) -> Self;
+
+    /// Whether this rail reads a storage binding's guest seed itself, at
+    /// execution, rather than taking the bytes staging would read on the CPU.
+    ///
+    /// A rail that answers `true` receives the window through
+    /// [`Self::with_guest_seed`] in place of the bytes, and owns the CPU read
+    /// as its own fallback.
+    fn defers_seed_read() -> bool {
+        false
+    }
+
+    /// Hand this rail the guest window a storage binding's seed lives in. Only
+    /// called when [`Self::defers_seed_read`] answered `true`.
+    fn with_guest_seed(self, _window: MappingSeedWindow) -> Self {
+        self
+    }
+}
+
+/// The guest window a storage binding's seed lives in, for a rail that reads
+/// it itself. Neutral: a mapping and the window into it, nothing a rail owns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MappingSeedWindow {
+    pub(crate) mapping_id: u32,
+    pub(crate) window: mapping_write::SurfaceWindow,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
 /// The storage-mirror window a staged binding corresponds to.
@@ -2278,7 +2305,7 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
         // pages reproduces what the GPU already has. The mapping-level content
         // generation may have advanced via disjoint sibling windows
         // (ping-pong canvases), so the gate pairs mirror↔engine directly.
-        // The zero placeholder is never seeded — the engine fails visibly
+        // Nothing is seeded from `bytes` — the engine fails visibly
         // with `vk_compute_exec_resident_seed_generation_lost` if the resident
         // vanishes by acquire time.
         // Copy-on-sample is the same gate: a sampled input of a window whose
@@ -2356,18 +2383,34 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
                 ));
             }
         }
-        let mut bytes = vec![0u8; need];
+        // A storage seed nothing serves is the rail's to read when it can read
+        // guest pages itself: neither the host buffer nor the CPU read exists.
+        let defer_seed = is_storage && serve.is_none() && R::defers_seed_read();
+        // A served storage seed is never read from `bytes` on any rail; only a
+        // sampled serve still carries the placeholder its fallback arm names.
+        let seed_served = is_storage
+            && serve
+                .as_ref()
+                .and_then(ResidentServe::seed_generation)
+                .is_some();
+        let window = mapping_write::SurfaceWindow {
+            base_off: surface_offset,
+            bpr: surface_bpr,
+            span_end,
+            bpp,
+        };
+        let mut bytes = if defer_seed || seed_served {
+            Vec::new()
+        } else {
+            vec![0u8; need]
+        };
         if serve.is_none()
+            && !defer_seed
             && !mapping_write::read_rect_raw_at(
                 state,
                 host,
                 mapping_id,
-                mapping_write::SurfaceWindow {
-                    base_off: surface_offset,
-                    bpr: surface_bpr,
-                    span_end,
-                    bpp,
-                },
+                window,
                 mapping_write::Rect {
                     origin_x: 0,
                     origin_y: 0,
@@ -2408,6 +2451,14 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             )
             });
         }
+        let rail = R::stage(
+            texture_ref,
+            is_storage.then_some(ComputeStorageResidencyCandidate {
+                key: residency_key,
+                seed_generation,
+            }),
+            serve,
+        );
         return Ok(StagedTexture {
             binding,
             pixel_format: stage_fmt,
@@ -2419,14 +2470,16 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             bytes,
             is_storage,
             writeback,
-            rail: R::stage(
-                texture_ref,
-                is_storage.then_some(ComputeStorageResidencyCandidate {
-                    key: residency_key,
-                    seed_generation,
-                }),
-                serve,
-            ),
+            rail: if defer_seed {
+                rail.with_guest_seed(MappingSeedWindow {
+                    mapping_id,
+                    window,
+                    width,
+                    height,
+                })
+            } else {
+                rail
+            },
         });
     }
 

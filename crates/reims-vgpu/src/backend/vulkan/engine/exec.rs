@@ -60,7 +60,7 @@ impl From<BufferSlot> for BoundBuffer {
 /// Recorded rather than executed at plan time: the copies belong in the draw's
 /// own command buffer, ahead of the pass that reads them, so they cost one
 /// submission with the draw instead of a submit and a fence of their own.
-struct PendingGuestGather {
+pub(super) struct PendingGuestGather {
     /// Device-local destination, which is what the draw actually binds.
     dst: vk::Buffer,
     /// One entry per import the window's stretches resolved against, each with
@@ -982,7 +982,7 @@ crate::observe::decline::decline_display!(BufferImportDecline);
 ///
 /// The two arms are the same `vkCmdCopyBufferToImage` over a different buffer,
 /// and the whole difference is whether the CPU moved the texels first.
-enum GuestTexels {
+pub(super) enum GuestTexels {
     /// The buffer **is** the guest's pages, reached through the host-pointer
     /// import over their RAMBlock. Nothing copied them into it: the GPU reads
     /// the bytes where the guest wrote them, and `offset` is where the first
@@ -1012,14 +1012,14 @@ enum GuestTexels {
 }
 
 impl GuestTexels {
-    fn buffer(&self) -> vk::Buffer {
+    pub(super) fn buffer(&self) -> vk::Buffer {
         match self {
             Self::Imported { buffer, .. } => *buffer,
             Self::Gathered(slot) | Self::Scratch(slot) => slot.buffer,
         }
     }
 
-    fn offset(&self) -> u64 {
+    pub(super) fn offset(&self) -> u64 {
         match self {
             Self::Imported { offset, .. } => *offset,
             // Both start at the beginning of a pooled slot the window was
@@ -1305,6 +1305,76 @@ unsafe fn import_sampled_guest_window(
         sources,
     });
     Ok(Some(GuestTexels::Gathered(slot)))
+}
+
+/// A guest window as a buffer a transfer can name: the import itself, a GPU
+/// gather out of it, or — where neither is possible — the CPU's packing of the
+/// same runs into staging. The draw rail's sampled bind makes this choice
+/// inline; this is the same choice for a caller that only needs the buffer.
+///
+/// An imported or gathered window is read by the GPU when the command buffer
+/// executes, so the guest read is recorded and the completion stamp waits for
+/// it. Gathers are appended to `gathers`; the caller records them with
+/// [`record_guest_gathers_for_transfer`] before the transfer that reads them.
+///
+/// # Safety
+///
+/// As [`import_sampled_guest_window`].
+pub(super) unsafe fn guest_window_texels(
+    ctx: &super::context::DeviceContext,
+    pools: &mut ResourcePools,
+    counters: &EngineCounters,
+    src: &super::types::GuestRunSource,
+    gathers: &mut Vec<PendingGuestGather>,
+) -> Result<GuestTexels, DrawError> {
+    if let Some(texels) =
+        unsafe { import_sampled_guest_window(ctx, pools, counters, src, gathers)? }
+    {
+        pools.note_guest_read_recorded();
+        counters.note_sampled_guest_import(src.total_len);
+        return Ok(texels);
+    }
+    let scratch = pools.acquire_staging(ctx, src.total_len, counters)?;
+    unsafe {
+        pools.write_staging_from_runs(ctx, &scratch, &src.runs, src.source_offset, src.total_len)?
+    };
+    counters.note_sampled_gather(src.total_len);
+    Ok(GuestTexels::Scratch(scratch))
+}
+
+/// Record `gathers` as buffer copies, and make them visible to a transfer read.
+///
+/// # Safety
+///
+/// `cb` must be recording, outside a render pass, and every buffer named must
+/// outlive its execution.
+pub(super) unsafe fn record_guest_gathers_for_transfer(
+    ctx: &super::context::DeviceContext,
+    cb: vk::CommandBuffer,
+    gathers: &[PendingGuestGather],
+) {
+    if gathers.is_empty() {
+        return;
+    }
+    for gather in gathers {
+        for (source, copies) in &gather.sources {
+            unsafe { ctx.device.cmd_copy_buffer(cb, *source, gather.dst, copies) };
+        }
+    }
+    let barrier = [vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+    unsafe {
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &barrier,
+            &[],
+            &[],
+        )
+    };
 }
 
 /// A check that sent a guest-sourced sampled bind back to the CPU gather before

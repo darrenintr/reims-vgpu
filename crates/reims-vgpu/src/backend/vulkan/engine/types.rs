@@ -1679,24 +1679,51 @@ pub struct ComputeStorageImageResource {
     pub format: StorageImageFormat,
     pub width: u32,
     pub height: u32,
-    /// Seed content, read *into* the image before the dispatch.
-    ///
-    /// Deliberately still a host allocation, and not paired with
-    /// [`Self::destination`]. The seed direction is the GPU *reading* guest
-    /// pages, which this device refuses on its own grounds: it acks a command
-    /// before the work runs, so the guest may repaint those pages first. Only
-    /// the output direction is routed.
-    pub bytes: Vec<u8>,
+    /// What the image holds before the dispatch. See [`StorageImageSeed`].
+    pub seed: StorageImageSeed,
     /// Where the post-dispatch pixels go. See [`ComputeImageDestination`].
     pub destination: ComputeImageDestination,
     /// Exact mapper-ref-texture resource lifetime/view contract for persistent GPU
     /// storage. `None` keeps the conservative transient upload path.
     pub residency: Option<ComputeStorageResidency>,
-    /// The caller skipped reading guest pages into `bytes` because the
-    /// resident generation matched at stage time. The engine must fail
-    /// visibly (never seed the zero placeholder) if the resident image is
-    /// gone by acquire time.
-    pub seed_skipped: bool,
+}
+
+impl ComputeStorageImageResource {
+    /// Bytes of one tight copy of this image: what a readback slot holds and
+    /// what a host seed must be. Derived from the geometry, never carried.
+    pub fn tight_len(&self) -> usize {
+        (self.width as usize)
+            .saturating_mul(self.height as usize)
+            .saturating_mul(self.format.bytes_per_texel())
+    }
+}
+
+/// Where a storage image's contents come from before the dispatch writes it.
+///
+/// A storage binding is seeded even when the kernel only writes, because the
+/// texels it leaves alone must still hold what they held when the image goes
+/// back to the guest. The three sources exclude each other, so they are one
+/// type: this replaced a byte vector, a `seed_skipped` flag beside it, and a
+/// zero placeholder the vector had to carry whenever the flag was set.
+#[derive(Clone, Debug)]
+pub enum StorageImageSeed {
+    /// Tight host bytes, [`ComputeStorageImageResource::tight_len`] long.
+    Host(Vec<u8>),
+    /// The guest pages the image mirrors, read by the GPU when the dispatch
+    /// executes — the import itself, a GPU gather of it, or the CPU's packing
+    /// of the same runs where neither is possible.
+    ///
+    /// The read happens after this device has acknowledged the packet, which
+    /// is lawful for the same reason the draw rail's sampled import is: the
+    /// read is recorded, and the completion stamp the guest waits on before
+    /// touching the resource with its CPU is not published until it has run.
+    /// That stamp — not packet acknowledgement — is what a Metal client
+    /// synchronizes on.
+    Guest(GuestRunSource),
+    /// The engine resident already holds this content at the residency's seed
+    /// generation; nothing is read. The engine refuses by name if the resident
+    /// is gone by acquire time, rather than leaving the image unseeded.
+    Resident,
 }
 
 /// Bind request for a sampled input whose window content the engine already

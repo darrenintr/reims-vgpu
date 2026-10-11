@@ -12,7 +12,7 @@
 use reims_vgpu::backend::vulkan::engine::{
     self, ComputeBufferResource, ComputeRequest, ComputeResidentSampleBind,
     ComputeSampledImageResource, ComputeSampledSource, ComputeStorageImageResource,
-    ComputeStorageResidency, StorageImageFormat,
+    ComputeStorageResidency, StorageImageFormat, StorageImageSeed,
 };
 use reims_vgpu::model::ComputeStorageResidencyKey;
 
@@ -534,13 +534,12 @@ fn compute_storage_image_rgba8unorm_known_result() {
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            bytes: seed.clone(),
+            seed: StorageImageSeed::Host(seed.clone()),
             residency: Some(ComputeStorageResidency {
                 identity,
                 seed_generation: 1,
                 output_generation: 2,
             }),
-            seed_skipped: false,
         }],
     };
     let Some(out) = engine_or_skip("simg_rgba8", &req) else {
@@ -584,13 +583,12 @@ fn compute_storage_image_rgba8unorm_known_result() {
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            bytes: resident_seed.clone(),
+            seed: StorageImageSeed::Host(resident_seed.clone()),
             residency: Some(ComputeStorageResidency {
                 identity,
                 seed_generation: 2,
                 output_generation: 3,
             }),
-            seed_skipped: false,
         }],
     };
     let hit =
@@ -624,13 +622,12 @@ fn compute_storage_image_rgba8unorm_known_result() {
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            bytes: seed.clone(),
+            seed: StorageImageSeed::Host(seed.clone()),
             residency: Some(ComputeStorageResidency {
                 identity,
                 seed_generation: 9,
                 output_generation: 10,
             }),
-            seed_skipped: false,
         }],
     };
     let mismatch = engine::execute_compute_request(engine_device(), &mismatch_req)
@@ -718,13 +715,12 @@ fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() 
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            bytes: seed.clone(),
+            seed: StorageImageSeed::Host(seed.clone()),
             residency: Some(ComputeStorageResidency {
                 identity: identity(i),
                 seed_generation,
                 output_generation: 2,
             }),
-            seed_skipped: false,
         }],
     };
 
@@ -755,6 +751,93 @@ fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() 
             "resident {i} was destroyed by something other than an allocation failure"
         );
     }
+}
+
+/// `StorageImageSeed::Guest`: a storage image is seeded from a guest window at
+/// its own padded pitch, not from host bytes. The kernel writes only the left
+/// half, so the right half is the seed and must hold the window's texels, row
+/// for row, with none of the pitch padding. A window over a host `Vec` has no
+/// import, so this is the CPU packing of the runs — the same copy the import
+/// and the GPU gather feed.
+#[test]
+fn compute_storage_image_guest_seed_strides_the_window() {
+    use reims_vgpu::backend::vulkan::engine::{GuestRun, GuestRunSource};
+    let _g = engine_test_session();
+    let spvasm = &storage_image_write_red_kernel("Rgba8");
+    let Some(words) = assemble_spvasm(spvasm, "simg_guest_seed") else {
+        return;
+    };
+    let (w, h, pitch_texels) = (4u32, 2u32, 6u32);
+    let pitch = (pitch_texels * 4) as usize;
+    let total = pitch * (h as usize - 1) + w as usize * 4;
+    // Each texel names its own coordinate; the padding is a value no texel has.
+    let mut window = vec![0xeeu8; pitch * h as usize];
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let i = y * pitch + x * 4;
+            window[i..i + 4].copy_from_slice(&[x as u8, y as u8, 0x40, 0x80]);
+        }
+    }
+    let req = ComputeRequest {
+        spirv: words,
+        entry: "main".into(),
+        dispatch: engine::ComputeDispatch::Workgroups([w / 2, h, 1]),
+        storage_buffers: vec![],
+        sampled_images: vec![],
+        samplers: vec![],
+        storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
+            binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
+            format: StorageImageFormat::Rgba8Unorm,
+            width: w,
+            height: h,
+            seed: StorageImageSeed::Guest(GuestRunSource {
+                runs: std::sync::Arc::new(vec![GuestRun::whole(
+                    window.as_ptr() as usize,
+                    total as u64,
+                )
+                .expect("a fixture run covers its own span")]),
+                source_offset: 0,
+                total_len: total as u64,
+                row_length_texels: pitch_texels,
+                pages: None,
+                direct_image: None,
+            }),
+            residency: None,
+        }],
+    };
+    // `window` outlives the call, which is the only time its bytes are read.
+    let Some(out) = engine_or_skip("simg_guest_seed", &req) else {
+        return;
+    };
+    let bytes = out.images[0]
+        .bytes()
+        .expect("a Host destination reads bytes back");
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            let got = &bytes[i..i + 4];
+            if x < w / 2 {
+                assert!(
+                    got[0] >= 254 && got[1] == 0 && got[2] == 0 && got[3] >= 254,
+                    "written texel ({x},{y}) = {got:?}"
+                );
+            } else {
+                assert_eq!(
+                    got,
+                    &[x as u8, y as u8, 0x40, 0x80],
+                    "seeded texel ({x},{y})"
+                );
+            }
+        }
+    }
+    let snap = engine::counter_snapshot();
+    assert_eq!(
+        snap.compute_storage_seed_uploads, 0,
+        "a guest seed is not a host upload"
+    );
 }
 
 /// Regression lock for the BGRA storage-composite R/B fix: a guest `BGRA8Unorm`
@@ -810,13 +893,12 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
             format: StorageImageFormat::Bgra8Unorm,
             width: w,
             height: h,
-            bytes: seed,
+            seed: StorageImageSeed::Host(seed),
             residency: Some(ComputeStorageResidency {
                 identity,
                 seed_generation: 1,
                 output_generation: 2,
             }),
-            seed_skipped: false,
         }],
     };
     let Some(out) = engine_or_skip("simg_bgra8", &req) else {
@@ -838,7 +920,7 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
     }
 }
 
-/// `seed_skipped` contract: a generation-matching resident dispatch renders
+/// `StorageImageSeed::Resident` contract: a generation-matching resident dispatch renders
 /// from the GPU-resident content while `bytes` is a zero placeholder (no seed
 /// upload); once the resident is gone the same request must fail with
 /// `vk_compute_exec_resident_seed_generation_lost` — never silently seed the
@@ -880,13 +962,16 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
                 format: StorageImageFormat::Rgba8Unorm,
                 width: w,
                 height: h,
-                bytes: vec![0u8; (w * h * 4) as usize],
+                seed: if skipped {
+                    StorageImageSeed::Resident
+                } else {
+                    StorageImageSeed::Host(vec![0u8; (w * h * 4) as usize])
+                },
                 residency: Some(ComputeStorageResidency {
                     identity,
                     seed_generation,
                     output_generation,
                 }),
-                seed_skipped: skipped,
             }],
         }
     };
@@ -983,13 +1068,12 @@ fn compute_sampled_resident_copy_and_lost_resident() {
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            bytes: vec![0u8; (w * h * 4) as usize],
+            seed: StorageImageSeed::Host(vec![0u8; (w * h * 4) as usize]),
             residency: Some(ComputeStorageResidency {
                 identity,
                 seed_generation: 1,
                 output_generation: 2,
             }),
-            seed_skipped: false,
         }],
     };
     let Some(fill) = engine_or_skip("resident_sample_fill", &fill_req) else {
@@ -1336,9 +1420,8 @@ fn compute_storage_image_r16float_if_supported() {
             format: StorageImageFormat::R16Float,
             width: 2,
             height: 2,
-            bytes: seed,
+            seed: StorageImageSeed::Host(seed),
             residency: None,
-            seed_skipped: false,
         }],
     };
     match engine::execute_compute_request(engine_device(), &req) {

@@ -1225,6 +1225,150 @@ fn stage_texture_ref_texture_ref_resolves_surface_mapping() {
     ));
 }
 
+/// Stage the one-page 4x4 BGRA8 ref-texture surface the test above builds,
+/// filled with 0x5a, as a storage binding on rail `R`.
+fn stage_ref_texture_storage_surface<R: RailStage>(
+    stable_map_pages: bool,
+) -> (DeviceState, FakeHost, StagedTexture<R>) {
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    host.stable_map_pages = stable_map_pages;
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+    let sid = 3u32;
+    let ref_texture_ref = 10u32;
+    let pfn = 0x20u32;
+    host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0x5a);
+    assert!(state.map_surface(sid));
+    {
+        let m = state.mappings.get_mut(&sid).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    }
+    assert!(state.set_mapping_geom(sid, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
+    let ref_texture_desc = RefTextureBuilder::new(sid, 0, 0, 0).with_len(16);
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        desc_gva,
+        ref_texture_desc.bytes(),
+    );
+    let off = list_object_entry_offset(ref_texture_ref, 32).unwrap();
+    let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut list_entry[0..],
+        (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((16u32) << 8),
+    );
+    list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
+    let staged = stage_texture_raw::<R, _>(&mut state, &mut host, 1, ref_texture_ref, 32, true)
+        .expect("ref-texture storage surface must stage");
+    (state, host, staged)
+}
+
+/// A rail that reads guest pages itself is handed the storage seed's window
+/// instead of the bytes: staging reads nothing and allocates nothing. The rail
+/// then reads the window on the GPU where its pages resolve to runs, and where
+/// they do not reads on the CPU exactly the bytes staging would have read.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn vulkan_storage_seed_is_read_by_the_rail_not_by_staging() {
+    use crate::backend::vulkan::engine::{StorageImageFormat, StorageImageSeed};
+
+    let (_, _, neutral) = stage_ref_texture_storage_surface::<NeutralStage>(false);
+    assert_eq!(neutral.bytes, vec![0x5a; 4 * 4 * 4]);
+
+    for stable in [true, false] {
+        let (mut state, mut host, mut staged) =
+            stage_ref_texture_storage_surface::<vulkan::VulkanStage>(stable);
+        assert!(staged.bytes.is_empty(), "staging must not read the seed");
+        let window = staged.rail.guest_seed.expect("the rail owns the read");
+        assert_eq!(
+            (
+                window.mapping_id,
+                window.width,
+                window.height,
+                window.window.bpp
+            ),
+            (3, 4, 4, 4)
+        );
+        let seed = vulkan::storage_seed(
+            &mut state,
+            &mut host,
+            &mut staged,
+            StorageImageFormat::Bgra8Unorm,
+        )
+        .expect("seed");
+        match (stable, seed) {
+            (true, StorageImageSeed::Guest(source)) => {
+                // The surface's own row pitch, strided by the copy rather than
+                // packed: three padded rows and one tight one.
+                let bpr = u64::from(window.window.bpr);
+                assert!(bpr > 16);
+                assert_eq!(source.total_len, bpr * 3 + 16);
+                assert_eq!(u64::from(source.row_length_texels), bpr / 4);
+            }
+            (false, StorageImageSeed::Host(bytes)) => assert_eq!(bytes, neutral.bytes),
+            (_, other) => panic!("stable={stable}: unexpected seed {other:?}"),
+        }
+    }
+
+    // A texel size the window does not share is not reinterpreted on the GPU:
+    // the CPU bytes go on to the engine's length refusal.
+    let (mut state, mut host, mut staged) =
+        stage_ref_texture_storage_surface::<vulkan::VulkanStage>(true);
+    assert!(matches!(
+        vulkan::storage_seed(
+            &mut state,
+            &mut host,
+            &mut staged,
+            StorageImageFormat::Rgba16Float
+        ),
+        Ok(StorageImageSeed::Host(bytes)) if bytes == neutral.bytes
+    ));
+}
+
+/// The seed's other two sources: a verified resident reads nothing, and a
+/// binding staging already read hands those bytes over.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn vulkan_storage_seed_prefers_resident_then_staged_bytes() {
+    use crate::backend::vulkan::engine::{StorageImageFormat, StorageImageSeed};
+    use crate::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let mut staged = StagedTexture {
+        mip_levels: 1,
+        binding: 32,
+        rail: vulkan::VulkanStage::default(),
+        pixel_format: MTL_FORMAT_RGBA8_UNORM,
+        storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Unorm),
+        width: 1,
+        height: 1,
+        bytes: vec![1, 2, 3, 4],
+        is_storage: true,
+        writeback: TextureWriteback::None,
+    };
+    let held = StorageImageFormat::Rgba8Unorm;
+    staged.rail.serve = Some(ResidentServe::Seed(7));
+    assert!(matches!(
+        vulkan::storage_seed(&mut state, &mut host, &mut staged, held),
+        Ok(StorageImageSeed::Resident)
+    ));
+    staged.rail.serve = None;
+    assert!(matches!(
+        vulkan::storage_seed(&mut state, &mut host, &mut staged, held),
+        Ok(StorageImageSeed::Host(bytes)) if bytes == [1, 2, 3, 4]
+    ));
+}
+
 /// A ref-texture record is the exact Metal view, even when its single-plane
 /// backing already has valid base geometry. Live pipe 5 exposes each row
 /// of a 1920-wide BGRA8 surface as a 480-wide RGBA32Uint view so one

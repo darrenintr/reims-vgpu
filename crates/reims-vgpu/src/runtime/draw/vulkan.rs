@@ -2370,7 +2370,7 @@ fn try_mapper_ref_texture_target_guest_seed<M: HostMemory + HostOps>(
     h: u32,
     target_format: ash::vk::Format,
 ) -> Option<crate::backend::vulkan::engine::GuestTargetSeed> {
-    use crate::backend::vulkan::engine::{GuestRunSource, GuestTargetSeed};
+    use crate::backend::vulkan::engine::GuestTargetSeed;
     use crate::runtime::mapping_write::mapper_ref_texture_sample_window;
 
     if w == 0 || h == 0 || !mapper::ensure_resolved_for_scanout(state, host, mapping_id) {
@@ -2399,25 +2399,51 @@ fn try_mapper_ref_texture_target_guest_seed<M: HostMemory + HostOps>(
     if source_format != target_format {
         return None;
     }
-    let (span, row_length_texels) =
-        strided_window_extent(w, h, u64::from(layout.bytes_per_texel()), bpr)?;
+    Some(GuestTargetSeed {
+        source: mapping_window_source(
+            state,
+            host,
+            mapping_id,
+            base_off,
+            bpr,
+            w,
+            h,
+            u64::from(layout.bytes_per_texel()),
+        )?,
+        format: source_format,
+    })
+}
 
-    // A debt is not submitted work, so queue order cannot put it before the
-    // seed read until this call turns it into work. A submitted payment and the
-    // draw use the same queue; no CPU settle is needed between them.
+/// A `w × h` window of mapping `mapping_id`, `bpr` bytes per row from
+/// `base_off`, as guest runs the GPU reads when the command buffer executes.
+///
+/// Pays the mapping's writeback debt first and settles nothing: a debt is not
+/// submitted work, so queue order cannot put it before the read until this call
+/// turns it into work, and a submitted payment and the reader share the queue.
+/// `None` when the stride has no `bufferRowLength` or the pages do not resolve
+/// to runs; the caller reads the bytes on the CPU instead.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mapping_window_source<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    base_off: u64,
+    bpr: u64,
+    w: u32,
+    h: u32,
+    bpp: u64,
+) -> Option<crate::backend::vulkan::engine::GuestRunSource> {
+    let (span, row_length_texels) = strided_window_extent(w, h, bpp, bpr)?;
     crate::runtime::writeback_debt::pay_for_mapping(state, host, mapping_id);
     let (gpas, runs) = mapping_window_guest_runs(state, host, mapping_id, base_off, span)?;
     let page = state.page_size();
-    Some(GuestTargetSeed {
-        source: GuestRunSource {
-            runs: std::sync::Arc::new(runs),
-            source_offset: 0,
-            total_len: span,
-            row_length_texels,
-            pages: guest_page_window(host, gpas, page, base_off % page, span),
-            direct_image: None,
-        },
-        format: source_format,
+    Some(crate::backend::vulkan::engine::GuestRunSource {
+        runs: std::sync::Arc::new(runs),
+        source_offset: 0,
+        total_len: span,
+        row_length_texels,
+        pages: guest_page_window(host, gpas, page, base_off % page, span),
+        direct_image: None,
     })
 }
 
