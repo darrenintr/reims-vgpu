@@ -5604,6 +5604,12 @@ mod recycle_tests {
             assert!(route.starts_with("sampled_miss_lost_"), "{route}");
             assert!(routes.insert(route), "{route} names two causes");
         }
+        // The live census counts by name, so it has to know every one.
+        let census: std::collections::HashSet<&str> =
+            crate::runtime::drain::census::sampled_miss::ROUTES
+                .into_iter()
+                .collect();
+        assert_eq!(routes, census, "the live census and the routes disagree");
     }
 
     /// A gather the witness proved unnameable carries no identity, and the cache

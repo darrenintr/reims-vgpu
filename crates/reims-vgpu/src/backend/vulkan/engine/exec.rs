@@ -4183,9 +4183,12 @@ pub(crate) unsafe fn execute_draw_inner(
                 // reads `Fresh`) correctly names the required conservative
                 // gather. The route joins the witness's cause to the cache's.
                 counters.note_sampled_gather_unskipped(answer.vouch());
-                crate::runtime::drain::note_store_route(super::pools::sampled_identity_miss_route(
-                    *answer, miss,
-                ));
+                let miss_route = super::pools::sampled_identity_miss_route(*answer, miss);
+                crate::runtime::drain::note_store_route(miss_route);
+                crate::runtime::drain::census::sampled_miss::note_sampled_miss(
+                    miss_route,
+                    src.total_len,
+                );
                 let img = pools.acquire_sampled(ctx, SampledKey::of(resource), counters)?;
                 // Everything from here to the end of this arm moves bytes;
                 // everything above it in `AcquireSampled` decides which image
