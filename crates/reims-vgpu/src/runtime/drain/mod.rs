@@ -4284,17 +4284,21 @@ fn read_child_ring_bytes_inner<M: HostMemory>(
     if ring_length == 0 || page_gpas.is_empty() {
         return Ok(out);
     }
-    for i in 0..len {
+    // One read per stretch that stays inside one ring page and before the
+    // ring's wrap, rather than one per byte. A page past the list reads as
+    // zeroes, exactly as the per-byte loop left it.
+    let mut i = 0u32;
+    while i < len {
         let off = absolute.wrapping_add(i) % ring_length;
         let page = (off as u64) >> page_shift;
         let page_off = (off as u64) & (page_size - 1);
-        if page as usize >= page_gpas.len() {
-            out[i as usize] = 0;
-            continue;
+        let to_page_end = page_size - page_off;
+        let to_wrap = u64::from(ring_length - off);
+        let n = to_page_end.min(to_wrap).min(u64::from(len - i)) as u32;
+        if let Some(gpa) = page_gpas.get(page as usize) {
+            mem.read_gpa(gpa + page_off, &mut out[i as usize..(i + n) as usize])?;
         }
-        let mut b = [0u8; 1];
-        mem.read_gpa(page_gpas[page as usize] + page_off, &mut b)?;
-        out[i as usize] = b[0];
+        i += n;
     }
     Ok(out)
 }
@@ -4899,7 +4903,10 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         log_present_page_identity(state, mapping, w, h);
         // Independent of everything below: the guest's own copy of the plane
         // this present names, sampled where the desktop background belongs.
-        {
+        // A diagnostic of 256 guest reads and a page-list copy per present, so
+        // it runs only when asked for, under the same switch as its sampled-bind
+        // twin.
+        if crate::runtime::scanout::sampled_field_witness_enabled() {
             crate::runtime::scanout::note_present_field_witness(state, &*host, mapping, w, h);
         }
         // Every present takes one route: capture the surface the transaction
@@ -5004,8 +5011,19 @@ fn present_named_mapping<H: HostMemory + HostOps>(
             // `px[0].max(px[1]).max(px[2])` per pixel, so a separate scan for
             // `max_rgb` was a second full 8 MiB walk of the frame, under the
             // device lock, for a value this call already returns.
-            let (rgb_nz, max_rgb, px0) = crate::observe::bgra_rgb_stats(&state.present.frame_bgra);
-            let verdict = present_content_verdict(&state.present.frame_bgra, max_rgb);
+            //
+            // And not on every present: the verdict needs only whether any texel
+            // has colour, which a real frame answers within its first pixels.
+            // The full statistics are paid only where a line reports them — a
+            // black frame (whose scan is short-circuit-free anyway) or a
+            // verbose run.
+            let frame = &state.present.frame_bgra;
+            let any_rgb = frame
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|px| px[0] | px[1] | px[2] != 0);
+            let verdict = present_content_verdict(frame, u8::from(any_rgb));
             if verdict == PresentContentVerdict::Unsampled {
                 // Not a decline: an engine resident carried the frame to the
                 // window, so there are no CPU pixels to judge and no guest work
@@ -5027,6 +5045,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
                 // same undefended non-zero-pixel threshold — for that reason. A
                 // black present is a decode or a writeback fault, and the mid,
                 // geometry and generation here are what locate it.
+                let (rgb_nz, _, px0) = crate::observe::bgra_rgb_stats(frame);
                 crate::observe::off(format!(
                     "present_black mid={mapping} {w}x{h} gen={gen} rgb_nz={rgb_nz} px0=[{},{},{},{}] (QMP will be black)",
                     px0[0], px0[1], px0[2], px0[3]
@@ -5035,10 +5054,13 @@ fn present_named_mapping<H: HostMemory + HostOps>(
                     "present_black_retain mid={mapping} {w}x{h} gen={gen} (alpha-only/black +0x188)"
                 ));
             } else {
-                crate::observe::off(format!(
-                    "present_content mid={mapping} {w}x{h} gen={gen} rgb_nz={rgb_nz} max_rgb={max_rgb} px0=[{},{},{},{}] encoded={}",
-                    px0[0], px0[1], px0[2], px0[3], encoded as u8
-                ));
+                crate::observe::verbose(|| {
+                    let (rgb_nz, max_rgb, px0) = crate::observe::bgra_rgb_stats(frame);
+                    format!(
+                        "present_content mid={mapping} {w}x{h} gen={gen} rgb_nz={rgb_nz} max_rgb={max_rgb} px0=[{},{},{},{}] encoded={}",
+                        px0[0], px0[1], px0[2], px0[3], encoded as u8
+                    )
+                });
             }
         }
         // No guest-page comparison here. The presented surface's guest window is

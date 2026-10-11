@@ -312,7 +312,13 @@ pub fn write_task_gva<M: HostMemory>(
 /// directory changes what this field reads — as `blit_exec` just did.
 #[track_caller]
 fn via_caller() -> String {
-    let loc = std::panic::Location::caller();
+    via_at(std::panic::Location::caller())
+}
+
+/// [`via_caller`] for a location captured earlier: the capture is free, so a
+/// hot caller takes it up front and renders it only when it has a line to
+/// write.
+fn via_at(loc: &std::panic::Location<'_>) -> String {
     let file = loc.file();
     let tail = file.rfind("/src/").map_or(file, |i| &file[i + 5..]);
     format!("{tail}:{}", loc.line())
@@ -477,7 +483,7 @@ pub fn write_task_gva_product_within<H: HostMemory + crate::runtime::host::HostO
     if buf.is_empty() {
         return Ok(());
     }
-    let via = via_caller();
+    let caller = std::panic::Location::caller();
     let Err(err) =
         crate::runtime::gva_view::write_span_within(state, host, task_id, gva, buf, allowed)
     else {
@@ -487,7 +493,7 @@ pub fn write_task_gva_product_within<H: HostMemory + crate::runtime::host::HostO
         .field("task", task_id)
         .field("gva", format!("{gva:#x}"))
         .field("len", format!("{:#x}", buf.len()))
-        .field("via", via)
+        .field("via", via_at(caller))
         .fail();
     Err(err)
 }

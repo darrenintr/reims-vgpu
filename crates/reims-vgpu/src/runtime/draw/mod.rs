@@ -2788,7 +2788,11 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                 // from the vector the identity will read rather than from the
                 // slot number, which is the guest's and need not start at zero.
                 let elided = elided && colors.is_empty();
-                gva_load_from_resident = elided;
+                // The flag is colour0's alone: a later slot must not clear
+                // what the first one set.
+                if colors.is_empty() {
+                    gva_load_from_resident = elided;
+                }
                 if !elided {
                     seed = seed_color_load(state, host, task_id, att.texture_ref, gva, mw, mh);
                     if seed.is_none() {

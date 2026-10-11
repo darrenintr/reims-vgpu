@@ -654,6 +654,10 @@ pub(crate) fn publish_window_early_frame<
     if now_ns.saturating_sub(last) < 33_000_000 {
         return;
     }
+    // Stamped for the attempt, not the success: a console with nothing to
+    // paint is asked again in 33 ms, not on every 4 ms poll with a fresh
+    // full-frame buffer each time.
+    slot.early_last_ns.store(now_ns, Ordering::Relaxed);
     let w = crate::model::EFI_BOOT_WIDTH;
     let h = crate::model::EFI_BOOT_HEIGHT;
     let stride = w.saturating_mul(4);
@@ -670,7 +674,6 @@ pub(crate) fn publish_window_early_frame<
     if !painted {
         return;
     }
-    slot.early_last_ns.store(now_ns, Ordering::Relaxed);
     // Early boot frames come from the BAR1 GOP framebuffer, not a resident
     // target, so there is no resident source to hand over.
     window_write_frame(link, w, h, buf, None);

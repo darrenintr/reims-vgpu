@@ -3837,3 +3837,30 @@ fn a_render_target_serves_only_a_whole_stored_surface() {
         "an unstored surface must read the guest"
     );
 }
+
+/// Staged bytes exist only for a binding something will read them for: an
+/// unserved one, or a sampled input answered with a seed generation.
+#[test]
+fn staged_bytes_are_needed_only_where_a_rail_reads_them() {
+    use crate::runtime::resident_target::ResidentTarget;
+    let _ = std::any::type_name::<ResidentTarget>();
+    assert!(staged_bytes_needed(true, None));
+    assert!(staged_bytes_needed(false, None));
+    assert!(!staged_bytes_needed(true, Some(&ResidentServe::Seed(3))));
+    assert!(staged_bytes_needed(false, Some(&ResidentServe::Seed(3))));
+    let key = crate::model::ComputeStorageResidencyKey {
+        mapping_id: 1,
+        map_generation: 1,
+        surface_offset: 0,
+        surface_bpr: 16,
+        span_end: 64,
+        width: 4,
+        height: 4,
+        pixel_format: 80,
+        texture_ref: 0,
+    };
+    assert!(!staged_bytes_needed(
+        false,
+        Some(&ResidentServe::Sample(key, 2))
+    ));
+}

@@ -1814,8 +1814,12 @@ fn plane_offsets_of_pages(
     written: &[u64],
 ) -> Vec<(u64, u64)> {
     let mut out: Vec<(u64, u64)> = Vec::new();
+    // Sorted once, so membership is a binary search rather than a scan of
+    // every written page for every page of the plane.
+    let mut written = written.to_vec();
+    written.sort_unstable();
     for (i, gpa) in ordered.iter().enumerate() {
-        if !written.contains(gpa) {
+        if written.binary_search(gpa).is_err() {
             continue;
         }
         let from = (i as u64).saturating_mul(page_size);

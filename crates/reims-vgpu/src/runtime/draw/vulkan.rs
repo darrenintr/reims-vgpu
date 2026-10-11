@@ -122,7 +122,19 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // than there because the Store routing below the engine is on the same
     // clock: `drain_duty`'s `draw_us` brackets exactly this function, and the
     // whole reading is that the phases sum to it.
-    let colors: Vec<ColorRtRequest> = req.colors.clone();
+    // A snapshot of the attachments as they stood before the draw, which the
+    // Store below reads. Never their seeds: those are whole frames, the draw
+    // consumes them out of `req`, and nothing below reads them from here.
+    let colors: Vec<ColorRtRequest> = req
+        .colors
+        .iter_mut()
+        .map(|c| {
+            let seed = c.target_seed_rgba.take();
+            let snapshot = c.clone();
+            c.target_seed_rgba = seed;
+            snapshot
+        })
+        .collect();
     let Some((pass_w, pass_h)) = colors.first().map(|c0| (c0.width, c0.height)) else {
         return (EncodeStatus::BadArgs("draw_vk_no_color_target"), None);
     };
@@ -768,13 +780,18 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             .map_or("unnamed", |id| {
                 state.pipeline_state(id).unwrap_or("unleased")
             });
-        crate::observe::fail(format!(
-            "linux_clear_store draws_skipped reason=draws_skipped_after_engine_refusal \
-             pipe={} model_pipeline={model_pipeline} vtx={} refused_by={} {target} clear={clear}",
-            req.pipeline_ref,
-            req.vertex_count,
-            engine_outcome.slug()
-        ));
+        // Once per `(pipeline, refusal)`: a layer refused every frame is one
+        // class, and the counters below carry how many draws it cost.
+        if crate::observe::first_sight(engine_outcome.slug(), u64::from(req.pipeline_ref) | 1 << 40)
+        {
+            crate::observe::fail(format!(
+                "linux_clear_store draws_skipped reason=draws_skipped_after_engine_refusal \
+                 pipe={} model_pipeline={model_pipeline} vtx={} refused_by={} {target} clear={clear}",
+                req.pipeline_ref,
+                req.vertex_count,
+                engine_outcome.slug()
+            ));
+        }
         // The line above dedupes on `(pipeline, slug)` and the count does
         // not, so the two answer different questions and only this one can
         // be added up. Reading the line count as the draw count understates

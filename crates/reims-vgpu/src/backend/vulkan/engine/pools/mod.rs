@@ -3317,26 +3317,17 @@ impl CbBind {
     }
 }
 
-/// 128-bit content fingerprint for the sampled cache.
+/// Content digest for the sampled cache.
 ///
-/// The sampled cache matches an incoming blob to a retained VkImage by this
-/// fingerprint alone — it no longer keeps a byte copy to `memcmp` against, so
-/// the width must make an accidental collision (different content, identical
-/// digest, identical geometry/format key) astronomically unlikely: at 128 bits
-/// the birthday bound across the 64-entry cache is ~2^-116, far below the host
-/// GPU's own soft-error rate. Two independently salted `DefaultHasher`
-/// (SipHash-1-3) passes over the *warm* source bytes are still strictly cheaper
-/// than the old one-hash-plus-cold-full-frame-`memcmp` (which pulled the
-/// retained 8 MiB copy back through DRAM on every hit).
+/// Only a filter: a lookup binds a retained image when the digest matches *and*
+/// the retained bytes compare equal (see `ResidentSampledSlot::content`), so a
+/// collision costs one comparison and never a wrong texture. One SipHash pass;
+/// a second, salted pass bought collision resistance the byte comparison has
+/// already made unnecessary, at the cost of re-reading every uploaded texture.
 fn sampled_content_hash(bytes: &[u8]) -> u128 {
-    let mut lo = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut lo);
-    let mut hi = std::collections::hash_map::DefaultHasher::new();
-    // Distinct salt so the two digests are independent (else both hashers see
-    // the same input and finish() to correlated values, collapsing to 64 bits).
-    hi.write_u64(0x9e37_79b9_7f4a_7c15);
-    bytes.hash(&mut hi);
-    ((hi.finish() as u128) << 64) | lo.finish() as u128
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    u128::from(h.finish())
 }
 
 /// Which pool asked for a `vkAllocateMemory`.

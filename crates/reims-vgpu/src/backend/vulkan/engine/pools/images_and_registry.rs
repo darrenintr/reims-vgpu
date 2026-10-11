@@ -174,13 +174,17 @@ impl ResourcePools {
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateStorageImage, e)))?;
         counters.note_create(CreateSite::StorageImage);
         let req = ctx.device.get_image_memory_requirements(image);
-        let mt = ctx
-            .memory_type_for(req.memory_type_bits, req.size, MemoryClass::DeviceLocal)
-            .ok_or({
-                DrawError::Unsupported(reason::DrawReason::NoDeviceLocalMemoryForStorageImage {
+        let Some(mt) =
+            ctx.memory_type_for(req.memory_type_bits, req.size, MemoryClass::DeviceLocal)
+        else {
+            // The handle exists and nothing else owns it yet.
+            ctx.device.destroy_image(image, None);
+            return Err(DrawError::Unsupported(
+                reason::DrawReason::NoDeviceLocalMemoryForStorageImage {
                     memory_type_bits: req.memory_type_bits,
-                })
-            })?;
+                },
+            ));
+        };
         // A compute storage image takes a dedicated `vkAllocateMemory` rather
         // than a slab suballocation, so it does not pass through
         // `bind_image_slab` and does not inherit its out-of-memory retry. It

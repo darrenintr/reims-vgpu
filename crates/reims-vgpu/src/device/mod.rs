@@ -394,6 +394,13 @@ pub fn device_reset(id: u64) -> bool {
         slot.gfx_read_cache.lock().clear();
         slot.present_action_pending.store(false, Ordering::Release);
         slot.present_boundary_seen.store(false, Ordering::Release);
+        // The vblank thread reads this snapshot without the lock. Left as it
+        // was, it would go on writing VBL bits into the shared page the guest
+        // had before the reset — memory it may have reused — until the next
+        // locked poll republished it.
+        slot.vbl_online.store(false, Ordering::Release);
+        slot.vbl_shared_gpa.store(0, Ordering::Release);
+        slot.vbl_interval_us.store(0, Ordering::Release);
         crate::runtime::census::present_proxy::reset_for_device();
         true
     } else {

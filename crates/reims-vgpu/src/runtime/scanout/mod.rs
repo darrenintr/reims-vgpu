@@ -460,10 +460,13 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
             && state.present.painted_mapping == state.present.frame_mapping
             && state.present.painted_generation == state.present.frame_generation
         {
-            crate::observe::off(format!(
-                "present_paint Unchanged mid={} gen={} (console already holds +0x188)",
-                state.present.frame_mapping, state.present.frame_generation
-            ));
+            // Every display refresh of a still frame lands here.
+            crate::observe::verbose(|| {
+                format!(
+                    "present_paint Unchanged mid={} gen={} (console already holds +0x188)",
+                    state.present.frame_mapping, state.present.frame_generation
+                )
+            });
             return ScanoutCopyResult::Unchanged;
         }
         if blit_present_snapshot(state, dst, dst_stride, width, height) {

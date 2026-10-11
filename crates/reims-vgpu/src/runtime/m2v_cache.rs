@@ -1246,7 +1246,7 @@ pub fn translate_cached_reflected(
         }
     }
 
-    let shader = Arc::new(translate_air(air, stage)?);
+    let shader = Arc::new(translate_air(air, stage).map_err(|e| remember_failure(id, air, e))?);
 
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
@@ -1307,7 +1307,8 @@ pub fn translate_cached_kernel_reflected(
         }
     }
 
-    let shader = Arc::new(translate_kernel_air(air, local_size)?);
+    let shader =
+        Arc::new(translate_kernel_air(air, local_size).map_err(|e| remember_failure(id, air, e))?);
 
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
@@ -1322,6 +1323,18 @@ pub fn translate_cached_kernel_reflected(
         ));
     }
     Ok(shader)
+}
+
+/// Store a synchronous translation's failure as the async worker stores one,
+/// so a shader the translator rejects is rejected from the cache on the next
+/// ask instead of being translated again on every draw. A transient failure is
+/// stored too: [`forget_if_transient`] drops it when it is next consumed, which
+/// is the one place a retry is armed.
+fn remember_failure(id: ShaderId<'_>, air: &[u8], e: M2vCacheDecline) -> M2vCacheDecline {
+    let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
+    c.misses = c.misses.saturating_add(1);
+    c.put(id, &Arc::from(air), Entry::Failed(e.clone()));
+    e
 }
 
 /// Snapshot counters for tests.

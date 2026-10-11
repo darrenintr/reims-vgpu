@@ -3373,16 +3373,18 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                 let z = soz < doz + copy_d && doz < soz + copy_d;
                 x && y && z
             } else {
-                let s_end =
-                    src_off.saturating_add(row_bytes.saturating_mul(copy_h).saturating_mul(copy_d));
-                let d_end =
-                    dst_off.saturating_add(row_bytes.saturating_mul(copy_h).saturating_mul(copy_d));
-                ranges_overlap(
-                    src_off,
-                    s_end.saturating_sub(src_off),
-                    dst_off,
-                    d_end.saturating_sub(dst_off),
-                )
+                // Each side's strided footprint, not its packed byte count: a
+                // padded row or image reaches further than `row_bytes * rows`.
+                // An unrepresentable span is treated as overlapping.
+                match (
+                    strided_span(row_bytes, sl.row_stride, copy_h, src_bpi, copy_d),
+                    strided_span(row_bytes, dl.row_stride, copy_h, dst_bpi, copy_d),
+                ) {
+                    (Some(s_span), Some(d_span)) => {
+                        ranges_overlap(src_off, s_span, dst_off, d_span)
+                    }
+                    _ => true,
+                }
             };
             if overlaps {
                 // The serialized copy record carries the complete source and
@@ -3976,8 +3978,20 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
             };
             // Same allocation overlap check (conservative).
             if sl.base_gva == dl.base_gva {
-                let span = row_bytes.saturating_mul(rows).saturating_mul(image_count);
-                if ranges_overlap(src_off, span, dst_off, span) {
+                // The strided footprints the row walk below covers on each side:
+                // with padded rows or slices, the packed `row_bytes * rows *
+                // images` reached only the first slice and let a copy between
+                // slices overwrite one before reading it.
+                let overlaps = match (
+                    strided_span(row_bytes, sl.row_stride, rows, src_img_stride, image_count),
+                    strided_span(row_bytes, dl.row_stride, rows, dst_img_stride, image_count),
+                ) {
+                    (Some(s_span), Some(d_span)) => {
+                        ranges_overlap(src_off, s_span, dst_off, d_span)
+                    }
+                    _ => true,
+                };
+                if overlaps {
                     return br(BlitFailure::Overlap, "sl_overlap");
                 }
             }

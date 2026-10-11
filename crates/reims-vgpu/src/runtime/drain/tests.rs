@@ -7204,3 +7204,48 @@ fn only_a_lost_answer_reports_a_draw_with_no_published_stage() {
         );
     }
 }
+
+/// The child ring is read a page stretch at a time and returns exactly what a
+/// byte-at-a-time read would: across page boundaries, across the ring's wrap,
+/// and with zeroes for a page the list does not name.
+#[test]
+fn child_ring_bytes_read_in_stretches_match_a_bytewise_read() {
+    let shift = PAGE_SHIFT_X86;
+    let page = 1u64 << shift;
+    let mut host = FakeHost::new();
+    // Three ring pages scattered in guest RAM, each filled with its own pattern.
+    let gpas = [0x30_000u64, 0x10_000, 0x50_000];
+    for (n, gpa) in gpas.iter().enumerate() {
+        host.map_range(*gpa, page as usize, 0);
+        let bytes: Vec<u8> = (0..page).map(|i| (i as u8) ^ (0x40 * n as u8)).collect();
+        host.write_gpa(*gpa, &bytes).unwrap();
+    }
+    let bytewise = |pages: &[u64], ring: u32, absolute: u32, len: u32| -> Vec<u8> {
+        (0..len)
+            .map(|i| {
+                let off = u64::from(absolute.wrapping_add(i) % ring);
+                pages.get((off >> shift) as usize).map_or(0, |gpa| {
+                    let mut b = [0u8; 1];
+                    host.read_gpa(gpa + (off & (page - 1)), &mut b).unwrap();
+                    b[0]
+                })
+            })
+            .collect()
+    };
+    let ring = 3 * page as u32;
+    for (pages, absolute, len) in [
+        (&gpas[..], 10, 200),
+        (&gpas[..], page as u32 - 7, 300),
+        (&gpas[..], ring - 50, 400),
+        (&gpas[..], ring * 5 + 4000, 9000),
+        // A list shorter than the ring: the missing page reads as zeroes.
+        (&gpas[..2], 2 * page as u32 - 30, 100),
+    ] {
+        assert_eq!(
+            read_child_ring_bytes_inner(&host, pages, ring, absolute, len, shift).unwrap(),
+            bytewise(pages, ring, absolute, len),
+            "absolute={absolute} len={len} pages={}",
+            pages.len()
+        );
+    }
+}

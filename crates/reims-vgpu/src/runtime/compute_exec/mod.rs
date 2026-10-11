@@ -1499,6 +1499,21 @@ pub(crate) enum ResidentServe {
     Target(crate::runtime::resident_target::ResidentTarget),
 }
 
+/// Whether a staged binding's host bytes will be read, given what serves it.
+///
+/// Nothing reads them once a resident serves the binding: a storage seed binds
+/// the resident, and a sampled input copies from the resident or target it was
+/// served. The one exception is a sampled binding answered with a *seed*
+/// generation, which binds its bytes like an unserved one. A full-size zeroed
+/// buffer for a binding nobody reads was megabytes per bind per dispatch.
+pub(crate) fn staged_bytes_needed(is_storage: bool, serve: Option<&ResidentServe>) -> bool {
+    match serve {
+        None => true,
+        Some(ResidentServe::Seed(_)) => !is_storage,
+        Some(ResidentServe::Sample(..) | ResidentServe::Target(_)) => false,
+    }
+}
+
 impl ResidentServe {
     /// The generation a seeded resident is held at, or `None` for a sampled
     /// one — whose generation belongs to its key rather than to the guest read
@@ -1936,7 +1951,11 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             mip_levels: 1,
             width,
             height,
-            bytes: vec![0; need],
+            bytes: if staged_bytes_needed(is_storage, serve.as_ref()) {
+                vec![0; need]
+            } else {
+                Vec::new()
+            },
             is_storage,
             writeback: TextureWriteback::None,
             rail: R::stage(
@@ -2386,20 +2405,14 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
         // A storage seed nothing serves is the rail's to read when it can read
         // guest pages itself: neither the host buffer nor the CPU read exists.
         let defer_seed = is_storage && serve.is_none() && R::defers_seed_read();
-        // A served storage seed is never read from `bytes` on any rail; only a
-        // sampled serve still carries the placeholder its fallback arm names.
-        let seed_served = is_storage
-            && serve
-                .as_ref()
-                .and_then(ResidentServe::seed_generation)
-                .is_some();
+        let served_without_bytes = !staged_bytes_needed(is_storage, serve.as_ref());
         let window = mapping_write::SurfaceWindow {
             base_off: surface_offset,
             bpr: surface_bpr,
             span_end,
             bpp,
         };
-        let mut bytes = if defer_seed || seed_served {
+        let mut bytes = if defer_seed || served_without_bytes {
             Vec::new()
         } else {
             vec![0u8; need]
@@ -2684,7 +2697,6 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             stage_format,
         )
     });
-    let mut bytes = vec![0u8; pyramid_need];
     // Resident-authoritative window (deferred linear writeback): consume the
     // rail's resident without bytes when possible; otherwise flush it into the
     // entry first — falling through to the raw guest read would silently serve
@@ -2721,6 +2733,11 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             stage_format
         ));
     }
+    let mut bytes = if staged_bytes_needed(is_storage, serve.as_ref()) {
+        vec![0u8; pyramid_need]
+    } else {
+        Vec::new()
+    };
     if serve.is_some() {
         // The rail's resident serves this window; no cache/guest read.
     } else {

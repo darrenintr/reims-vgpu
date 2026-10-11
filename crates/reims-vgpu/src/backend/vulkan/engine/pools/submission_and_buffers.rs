@@ -3124,13 +3124,16 @@ impl ResourcePools {
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateStaging, e)))?;
         counters.note_create(CreateSite::StagingBuffer);
         let req = ctx.device.get_buffer_memory_requirements(buffer);
-        let mt = ctx
-            .memory_type_for(req.memory_type_bits, req.size, MemoryClass::Upload)
-            .ok_or({
-                DrawError::Unsupported(reason::DrawReason::NoHostVisibleMemoryForStaging {
+        let Some(mt) = ctx.memory_type_for(req.memory_type_bits, req.size, MemoryClass::Upload)
+        else {
+            // The handle exists and nothing else owns it yet.
+            ctx.device.destroy_buffer(buffer, None);
+            return Err(DrawError::Unsupported(
+                reason::DrawReason::NoHostVisibleMemoryForStaging {
                     memory_type_bits: req.memory_type_bits,
-                })
-            })?;
+                },
+            ));
+        };
         // Carve out of a shared HOST_VISIBLE block rather than allocating one
         // memory object per buffer. The block is allocated and mapped once; a
         // miss here is a create + carve + bind, which is what turns the ~0.4 ms
@@ -3473,13 +3476,16 @@ impl ResourcePools {
             .map_err(|e| DrawError::VkCall(VkCall::new(create_op, e)))?;
         counters.note_create(CreateSite::ReadbackBuffer);
         let req = ctx.device.get_buffer_memory_requirements(buffer);
-        let mt = ctx
-            .memory_type_for(req.memory_type_bits, req.size, MemoryClass::Readback)
-            .ok_or({
-                DrawError::Unsupported(reason::DrawReason::NoHostVisibleMemoryForReadback {
+        let Some(mt) = ctx.memory_type_for(req.memory_type_bits, req.size, MemoryClass::Readback)
+        else {
+            // The handle exists and nothing else owns it yet.
+            ctx.device.destroy_buffer(buffer, None);
+            return Err(DrawError::Unsupported(
+                reason::DrawReason::NoHostVisibleMemoryForReadback {
                     memory_type_bits: req.memory_type_bits,
-                })
-            })?;
+                },
+            ));
+        };
         let memory = allocate_memory_timed(
             ctx,
             &vk::MemoryAllocateInfo::default()
