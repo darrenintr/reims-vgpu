@@ -4,6 +4,7 @@
 //! counting the route it names. The counters exist only under `cfg(test)`;
 //! production builds compile every call down to nothing.
 
+pub mod gva_store;
 pub mod stall;
 
 #[cfg(test)]

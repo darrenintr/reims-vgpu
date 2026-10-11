@@ -732,7 +732,11 @@ fn note_delete_object_ref_space<M: HostMemory>(
     };
     let route = retained.route(answer);
     note_store_route(route);
-    if crate::observe::first_sight(route, (u64::from(opcode) << 32) | u64::from(object_ref)) {
+    // Agreement is the expected answer and the route counts it; only a type
+    // that differs is an anomaly worth a line.
+    if matches!(answer, RefSpaceAnswer::TypeDiffers)
+        && crate::observe::first_sight(route, (u64::from(opcode) << 32) | u64::from(object_ref))
+    {
         crate::observe::fail(format!(
             "{route} kind={} task={task_id} ref={object_ref} found_type={} expected_type={} \
              (whether this destroy record's ref is a number in the guest's object-list space \

@@ -486,7 +486,9 @@ struct Cache {
     hits: u64,
     misses: u64,
     async_queue: VecDeque<TranslationTask>,
-    async_worker_running: bool,
+    /// Background translation workers currently running, at most
+    /// [`async_worker_limit`].
+    async_workers: usize,
     /// The last identity each `(task, pipeline_ref, stage_tag)` was translated
     /// under.
     ///
@@ -748,9 +750,37 @@ fn tmp_dir() -> PathBuf {
     .clone()
 }
 
-fn translation_lock() -> &'static Mutex<()> {
-    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+/// A scratch directory of this translation's own.
+///
+/// metal2vulkan's tool boundary uses fixed file names inside the directory it is
+/// handed, and keeps its other state per thread, so two translations alias only
+/// through the directory. One per call lets them run side by side: a 2 s shader
+/// at the head of the queue used to hold every shader queued behind it.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new() -> std::io::Result<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = tmp_dir().join(format!("t{n}"));
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// How many background translation workers may run at once: half the host's
+/// cores, between one and four, so translation never takes the cores the
+/// guest's vCPUs and the drain thread need.
+fn async_worker_limit() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(1, 4))
+        .unwrap_or(1)
 }
 
 /// Directory [`capture_air`] writes into.
@@ -809,11 +839,9 @@ fn capture_air(air: &[u8], stage: Stage, spirv: &[u8]) {
 }
 
 fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
-    // metal2vulkan's tool boundary uses fixed scratch names inside `tmp_dir`.
-    // Serialize sync and background calls so their AIR/LLVM/SPIR-V files never
-    // alias one another.
-    let _guard = translation_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let tmp = tmp_dir();
+    // Fixed scratch names, in a directory of this call's own: see `Scratch`.
+    let scratch = Scratch::new().map_err(|e| scratch_write_decline(stage, e.to_string()))?;
+    let tmp = scratch.0.clone();
     let name = match stage {
         Stage::Vertex => "v.air",
         Stage::Fragment => "f.air",
@@ -832,8 +860,10 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
 }
 
 fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedShader> {
-    let _guard = translation_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let tmp = tmp_dir();
+    let scratch = Scratch::new().map_err(|e| M2vCacheDecline::KernelScratchWrite {
+        detail: e.to_string(),
+    })?;
+    let tmp = scratch.0.clone();
     let path = tmp.join("k.air");
     std::fs::write(&path, air).map_err(|e| M2vCacheDecline::KernelScratchWrite {
         detail: e.to_string(),
@@ -1007,8 +1037,8 @@ fn ensure_cached_async_keyed(
             air,
             pipeline_ref,
         });
-        if !c.async_worker_running {
-            c.async_worker_running = true;
+        if c.async_workers < async_worker_limit() {
+            c.async_workers += 1;
             start_worker = true;
         }
     }
@@ -1053,7 +1083,7 @@ fn async_worker() {
             match c.async_queue.pop_front() {
                 Some(task) => task,
                 None => {
-                    c.async_worker_running = false;
+                    c.async_workers = c.async_workers.saturating_sub(1);
                     return;
                 }
             }
@@ -1313,7 +1343,7 @@ pub fn reset_for_test() {
     c.hits = 0;
     c.misses = 0;
     c.async_queue.clear();
-    c.async_worker_running = false;
+    c.async_workers = 0;
 }
 
 #[cfg(test)]

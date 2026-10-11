@@ -777,16 +777,42 @@ fn read_table_entries(
     pages: u32,
     page_shift: u32,
 ) -> Result<Vec<u32>, Status> {
+    // Read the table in chunks that never cross a 4 KiB boundary of its
+    // address — the smallest page a guest kernel maps — so each chunk is one
+    // translation rather than one per entry. Every entry is still checked, in
+    // order, exactly as a per-entry read would check it.
+    const CHUNK: u64 = 4096;
+    let read_err = Status::ErrPageTableRead("iosurface_page_table_entry_read");
+    let total = (pages as u64)
+        .checked_mul(U32_SIZE as u64)
+        .ok_or(read_err)?;
     let mut entries = Vec::with_capacity(pages as usize);
-    for i in 0..pages {
-        let entry = read_u32_at(mem, table_kva, (i as u64) * U32_SIZE as u64)
-            .ok_or(Status::ErrPageTableRead("iosurface_page_table_entry_read"))?;
-        let gpa = entry_gpa_shift(entry, page_shift)
-            .ok_or(Status::ErrPageEntry("iosurface_page_table_entry_invalid"))?;
-        if !mem.is_ram_gpa(gpa) {
-            return Err(Status::ErrPageEntry("iosurface_page_table_gpa_not_ram"));
+    let mut buf = [0u8; CHUNK as usize];
+    let mut off = 0u64;
+    while off < total {
+        let address = checked_add_u64(table_kva, off).ok_or(read_err)?;
+        let len = (CHUNK - address % CHUNK).min(total - off);
+        // A table address that is not entry-aligned would split an entry
+        // across chunks; read it the per-entry way.
+        let len = if len.is_multiple_of(U32_SIZE as u64) {
+            len
+        } else {
+            U32_SIZE as u64
+        };
+        let chunk = &mut buf[..len as usize];
+        if !mem.read(address, chunk) {
+            return Err(read_err);
         }
-        entries.push(entry);
+        for bytes in chunk.as_chunks::<U32_SIZE>().0 {
+            let entry = ld32(bytes);
+            let gpa = entry_gpa_shift(entry, page_shift)
+                .ok_or(Status::ErrPageEntry("iosurface_page_table_entry_invalid"))?;
+            if !mem.is_ram_gpa(gpa) {
+                return Err(Status::ErrPageEntry("iosurface_page_table_gpa_not_ram"));
+            }
+            entries.push(entry);
+        }
+        off += len;
     }
     Ok(entries)
 }
@@ -912,6 +938,49 @@ mod tests {
         }
         fn is_kernel_va(&self, address: u64) -> bool {
             arm_kernel_va(address)
+        }
+    }
+
+    /// The table is read in 4 KiB-bounded chunks, not per entry, and still
+    /// yields every entry in order — across a boundary, from an address that
+    /// is not entry-aligned, and with the same refusal for an unreadable or
+    /// invalid entry.
+    #[test]
+    fn page_table_entries_are_read_in_page_bounded_chunks() {
+        struct Counting<'a>(&'a MapMem, std::cell::Cell<u32>);
+        impl PagesMemory for Counting<'_> {
+            fn read(&self, address: u64, dst: &mut [u8]) -> bool {
+                self.1.set(self.1.get() + 1);
+                self.0.read(address, dst)
+            }
+        }
+        let shift = PAGE_SHIFT_ARM64E;
+        let entry = |pfn: u32| (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        for base in [0x1_0000u64 + 4096 - 16, 0x2_0000 + 4096 - 14] {
+            let mut mem = MapMem::new();
+            let want: Vec<u32> = (0..12).map(|i| entry(0x100 + i)).collect();
+            for (i, e) in want.iter().enumerate() {
+                mem.put_u32(base + 4 * i as u64, *e);
+            }
+            let counting = Counting(&mem, std::cell::Cell::new(0));
+            assert_eq!(read_table_entries(&counting, base, 12, shift), Ok(want));
+            if base.is_multiple_of(4) {
+                assert_eq!(counting.1.get(), 2, "one read either side of the boundary");
+            } else {
+                // Per entry up to the boundary, then whole chunks again.
+                assert!(counting.1.get() < 12, "reads={}", counting.1.get());
+            }
+
+            mem.map.remove(&(base + 4 * 7));
+            assert_eq!(
+                read_table_entries(&mem, base, 12, shift),
+                Err(Status::ErrPageTableRead("iosurface_page_table_entry_read"))
+            );
+            mem.put_u32(base + 4 * 7, 0);
+            assert_eq!(
+                read_table_entries(&mem, base, 12, shift),
+                Err(Status::ErrPageEntry("iosurface_page_table_entry_invalid"))
+            );
         }
     }
 

@@ -246,6 +246,19 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         )
                     })
                 });
+                {
+                    use crate::runtime::drain::census::gva_store::{
+                        note_gva_store, GvaStoreOutcome,
+                    };
+                    note_gva_store(
+                        if landed {
+                            GvaStoreOutcome::Deferred
+                        } else {
+                            GvaStoreOutcome::ArmRefused
+                        },
+                        gva_store_bytes(req),
+                    );
+                }
                 if landed {
                     note_mapper_ref_texture_store_route("gva_resident_authoritative");
                     gva_store_armed = true;
@@ -628,34 +641,37 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         true,
                     );
                 }
-                let (rgb_nz, max_rgb, mean_rgb) = rgb_stats(&rgba);
-                // A Store that lands is expected control flow and belongs on
-                // the census channel, not the failure one — "non-OFF lines are
-                // the failures" is the rule the whole always-on log is triaged
-                // by. Only the loss gets a failure line, and it carries the
-                // census fields so nothing has to be correlated across two.
-                crate::observe::off(format!(
-                    "m2v_store_gva gva={:#x} {}x{} pipe={} tex_ref={} load={} ok={} rgb_nz={} max_rgb={} mean_rgb={} bpr={}",
-                    c0.target_gva,
-                    c0.width,
-                    c0.height,
-                    req.pipeline_ref,
-                    c0.texture_ref,
-                    c0.load_action,
-                    gva_ok as u8,
-                    rgb_nz,
-                    max_rgb,
-                    mean_rgb,
-                    c0.row_stride
-                ));
-                if !gva_ok {
-                    crate::observe::fail(format!(
-                        "linux_m2v_store lost gva={:#x} {}x{} pipe={} tex_ref={} rgb_nz={} max={} mean_rgb={} bpr={}",
+                // A Store that lands is expected control flow: its census line
+                // and the full-frame pixel statistics it carries are verbose
+                // only, so a landed Store costs no scan. A lost one is a
+                // failure line and pays for the statistics that describe it.
+                crate::observe::verbose(|| {
+                    let (rgb_nz, max_rgb, mean_rgb) = rgb_stats(&rgba);
+                    format!(
+                        "m2v_store_gva gva={:#x} {}x{} pipe={} tex_ref={} load={} ok={} rgb_nz={} max_rgb={} mean_rgb={} bpr={}",
                         c0.target_gva,
                         c0.width,
                         c0.height,
                         req.pipeline_ref,
                         c0.texture_ref,
+                        c0.load_action,
+                        gva_ok as u8,
+                        rgb_nz,
+                        max_rgb,
+                        mean_rgb,
+                        c0.row_stride
+                    )
+                });
+                if !gva_ok {
+                    let (rgb_nz, max_rgb, mean_rgb) = rgb_stats(&rgba);
+                    crate::observe::fail(format!(
+                        "linux_m2v_store lost gva={:#x} {}x{} pipe={} tex_ref={} load={} rgb_nz={} max={} mean_rgb={} bpr={}",
+                        c0.target_gva,
+                        c0.width,
+                        c0.height,
+                        req.pipeline_ref,
+                        c0.texture_ref,
+                        c0.load_action,
                         rgb_nz,
                         max_rgb,
                         mean_rgb,
@@ -6426,15 +6442,21 @@ pub(crate) fn host_cache_store_gva_layer<M: HostMemory + HostOps>(
     if rgba.len() < need {
         return;
     }
-    let bgra = swap_rb_channels(&rgba[..need]);
+    let mut bgra = swap_rb_channels(&rgba[..need]);
     if texture_ref != 0 {
+        // Each cache owns its frame; only a Store both keep pays for a second.
+        let texture_bytes = if gva != 0 {
+            bgra.clone()
+        } else {
+            std::mem::take(&mut bgra)
+        };
         crate::runtime::surface_cache::store_texture(
             state,
             task_id,
             texture_ref,
             width,
             height,
-            bgra.clone(),
+            texture_bytes,
             gva,
         );
     }
@@ -8902,6 +8924,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
+        if store_is_store && writeback_guest && gva_chain_identity(req).is_some() {
+            use crate::runtime::drain::census::gva_store::{note_gva_store, GvaStoreOutcome};
+            // Deferred Stores are counted where their debt arms or is refused.
+            let refusal = if gpu_only_content_allowed {
+                gva_store_defer_refusal(req)
+            } else {
+                Some(GvaStoreOutcome::GpuOnlyUnavailable)
+            };
+            if let Some(refusal) = refusal {
+                note_gva_store(refusal, gva_store_bytes(req));
+            }
+        }
         if gpu_only_content_allowed && store_is_store && writeback_guest {
             if let Some(identity) = gva_chain_identity(req) {
                 // Only the eligibility call can still vary here: the enclosing
@@ -11047,26 +11081,49 @@ fn arm_surface_writeback_debt<M: HostMemory + HostOps>(
 /// caller must be able to replay the sync `write_gva_rgba8` exactly — identity
 /// geometry == c0 geometry, convertible format, sane BPR.
 fn gva_store_defer_eligible(req: &DrawEncodeRequest) -> bool {
+    gva_store_defer_refusal(req).is_none()
+}
+
+/// Which gate keeps a GVA Store off the deferred rail, or `None` when none
+/// does. The one statement of that rail's eligibility, so the census and the
+/// decision cannot disagree.
+fn gva_store_defer_refusal(
+    req: &DrawEncodeRequest,
+) -> Option<crate::runtime::drain::census::gva_store::GvaStoreOutcome> {
+    use crate::runtime::drain::census::gva_store::GvaStoreOutcome as O;
     let Some(c0) = req.colors.first() else {
-        return false;
+        return Some(O::NotGva);
     };
-    if c0.mapping_id != 0
-        || c0.target_gva == 0
-        || c0.row_stride == 0
-        || c0.texture_ref == 0
-        || req.gva_alloc_gen == 0
-    {
-        return false;
+    if c0.mapping_id != 0 || c0.target_gva == 0 {
+        return Some(O::NotGva);
+    }
+    if c0.row_stride == 0 {
+        return Some(O::NoStride);
+    }
+    if c0.texture_ref == 0 {
+        return Some(O::NoTextureRef);
+    }
+    if req.gva_alloc_gen == 0 {
+        return Some(O::NoAllocation);
     }
     let Some(identity) = gva_chain_identity(req) else {
-        return false;
+        return Some(O::NotGva);
     };
     if identity.width() != c0.width || identity.height() != c0.height {
-        return false;
+        return Some(O::ExtentMismatch);
     }
-    pixel_format::tight_row_bytes(c0.width, c0.format)
+    let fits = pixel_format::tight_row_bytes(c0.width, c0.format)
         .and_then(|bytes| bytes.checked_mul(c0.sample_count.max(1)))
-        .is_some_and(|tight| c0.row_stride >= tight)
+        .is_some_and(|tight| c0.row_stride >= tight);
+    (!fits).then_some(O::StrideShort)
+}
+
+/// Frame bytes of colour 0 as the guest lays it out, for the Store census.
+fn gva_store_bytes(req: &DrawEncodeRequest) -> u64 {
+    req.colors
+        .first()
+        .map(|c0| u64::from(c0.row_stride).saturating_mul(u64::from(c0.height)))
+        .unwrap_or(0)
 }
 
 #[cfg(all(test, feature = "backend-vulkan"))]

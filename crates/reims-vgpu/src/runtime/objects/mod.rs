@@ -1909,18 +1909,22 @@ fn note_extent_against_allocation(
         crate::runtime::drain::note_store_route("declared_extent_is_the_allocation");
         return;
     }
+    // A sub-window extent is an ordinary texture, not a refusal: the route
+    // counts it, and the per-object sample is a verbose detail. Any record that
+    // later refuses against the extent names itself where it refuses.
     crate::runtime::drain::note_store_route("declared_extent_is_a_sub_window");
     if crate::observe::first_sight(
         "declared_extent_is_a_sub_window",
         (u64::from(task_id) << 32) | u64::from(obj_ref),
     ) {
-        crate::observe::fail(format!(
-            "declared_extent_is_a_sub_window task={task_id} ref={obj_ref} \
-             object_type={} extent_offset={offset} extent_length={length} \
-             allocation={allocation} (the model will check every record's window against \
-             the extent, so a record naming the allocation refuses here)",
-            entry.object_type,
-        ));
+        crate::observe::verbose(|| {
+            format!(
+                "declared_extent_is_a_sub_window task={task_id} ref={obj_ref} \
+                 object_type={} extent_offset={offset} extent_length={length} \
+                 allocation={allocation}",
+                entry.object_type,
+            )
+        });
     }
 }
 
@@ -4130,11 +4134,15 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
     // holding a host mapping over memory the guest has already rewired — the same
     // reason the trailing delete flushes here.
     crate::runtime::mapper::flush_retired_views(state, host);
+    // Expected control flow, counted by the route above; per-packet detail is
+    // verbose only, because a compositor re-points backings continuously.
     if had {
-        crate::observe::off(format!(
-            "replace_physical task={task_id} object={object_id} mid={target} \
-             (guest re-pointed the backing; cached page list dropped)"
-        ));
+        crate::observe::verbose(|| {
+            format!(
+                "replace_physical task={task_id} object={object_id} mid={target} \
+                 (guest re-pointed the backing; cached page list dropped)"
+            )
+        });
     }
 }
 
@@ -4227,15 +4235,19 @@ fn note_replace_physical_unmapped_after_invalidation<M: HostMemory>(
         crate::runtime::drain::note_store_route("replace_physical_unmapped_no_state");
     }
     // Deduped per `(task, object)`: a compositor re-pointing the same resource
-    // does it every frame, and the class is what matters here.
-    if crate::observe::first_sight(
-        "replace_physical_unknown_object",
-        (u64::from(task_id) << 32) | u64::from(object_id),
-    ) {
+    // does it every frame, and the class is what matters here. A re-point that
+    // dropped nothing is a no-op the route above counts; only one that
+    // invalidated a host copy is worth a line.
+    if (texture_cache || linear_cache)
+        && crate::observe::first_sight(
+            "replace_physical_unknown_object",
+            (u64::from(task_id) << 32) | u64::from(object_id),
+        )
+    {
         let kind = object_type
             .map(|t| t.to_string())
             .unwrap_or_else(|| "absent".to_string());
-        crate::observe::fail(format!(
+        crate::observe::off(format!(
             "replace_physical_unknown_object task={task_id} object={object_id} \
              obj_type={kind} tex_dropped={} lin_dropped={} \
              (no mapping belongs to this task-local resource; ref-keyed host copies dropped)",
