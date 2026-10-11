@@ -22,6 +22,17 @@
 - 3D: 4x MSAA passes are still refused (see below); a design plan exists in
   this session's notes and is summarised in that section.
 
+## metal2vulkan moved to upstream HEAD `43c46ac` (committed, not live-tested)
+
+The pin moved from `9e0e99a` to `43c46ac`, one upstream commit that squashes 680
+commits of translator, validation and corpus work. The only API change this repo
+met was a new `TextureFormat::Rgba16i`, mapped to an unsupported storage format
+in `spirv_bind::reflected_storage_image_format`. Needed before trusting it: the
+conformance battery on the guest rail and a live boot, because this changes the
+SPIR-V every guest shader becomes. (`joshuaswarren/metal2vk` was looked at and
+is not a replacement: it compiles Metal *source* compute kernels through
+clang/clspv, while this device receives compiled AIR for every stage.)
+
 ## Sampled-texture rewrite, step 1: the identity-miss census (committed, not live-read)
 
 Every guest-gather bind that moves bytes now emits exactly one `sampled_miss_*`

@@ -2116,6 +2116,10 @@ pub fn reflected_storage_image_format(
         TextureFormat::Rgba8ui => ImageFormat::Rgba8Uint,
         TextureFormat::Rgba16ui => ImageFormat::Rgba16Uint,
         TextureFormat::Rgba8i => ImageFormat::Rgba8Sint,
+        // SPIR-V `Rgba16i`. No signed 16-bit storage surface exists on the
+        // executor side (`Rgba16Uint` is the only 16-bit integer one), so it is
+        // carried as unsupported under its own SPIR-V ordinal, as `Rg32f` is.
+        TextureFormat::Rgba16i => ImageFormat::Unsupported(22),
     })
 }
 
