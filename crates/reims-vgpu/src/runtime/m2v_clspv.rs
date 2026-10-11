@@ -9,14 +9,16 @@
 //! reads, runs metal2vk's patched clspv on it, and makes the result answer to the
 //! interface the dispatcher already binds against.
 //!
-//! # The interface stays metal2vulkan's
+//! # The device describes the kernel itself
 //!
-//! metal2vulkan still translates every kernel first. Its [`ShaderReflection`] is
-//! what `compute_exec` builds descriptor sets, push constants and dispatch
-//! regions from, and nothing downstream is told which emitter produced the
-//! module. So the clspv module has to match that interface exactly:
+//! Compute kernels do not pass through metal2vulkan at all. [`reflection_for`]
+//! builds the [`ShaderReflection`] the dispatcher binds against from the AIR's
+//! own metadata (each buffer's Metal index, address space, access and, for a
+//! `constant T&` object, its size), and the clspv module is made to answer to
+//! it:
 //!
-//! - each Metal buffer at the descriptor the reflection names for it;
+//! - each Metal buffer `n` at descriptor set 0, binding `n` (the buffer band of
+//!   the shared descriptor layout);
 //! - the 48-byte dispatch-region push constant at offset 0, read the way
 //!   [`metal2vulkan::reflect::KernelDispatchPlan::push_constants`] writes it:
 //!   threads per grid, thread base, threadgroup base, threadgroups per grid;
@@ -25,8 +27,13 @@
 //! - one `GLCompute` entry point named `main`.
 //!
 //! [`conform`] checks each of these against clspv's own reflection and rewrites
-//! the bindings. Anything it cannot prove is a [`ClspvRefusal`], and the caller
-//! runs the metal2vulkan module instead.
+//! the bindings. Anything it cannot prove is a [`ClspvRefusal`], and the kernel
+//! is declined by name. The reflection *type* is still metal2vulkan's, because
+//! it is the vocabulary the whole dispatcher (shared with the graphics path)
+//! speaks; nothing of metal2vulkan's translation or analysis runs for a kernel.
+//!
+//! Buffer footprints are not computed: the dispatcher then stages whole
+//! allocations, which costs bytes and is never wrong.
 //!
 //! # The kernel body is not edited
 //!
@@ -60,11 +67,11 @@ const REGION_THREAD_BASE: u32 = 3;
 const REGION_THREADGROUP_BASE: u32 = 6;
 const REGION_THREADGROUPS_PER_GRID: u32 = 9;
 
-/// Why the clspv route did not produce the module. Each one runs the
-/// metal2vulkan module instead.
+/// Why the metal2vk route did not produce a kernel module. The kernel is then
+/// declined by name; there is no other compute translator.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClspvRefusal {
-    /// The route was asked for and `REIMS_VGPU_CLSPV` names no binary.
+    /// `REIMS_VGPU_CLSPV` names no binary.
     BinaryUnset,
     /// `llvm-dis` could not disassemble the AIR.
     Disassemble { detail: String },
@@ -84,7 +91,7 @@ pub enum ClspvRefusal {
     NameTaken { name: String },
     /// clspv failed, or reported a pass that gave up.
     Compile { detail: String },
-    /// The clspv module does not answer to metal2vulkan's interface.
+    /// The clspv module does not answer to the kernel's reflected interface.
     Interface { detail: String },
     /// `spirv-val` rejected the clspv module.
     Validate { detail: String },
@@ -140,23 +147,50 @@ fn first_line(detail: &str) -> String {
         .collect()
 }
 
-/// Compile the AIR at `air_path` through clspv into a module that answers to
-/// `reflection`'s interface.
+/// Translate the kernel AIR at `air_path`: the SPIR-V module and the reflection
+/// the dispatcher binds it with, both from metal2vk's route alone.
+pub fn compile_kernel(
+    clspv: &str,
+    air_path: &std::path::Path,
+    tmp: &std::path::Path,
+    local_size: [u32; 3],
+) -> Result<(Vec<u8>, ShaderReflection), ClspvRefusal> {
+    let adapted = adapt(&disassemble(air_path, tmp)?)?;
+    let reflection = reflection_for(&adapted, local_size)?;
+    let spirv = compile_adapted(clspv, &adapted, tmp, &reflection)?;
+    Ok((spirv, reflection))
+}
+
+/// Compile the AIR at `air_path` into a module that answers to `reflection`,
+/// whoever produced it. [`compile_kernel`] is this with the route's own
+/// reflection; tests use it to hold the module to a reflection they altered.
 pub fn compile(
     clspv: &str,
     air_path: &std::path::Path,
     tmp: &std::path::Path,
     reflection: &ShaderReflection,
 ) -> Result<Vec<u8>, ClspvRefusal> {
+    let adapted = adapt(&disassemble(air_path, tmp)?)?;
+    compile_adapted(clspv, &adapted, tmp, reflection)
+}
+
+fn disassemble(air_path: &std::path::Path, tmp: &std::path::Path) -> Result<String, ClspvRefusal> {
     let ll_path = tmp.join("k.clspv-src.ll");
     let air = air_path.to_str().unwrap_or("k.air");
     let ll_str = ll_path.to_str().unwrap_or("k.clspv-src.ll");
-    metal2vulkan::tools::run("llvm-dis", &[air, "-o", ll_str])
+    tool::run("llvm-dis", &[air, "-o", ll_str])
         .map_err(|detail| ClspvRefusal::Disassemble { detail })?;
-    let ll = std::fs::read_to_string(&ll_path).map_err(|e| ClspvRefusal::Disassemble {
+    std::fs::read_to_string(&ll_path).map_err(|e| ClspvRefusal::Disassemble {
         detail: e.to_string(),
-    })?;
-    let adapted = adapt(&ll)?;
+    })
+}
+
+fn compile_adapted(
+    clspv: &str,
+    adapted: &Adapted,
+    tmp: &std::path::Path,
+    reflection: &ShaderReflection,
+) -> Result<Vec<u8>, ClspvRefusal> {
     let in_path = tmp.join("k.clspv.ll");
     let out_path = tmp.join("k.clspv.spv");
     std::fs::write(&in_path, &adapted.ir).map_err(|e| ClspvRefusal::Compile {
@@ -164,11 +198,14 @@ pub fn compile(
     })?;
     let in_str = in_path.to_str().unwrap_or("k.clspv.ll");
     let out_str = out_path.to_str().unwrap_or("k.clspv.spv");
-    let (_, stderr) = metal2vulkan::tools::run_with_timeout(
+    let stderr = tool::run(
         clspv,
         &[
             "-x",
             "ir",
+            // OpenCL C++ mode turns on module-scope push constants (global
+            // offsets, non-uniform regions) that collide with the dispatch
+            // region; the IR needs none of what it adds.
             "--cl-std=CL1.2",
             "--inline-entry-points",
             "--spv-version=1.5",
@@ -179,24 +216,102 @@ pub fn compile(
             "-o",
             out_str,
         ],
-        120,
     )
     .map_err(|detail| ClspvRefusal::Compile { detail })?;
     // metal2vk's rule: a pointer pass that gave up leaves a half-rewritten module
     // clspv still emits, so the module is wrong even though the exit was clean.
-    let stderr = String::from_utf8_lossy(&stderr);
     if stderr.contains("did not converge") || stderr.contains("M2V-GIVEUP:") {
-        return Err(ClspvRefusal::Compile {
-            detail: stderr.into_owned(),
-        });
+        return Err(ClspvRefusal::Compile { detail: stderr });
     }
     let spirv = std::fs::read(&out_path).map_err(|e| ClspvRefusal::Compile {
         detail: e.to_string(),
     })?;
-    let spirv = conform(&spirv, &adapted, reflection)?;
-    metal2vulkan::tools::spirv_val_bytes(&spirv, tmp)
-        .map_err(|detail| ClspvRefusal::Validate { detail })?;
+    let spirv = conform(&spirv, adapted, reflection)?;
+    tool::spirv_val(&spirv, tmp).map_err(|detail| ClspvRefusal::Validate { detail })?;
     Ok(spirv)
+}
+
+/// The reflection the dispatcher binds this kernel with, from the AIR alone.
+///
+/// Buffer `n` sits at binding `n` of set 0, the buffer band of the descriptor
+/// layout every translated shader shares. Dispatch is exact-thread
+/// (`ThreadsDynamic` at offset 0), which is what the wrapper's region struct and
+/// clspv's workgroup-size spec constants implement.
+pub fn reflection_for(
+    adapted: &Adapted,
+    local_size: [u32; 3],
+) -> Result<ShaderReflection, ClspvRefusal> {
+    use metal2vulkan::reflect::{
+        BufferExtent, DescriptorLayout, DescriptorLocation, KernelDispatch, ResourceBinding,
+        ShaderStage, DEFAULT_KERNEL_DISPATCH_PUSH_CONSTANT_OFFSET, REFLECTION_VERSION,
+    };
+    let layout = DescriptorLayout::default();
+    let bindings =
+        adapted
+            .interface
+            .iter()
+            .map(|b| {
+                let binding = layout.buffers.binding(b.metal_index).ok_or_else(|| {
+                    ClspvRefusal::Interface {
+                        detail: format!("buffer index {} is past the buffer band", b.metal_index),
+                    }
+                })?;
+                Ok(ResourceBinding {
+                    kind: ResourceKind::Buffer,
+                    metal_index: b.metal_index,
+                    descriptor: Some(DescriptorLocation {
+                        set: layout.set,
+                        binding,
+                        count: 1,
+                    }),
+                    param_index: Some(b.param),
+                    stage_input_location: None,
+                    address_space: Some(b.address_space),
+                    declared_size: b.type_size,
+                    // A `constant T&` names its object's size; a pointer names
+                    // nothing, so the whole allocation stays reachable.
+                    extent: Some(match b.buffer_size {
+                        Some(bytes) => BufferExtent::Object { bytes },
+                        None => BufferExtent::Unbounded,
+                    }),
+                    footprint: None,
+                    type_layout: None,
+                    type_name: None,
+                    texture_shape: None,
+                    embedded_source: None,
+                    access: b.access,
+                    static_sampler: None,
+                })
+            })
+            .collect::<Result<Vec<_>, ClspvRefusal>>()?;
+    Ok(ShaderReflection {
+        reflection_version: REFLECTION_VERSION,
+        descriptor_layout: layout,
+        stage: ShaderStage::Kernel,
+        entry_point: Some(adapted.kernel_name.clone()),
+        bindings,
+        argument_buffer_fields: vec![],
+        vertex_attributes: vec![],
+        varyings: vec![],
+        render_targets: vec![],
+        depth_members: vec![],
+        depth_qualifier: None,
+        stencil_members: vec![],
+        local_size: Some(local_size),
+        max_work_group_size: None,
+        kernel_dispatch: Some(KernelDispatch::ThreadsDynamic {
+            offset: DEFAULT_KERNEL_DISPATCH_PUSH_CONSTANT_OFFSET,
+        }),
+        vertex_builtins: None,
+        tessellation: None,
+        imageblock_layouts: vec![],
+        implicit_imageblock_attachments: vec![],
+        fragment_imageblock: None,
+        datalayout: adapted.datalayout.clone(),
+        runtime_sampler_specializations: vec![],
+        runtime_storage_image_specializations: vec![],
+        function_constants: vec![],
+    })
 }
 
 /// The rewritten module, and which AIR parameter each wrapper argument carries.
@@ -206,6 +321,13 @@ pub struct Adapted {
     /// `buffers[ordinal]` is the AIR parameter index of the wrapper's argument
     /// `ordinal`. The region struct is the argument after the last of them.
     pub buffers: Vec<u32>,
+    /// The kernel's buffers, in wrapper-argument order (`interface[ordinal]`
+    /// is the buffer `buffers[ordinal]` names).
+    pub interface: Vec<KernelBuffer>,
+    /// The kernel's own name, unquoted and without `@`.
+    pub kernel_name: String,
+    /// The AIR `target datalayout`, kept in the module and reported.
+    pub datalayout: Option<String>,
 }
 
 impl Adapted {
@@ -214,12 +336,32 @@ impl Adapted {
     }
 }
 
+/// One buffer argument, as the AIR metadata and parameter type describe it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelBuffer {
+    /// The AIR parameter it is.
+    pub param: u32,
+    /// `[[buffer(n)]]`.
+    pub metal_index: u32,
+    /// 1 for `device`, 2 for `constant`.
+    pub address_space: u32,
+    pub access: Option<metal2vulkan::reflect::ResourceAccess>,
+    /// The object size a `constant T&` declares (`air.buffer_size`).
+    pub buffer_size: Option<u32>,
+    /// The pointee type's size (`air.arg_type_size`).
+    pub type_size: Option<u32>,
+}
+
 /// One kernel argument, as `!air.kernel` describes it.
 #[derive(Debug)]
 struct AirArg {
     index: u32,
     kind: String,
     address_space: Option<u32>,
+    location_index: Option<u32>,
+    access: Option<metal2vulkan::reflect::ResourceAccess>,
+    buffer_size: Option<u32>,
+    type_size: Option<u32>,
 }
 
 /// Rewrite AIR disassembly into IR clspv compiles: a `spir_kernel` wrapper named
@@ -317,13 +459,26 @@ pub fn adapt(ll: &str) -> Result<Adapted, ClspvRefusal> {
     for decl in &air_decls {
         out.push_str(&air_definition(decl, &mut decls)?);
     }
-    let (wrapper, buffers) = wrapper(&name, &params, &args, &mut decls)?;
+    let (wrapper, interface) = wrapper(&name, &params, &args, &mut decls)?;
+    let buffers = interface.iter().map(|b| b.param).collect();
     out.push_str(&format!(
         "\n%m2v.region = type {{ [{REGION_WORDS} x i32] }}\n"
     ));
     out.push_str(&wrapper);
     out.push_str(&decls.finish());
-    Ok(Adapted { ir: out, buffers })
+    let datalayout = ll.lines().find_map(|l| {
+        l.strip_prefix("target datalayout = \"")
+            .and_then(|v| v.strip_suffix('"'))
+            .map(str::to_owned)
+    });
+    let kernel_name = name.trim_start_matches('@').trim_matches('"').to_owned();
+    Ok(Adapted {
+        ir: out,
+        buffers,
+        interface,
+        kernel_name,
+        datalayout,
+    })
 }
 
 fn shape(detail: String) -> ClspvRefusal {
@@ -389,16 +544,33 @@ fn air_arg(node: &str) -> Result<AirArg, ClspvRefusal> {
         .and_then(|f| metadata_string(f))
         .ok_or_else(|| shape(format!("argument node without a kind: {node}")))?
         .to_owned();
-    let address_space = fields
-        .iter()
-        .position(|f| metadata_string(f) == Some("air.address_space"))
-        .and_then(|at| fields.get(at + 1))
-        .and_then(|v| v.trim().strip_prefix("i32 "))
-        .and_then(|n| n.trim().parse().ok());
+    let int_after = |key: &str| {
+        fields
+            .iter()
+            .position(|f| metadata_string(f) == Some(key))
+            .and_then(|at| fields.get(at + 1))
+            .and_then(|v| v.trim().strip_prefix("i32 "))
+            .and_then(|n| n.trim().parse().ok())
+    };
+    let has = |key: &str| fields.iter().any(|f| metadata_string(f) == Some(key));
+    use metal2vulkan::reflect::ResourceAccess;
+    let access = if has("air.read_write") {
+        Some(ResourceAccess::ReadWrite)
+    } else if has("air.read") {
+        Some(ResourceAccess::ReadOnly)
+    } else if has("air.write") {
+        Some(ResourceAccess::WriteOnly)
+    } else {
+        None
+    };
     Ok(AirArg {
         index,
         kind,
-        address_space,
+        address_space: int_after("air.address_space"),
+        location_index: int_after("air.location_index"),
+        access,
+        buffer_size: int_after("air.buffer_size"),
+        type_size: int_after("air.arg_type_size"),
     })
 }
 
@@ -460,7 +632,7 @@ fn wrapper(
     params: &[String],
     args: &[AirArg],
     decls: &mut Declarations<'_>,
-) -> Result<(String, Vec<u32>), ClspvRefusal> {
+) -> Result<(String, Vec<KernelBuffer>), ClspvRefusal> {
     let mut sig = Vec::new();
     let mut body = String::new();
     let mut call_args = Vec::new();
@@ -495,7 +667,22 @@ fn wrapper(
             let value = format!("%m2v.buf{}", arg.index);
             sig.push(format!("{param_ty} {value}"));
             call_args.push(format!("{param_ty} {value}"));
-            buffers.push(arg.index);
+            let metal_index = arg.location_index.ok_or_else(|| {
+                shape(format!("buffer {} names no [[buffer(n)]] index", arg.index))
+            })?;
+            buffers.push(KernelBuffer {
+                param: arg.index,
+                metal_index,
+                address_space: space,
+                // `constant` memory is read-only whatever the metadata says.
+                access: if space == 2 {
+                    Some(metal2vulkan::reflect::ResourceAccess::ReadOnly)
+                } else {
+                    arg.access
+                },
+                buffer_size: arg.buffer_size,
+                type_size: arg.type_size,
+            });
             continue;
         }
         let Some(b) = builtin(&arg.kind) else {
@@ -1186,6 +1373,8 @@ fn spirv_string(words: &[u32]) -> String {
         .collect();
     String::from_utf8_lossy(&bytes).into_owned()
 }
+
+mod tool;
 
 #[cfg(test)]
 mod tests;

@@ -71,6 +71,11 @@ pub enum M2vCacheDecline {
         requested: [u32; 3],
         reflected: Option<[u32; 3]>,
     },
+    /// The metal2vk route could not translate a kernel. There is no other
+    /// compute translator on this branch, so the kernel is declined.
+    KernelClspv {
+        refusal: crate::runtime::m2v_clspv::ClspvRefusal,
+    },
 }
 
 impl M2vCacheDecline {
@@ -113,7 +118,8 @@ impl M2vCacheDecline {
             | Self::LayoutRepair { .. }
             | Self::TranslationPending { .. }
             | Self::KernelLocalSizeZero { .. }
-            | Self::KernelLocalSizeMismatch { .. } => false,
+            | Self::KernelLocalSizeMismatch { .. }
+            | Self::KernelClspv { .. } => false,
         }
     }
 }
@@ -186,6 +192,7 @@ impl Decline for M2vCacheDecline {
             Self::TranslationPending { .. } => "m2v_translation_pending_at_sync_boundary",
             Self::KernelLocalSizeZero { .. } => "m2v_kernel_local_size_zero",
             Self::KernelLocalSizeMismatch { .. } => "m2v_kernel_local_size_mismatch",
+            Self::KernelClspv { refusal } => refusal.slug(),
         }
     }
 
@@ -251,6 +258,7 @@ impl Decline for M2vCacheDecline {
                     ),
                 ),
             ],
+            Self::KernelClspv { refusal } => refusal.fields(),
         }
     }
 }
@@ -839,6 +847,12 @@ fn capture_air(air: &[u8], stage: Stage, spirv: &[u8]) {
 }
 
 fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
+    // Kernels have one translator, and it does not read the local size into
+    // the module (the workgroup size is specialised per dispatch region), so a
+    // kernel asked for without one takes metal2vulkan's own default.
+    if stage == Stage::Kernel {
+        return translate_kernel_air(air, [64, 1, 1]);
+    }
     // Fixed scratch names, in a directory of this call's own: see `Scratch`.
     let scratch = Scratch::new().map_err(|e| scratch_write_decline(stage, e.to_string()))?;
     let tmp = scratch.0.clone();
@@ -868,83 +882,30 @@ fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedSha
     std::fs::write(&path, air).map_err(|e| M2vCacheDecline::KernelScratchWrite {
         detail: e.to_string(),
     })?;
-    let opts = metal2vulkan::passes::TransformOptions {
-        kernel_local_size: local_size,
-        ..Default::default()
-    };
-    let (spirv, reflection) = metal2vulkan::translate_reflected_with_options(
-        path.to_str().unwrap_or("k.air"),
-        Stage::Kernel,
-        &tmp,
-        opts,
-    )
-    .map_err(|e| M2vCacheDecline::KernelTranslate {
-        detail: e.to_string(),
+    // Every kernel goes through metal2vk's clspv: the module and the reflection
+    // the dispatcher binds it with both come from `m2v_clspv`. metal2vulkan
+    // translates vertex and fragment shaders only.
+    let clspv = crate::config::clspv_path().ok_or(M2vCacheDecline::KernelClspv {
+        refusal: crate::runtime::m2v_clspv::ClspvRefusal::BinaryUnset,
     })?;
+    let (spirv, reflection) =
+        crate::runtime::m2v_clspv::compile_kernel(&clspv, &path, &tmp, local_size)
+            .map_err(|refusal| M2vCacheDecline::KernelClspv { refusal })?;
     capture_air(air, Stage::Kernel, &spirv);
-    if reflection.local_size != Some(local_size) {
-        return Err(M2vCacheDecline::KernelLocalSizeMismatch {
-            requested: local_size,
-            reflected: reflection.local_size,
-        });
-    }
-    // The metal2vk route, when asked for: clspv's module in place of
-    // metal2vulkan's, held to the reflection above. A refusal keeps
-    // metal2vulkan's module and says why, once per kernel.
-    if let Some(clspv) = kernel_clspv_binary() {
-        match crate::runtime::m2v_clspv::compile(&clspv, &path, &tmp, &reflection) {
-            Ok(clspv_spirv) => {
-                crate::runtime::drain::note_store_route("kernel_clspv_used");
-                // Live, because route counters only count under test: once per
-                // translated kernel, which is what says the arm ran at all.
-                crate::observe::off(format!(
-                    "kernel_clspv used entry={} words={} metal2vulkan_words={}",
-                    reflection.entry_point.as_deref().unwrap_or("?"),
-                    clspv_spirv.len() / 4,
-                    spirv.len() / 4
-                ));
-                // No `repair_layout`: that pass corrects metal2vulkan's own
-                // vector-allocation offsets, and clspv lays memory out from the
-                // AIR datalayout the adapter keeps.
-                validate_reflection(&reflection, Stage::Kernel)?;
-                crate::runtime::spirv_bind::log_folded_function_constants(&reflection);
-                return Ok(CachedShader::new(clspv_spirv, Arc::new(reflection)));
-            }
-            Err(refusal) => {
-                crate::runtime::drain::note_store_route("kernel_clspv_refused");
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                air.hash(&mut hasher);
-                crate::observe::Emit::decline("kernel_clspv", &refusal).fail_once(hasher.finish());
-            }
-        }
-    }
-    finish_translated(spirv, reflection, Stage::Kernel)
-}
-
-/// The clspv binary the metal2vk kernel route runs, when that route was asked
-/// for and can run; `None` keeps metal2vulkan's emitter.
-///
-/// Read once: the answer is per process, like every operator switch. Asking for
-/// the route without naming the binary is refused by name, once, rather than
-/// ignored.
-fn kernel_clspv_binary() -> Option<String> {
-    static BINARY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    BINARY
-        .get_or_init(|| {
-            if crate::config::switch(crate::config::KERNEL_CLSPV) != crate::config::Switch::On {
-                return None;
-            }
-            let path = crate::config::clspv_path();
-            if path.is_none() {
-                crate::observe::Emit::decline(
-                    "kernel_clspv",
-                    &crate::runtime::m2v_clspv::ClspvRefusal::BinaryUnset,
-                )
-                .fail_once(0);
-            }
-            path
-        })
-        .clone()
+    crate::runtime::drain::note_store_route("kernel_clspv_used");
+    // Live, because route counters only count under test: once per translated
+    // kernel, which is what says the route served it.
+    crate::observe::off(format!(
+        "kernel_clspv used entry={} words={} buffers={}",
+        reflection.entry_point.as_deref().unwrap_or("?"),
+        spirv.len() / 4,
+        reflection.bindings.len()
+    ));
+    // No `repair_layout`: that pass corrects metal2vulkan's own vector
+    // allocation offsets, and clspv lays memory out from the AIR datalayout the
+    // adapter keeps.
+    validate_reflection(&reflection, Stage::Kernel)?;
+    Ok(CachedShader::new(spirv, Arc::new(reflection)))
 }
 
 /// Post-emit ABI reconciliation + package the translated shader with its reflection.

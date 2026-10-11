@@ -30,57 +30,77 @@ met was a new `TextureFormat::Rgba16i`, mapped to an unsupported storage format
 in `spirv_bind::reflected_storage_image_format`. Needed before trusting it: the
 conformance battery on the guest rail and a live boot, because this changes the
 SPIR-V every guest shader becomes. metal2vulkan stays the translator for every
-vertex and fragment shader; metal2vk can serve compute kernels only, through the
-route below.
+vertex and fragment shader; on the branch below it no longer translates kernels.
 
-## Compute kernels through metal2vk's clspv: `REIMS_VGPU_KERNEL_CLSPV` (committed, not live-tested)
+## Branch `claude/metal2vk-compute`: every compute kernel through metal2vk (not live-tested)
+
+On this branch metal2vk is the only compute translator. metal2vulkan translates
+vertex and fragment shaders only (clspv has no graphics stages, so nothing can
+replace it there).
 
 [metal2vk](https://github.com/joshuaswarren/metal2vk) compiles Metal compute
 *source* through clang and a patched clspv. The guest sends compiled AIR, so
-`runtime/m2v_clspv.rs` supplies the missing front half: it disassembles the AIR,
-keeps the kernel body untouched under a new name, and wraps it in a `main`
-`spir_kernel` that computes each Metal builtin from OpenCL work-item functions
-plus metal2vulkan's 48-byte dispatch-region push constant. Known `air.*` calls
-(math, conversions, the threadgroup barrier, relaxed `atomicrmw`) get bodies;
-anything else (textures, samplers, threadgroup-memory parameters, argument
-buffers, SIMD-group builtins, non-relaxed atomics) is refused by name.
+`runtime/m2v_clspv.rs` supplies the missing front half and the rest of the
+compute contract:
+- it disassembles the AIR, keeps the kernel body untouched under a new name, and
+  wraps it in a `main` `spir_kernel` that computes each Metal builtin from OpenCL
+  work-item functions plus the 48-byte dispatch-region push constant;
+- known `air.*` calls (math, conversions, the threadgroup barrier, relaxed
+  `atomicrmw`) get bodies;
+- `reflection_for` builds the `ShaderReflection` the dispatcher binds with from
+  the AIR metadata: buffer `n` at set 0 binding `n`, access from `air.read` /
+  `air.read_write`, a `constant T&` object's size from `air.buffer_size`, and the
+  exact-thread dispatch contract. The reflection *type* is still metal2vulkan's,
+  because the whole dispatcher (shared with graphics) speaks it; none of
+  metal2vulkan's translation or analysis runs for a kernel, and the route runs
+  `llvm-dis`, `clspv` and `spirv-val` through its own runner (`m2v_clspv/tool.rs`);
+- `conform` holds clspv's module to that reflection (bindings rewritten, push
+  constant at offset 0 and 48 bytes, workgroup size on spec ids 0..2, one `main`
+  entry), then `spirv-val` checks it.
 
-metal2vulkan still translates every kernel first: its reflection is the interface
-the dispatcher binds. The clspv module is used only if it matches that interface
-(buffers moved to the reflection's descriptors, push constant at offset 0 and 48
-bytes, workgroup size on spec ids 0..2, one `main` entry) and passes `spirv-val`;
-otherwise metal2vulkan's module runs and `kernel_clspv reason=...` names why on
-the failure channel. An adopted module logs `kernel_clspv used entry=...`.
+**What this branch loses against metal2vulkan, by design of the request.** A
+kernel the route cannot translate is declined (`compute_vk_translate
+step=kernel_clspv_*`), with no fallback: kernels with textures or samplers,
+threadgroup-memory parameters, argument buffers, SIMD-group functions,
+non-relaxed atomics, or an `air.*` function the adapter has no body for. The
+handoff above says the Simulator's compute passes use storage images; those will
+be declined here until the route carries textures. Buffer footprints are not
+computed either, so every bound buffer is staged whole (more bytes, never
+wrong). A host with no clspv (`REIMS_VGPU_CLSPV` unset) declines every kernel
+with `kernel_clspv_binary_unset`; the Linux bundle the CI builds does not ship
+clspv.
 
 How to run it:
 - Build clspv the way metal2vk's README says (commit `f2b01dd`, then
   `metal2vk/tools/apply-clspv-patches.sh`, then `ninja clspv`; about 1.5 h on 4
   cores, ~15 GB of disk during the build).
-- `REIMS_VGPU_KERNEL_CLSPV=on REIMS_VGPU_CLSPV=/path/to/clspv` on the QEMU
-  process. The boot line reports both.
+- `REIMS_VGPU_CLSPV=/path/to/clspv` on the QEMU process (reported on the boot
+  line). Every kernel the route serves logs `kernel_clspv used entry=...`.
 
 Verified off-VM, on lavapipe:
-- `tests/vk_kernel_clspv.rs` runs six kernels through both emitters with the
-  dispatch plan the reflection prescribes. Five write byte-identical buffers
-  (partial edge regions, threadgroup memory with barriers, 16-bit builtins,
-  relaxed atomics). On `math_convert` the clspv module matches an exact
+- `tests/vk_kernel_clspv.rs` translates six kernels with both metal2vk (module
+  and reflection from `compile_kernel`) and metal2vulkan (oracle only), and runs
+  each with its own reflection's dispatch plan. Five write byte-identical
+  buffers (partial edge regions, threadgroup memory with barriers, 16-bit
+  builtins, relaxed atomics). On `math_convert` metal2vk matches an exact
   round-to-nearest-even reference and **metal2vulkan rounds two float-to-half
-  conversions toward zero** (5.562072 to 5.5586, not 5.5625): a metal2vulkan
-  defect worth reporting upstream.
-- With the switch on, the whole reims-vgpu suite passes as it does with it off,
-  and the device path adopted the clspv module for `compute_mul3add1` and
-  produced `[4, 7, 10, 13]`.
+  conversions toward zero** (5.562072 to 5.5586, not 5.5625).
+- The whole reims-vgpu suite with `REIMS_VGPU_CLSPV` set: 2337 passed, the same
+  four failing as on master in this container (missing `vendor/qemu` checkout,
+  lavapipe limits). The device path served `compute_mul3add1` and returned the
+  expected values. Without clspv the same suite passes except that kernel, whose
+  test now asserts the by-name refusal instead.
 - The test kernels live in `tests/fixtures/clspv/*.metal`; their AIR is compiled
-  on a macOS runner by `.github/workflows/compile-clspv-fixtures.yml` (run it
-  after editing a kernel; it prints each module as base64 in the log).
+  on a macOS runner by `.github/workflows/compile-clspv-fixtures.yml`, which
+  also checks the committed modules still match.
 
-Not verified: a live guest. The guest's own kernels may use what the route
-refuses, which only a boot with the switch on will show (count
-`kernel_clspv used` against `kernel_clspv reason=`). Two clspv quirks found on
-the way are handled in the adapter: OpenCL C++ mode turns on module-scope push
-constants that collide with the dispatch region (the route uses `CL1.2`), and
-InstCombine turns two 16-bit lanes of `get_local_size` into a `<6 x i16>` load
-clspv aborts on (the lanes go through a value-preserving `umin` first).
+Not verified: a live guest. The first boot should count `kernel_clspv used`
+against `compute_vk_translate step=kernel_clspv_*`, which is the list of what the
+route has to learn next. Two clspv quirks are handled in the adapter: OpenCL C++
+mode turns on module-scope push constants that collide with the dispatch region
+(the route uses `CL1.2`), and InstCombine turns two 16-bit lanes of
+`get_local_size` into a `<6 x i16>` load clspv aborts on (the lanes go through a
+value-preserving `umin` first).
 
 ## Sampled-texture rewrite, step 1: the identity-miss census (committed, not live-read)
 

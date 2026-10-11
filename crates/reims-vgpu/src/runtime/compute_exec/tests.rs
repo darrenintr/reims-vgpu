@@ -1120,6 +1120,21 @@ fn dispatch_buffer_kernel_mul3add1() {
 
     let record = threadgroups([1, 1, 1], [4, 1, 1]);
     let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &record);
+    // The Vulkan rail compiles kernels with metal2vk's clspv alone. A host that
+    // names no clspv binary cannot run this kernel, and must say so by name
+    // rather than fall back to anything.
+    if crate::backend::selected().rail() == crate::backend::Rail::Vulkan
+        && crate::config::clspv_path().is_none()
+    {
+        let ComputeStatus::RailRefused(refusal) = &st else {
+            panic!("without clspv the kernel must be refused, got {st:?}");
+        };
+        assert!(
+            format!("{refusal:?}").contains("kernel_clspv_binary_unset"),
+            "{refusal:?}"
+        );
+        return;
+    }
     assert!(
         matches!(
             st,

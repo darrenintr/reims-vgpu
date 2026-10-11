@@ -3,8 +3,13 @@ use super::*;
 /// The fixture compute kernel's disassembly, read through the same `llvm-dis`
 /// the route runs.
 fn fixture_ll(name: &str) -> String {
+    fixture_ll_in("air", name)
+}
+
+fn fixture_ll_in(dir: &str, name: &str) -> String {
     let air = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/air")
+        .join("tests/fixtures")
+        .join(dir)
         .join(name);
     let dir = std::env::temp_dir().join(format!("m2v-clspv-test-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch dir");
@@ -147,7 +152,7 @@ fn unsupported_kernels_are_refused_by_name() {
     let unknown = module(
         "ptr addrspace(1) %b",
         "ptr addrspace(1) %b",
-        &["i32 0, !\"air.buffer\", !\"air.address_space\", i32 1"],
+        &["i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.address_space\", i32 1"],
         "declare float @air.simd_sum.f32(float)\n",
     );
     assert_eq!(
@@ -160,7 +165,7 @@ fn unsupported_kernels_are_refused_by_name() {
     let threadgroup_buffer = module(
         "ptr addrspace(3) %s",
         "ptr addrspace(3) %s",
-        &["i32 0, !\"air.buffer\", !\"air.address_space\", i32 3"],
+        &["i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.address_space\", i32 3"],
         "",
     );
     assert_eq!(
@@ -176,7 +181,7 @@ fn known_air_functions_get_bodies() {
     let ll = module(
         "ptr addrspace(1) %b",
         "ptr addrspace(1) %b",
-        &["i32 0, !\"air.buffer\", !\"air.address_space\", i32 1"],
+        &["i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.address_space\", i32 1"],
         "declare <4 x float> @air.fast_sqrt.v4f32(<4 x float>)\n\
          declare float @air.clamp.f32(float, float, float)\n\
          declare float @air.convert.f.f32.u.i32(i32)\n\
@@ -223,7 +228,7 @@ fn a_module_that_already_defines_main_is_refused() {
     let ll = module(
         "ptr addrspace(1) %b",
         "ptr addrspace(1) %b",
-        &["i32 0, !\"air.buffer\", !\"air.address_space\", i32 1"],
+        &["i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.address_space\", i32 1"],
         "declare void @main()\n",
     );
     assert_eq!(
@@ -283,11 +288,74 @@ fn a_non_relaxed_atomic_is_refused() {
     let ll = module(
         "ptr addrspace(1) %b",
         "ptr addrspace(1) %b",
-        &["i32 0, !\"air.buffer\", !\"air.address_space\", i32 1"],
+        &["i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.address_space\", i32 1"],
         "declare i32 @air.atomic.global.add.u.i32(ptr addrspace(1), i32, i32, i32, i1)\n\
          define void @helper(ptr addrspace(1) %p) {\n  %x = call i32 @air.atomic.global.add.u.i32(ptr addrspace(1) %p, i32 1, i32 5, i32 2, i1 true)\n  ret void\n}\n",
     );
     assert!(
         matches!(adapt(&ll), Err(ClspvRefusal::Intrinsic { name }) if name.contains("non-relaxed"))
+    );
+}
+
+/// The route describes a kernel from its AIR alone: each buffer at the binding
+/// its Metal index names, its access and, for a `constant T&`, its object size,
+/// and the exact-thread dispatch contract the wrapper implements. The
+/// description passes the dispatcher's own well-formedness guard.
+#[test]
+fn the_kernel_reflection_comes_from_the_air() {
+    use metal2vulkan::reflect::{BufferExtent, KernelDispatch, ResourceAccess};
+    let adapted = adapt(&fixture_ll_in("clspv", "math_convert.air")).expect("adapts");
+    let r = reflection_for(&adapted, [8, 1, 1]).expect("reflects");
+
+    assert_eq!(r.entry_point.as_deref(), Some("math_convert"));
+    assert_eq!(r.local_size, Some([8, 1, 1]));
+    assert_eq!(
+        r.kernel_dispatch,
+        Some(KernelDispatch::ThreadsDynamic { offset: 0 })
+    );
+    let shape: Vec<_> = r
+        .bindings
+        .iter()
+        .map(|b| {
+            (
+                b.metal_index,
+                b.descriptor.map(|d| (d.set, d.binding)),
+                b.access,
+                b.extent,
+                b.address_space,
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (
+                0,
+                Some((0, 0)),
+                Some(ResourceAccess::ReadOnly),
+                Some(BufferExtent::Unbounded),
+                Some(1)
+            ),
+            (
+                1,
+                Some((0, 1)),
+                Some(ResourceAccess::ReadWrite),
+                Some(BufferExtent::Unbounded),
+                Some(1)
+            ),
+            (
+                2,
+                Some((0, 2)),
+                Some(ResourceAccess::ReadOnly),
+                Some(BufferExtent::Object { bytes: 16 }),
+                Some(2)
+            ),
+        ]
+    );
+    assert!(r.datalayout.is_some(), "the AIR datalayout is reported");
+    assert_eq!(
+        crate::runtime::spirv_bind::census_reflection_wellformed(&r, 0),
+        0,
+        "the dispatcher's guard accepts the description"
     );
 }

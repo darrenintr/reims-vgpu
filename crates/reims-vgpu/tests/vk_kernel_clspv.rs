@@ -1,10 +1,11 @@
 //! Parity of the metal2vk compute route against metal2vulkan's emitter.
 //!
-//! Each kernel is translated by metal2vulkan (whose reflection is the interface
-//! both modules answer to) and by `runtime::m2v_clspv`, then both modules run
-//! through the shipped compute entry with the same buffers and the dispatch plan
-//! the reflection prescribes. The two must write the same bytes, and where the
-//! answer is exact it is asserted too.
+//! On this branch every kernel is translated by `runtime::m2v_clspv` alone,
+//! module and reflection both. metal2vulkan appears here only as an oracle:
+//! each kernel is translated by both, each module runs through the shipped
+//! compute entry with its *own* reflection's dispatch plan and the same
+//! buffers, and the two must write the same bytes. Where the answer is exact it
+//! is asserted too.
 //!
 //! Needs a Vulkan ICD and the patched clspv named by `REIMS_VGPU_CLSPV`; skips
 //! by name without either. **Serial:** one process-global engine.
@@ -54,8 +55,9 @@ fn words(bytes: &[u8]) -> Vec<u32> {
 /// Both modules for one kernel, with the reflection they answer to; `None`
 /// (with a line saying why) when this host cannot run the comparison.
 struct Pair {
-    reflection: ShaderReflection,
+    m2v_reflection: ShaderReflection,
     metal2vulkan: Vec<u32>,
+    clspv_reflection: ShaderReflection,
     clspv: Vec<u32>,
 }
 
@@ -85,12 +87,14 @@ fn translate(path: &str, local_size: [u32; 3]) -> Option<Pair> {
         opts,
     )
     .unwrap_or_else(|e| panic!("metal2vulkan {path}: {e}"));
-    let clspv_spirv = reims_vgpu::runtime::m2v_clspv::compile(&clspv, &air, &tmp, &reflection)
-        .unwrap_or_else(|r| panic!("clspv route {path}: {r:?}"));
+    let (clspv_spirv, clspv_reflection) =
+        reims_vgpu::runtime::m2v_clspv::compile_kernel(&clspv, &air, &tmp, local_size)
+            .unwrap_or_else(|r| panic!("clspv route {path}: {r:?}"));
     let _ = std::fs::remove_dir_all(&tmp);
     Some(Pair {
-        reflection,
+        m2v_reflection: reflection,
         metal2vulkan: words(&m2v),
+        clspv_reflection,
         clspv: words(&clspv_spirv),
     })
 }
@@ -171,7 +175,7 @@ fn both(
     let m2v = run(
         &format!("{path} metal2vulkan"),
         pair.metal2vulkan,
-        &pair.reflection,
+        &pair.m2v_reflection,
         local_size,
         threads,
         buffers,
@@ -179,7 +183,7 @@ fn both(
     let clspv = run(
         &format!("{path} clspv"),
         pair.clspv,
-        &pair.reflection,
+        &pair.clspv_reflection,
         local_size,
         threads,
         buffers,
