@@ -333,7 +333,8 @@ impl ResourcePools {
             readback_live: None,
             readback_multi_live: Vec::new(),
             readback_leased: Vec::new(),
-            sampled_free: FreePool::new(SAMPLED_FREE_CAP_PER_KEY, SAMPLED_FREE_CAP_TOTAL),
+            sampled_free: FreePool::new(SAMPLED_FREE_CAP_PER_KEY, SAMPLED_FREE_CAP_TOTAL)
+                .with_byte_cap(SAMPLED_FREE_BYTE_CAP, sampled_slot_bytes),
             sampled_live: Vec::new(),
             attachment_snapshot_free: FreePool::new(
                 ATTACHMENT_SNAPSHOT_FREE_CAP_PER_KEY,
@@ -5626,6 +5627,41 @@ mod recycle_tests {
             BATCH_MAX_DRAWS as usize
                 * (crate::runtime::render_pass::PASS_MAX_COLOR_ATTACHMENTS + 1)
         );
+    }
+
+    /// The sampled pool is bounded by the memory its images hold, and its count
+    /// and memory stay exact through admit, take, pop and drain. A burst of
+    /// small images far past the old count cap of 64 is retained — that is what
+    /// keeps a many-texture animation from recreating its images every frame —
+    /// while large images stop at the byte budget.
+    #[test]
+    fn sampled_free_pool_is_bounded_by_bytes_not_by_a_small_count() {
+        let mut pool = FreePool::new(SAMPLED_FREE_CAP_PER_KEY, SAMPLED_FREE_CAP_TOTAL)
+            .with_byte_cap(SAMPLED_FREE_BYTE_CAP, sampled_slot_bytes);
+        // 300 distinct 64x64 RGBA icons: 4.7 MiB, all retained.
+        for i in 0..300u32 {
+            let slot = null_slot(64 + i, 64);
+            assert!(pool.admit(slot.key(), slot).is_none(), "icon {i}");
+        }
+        assert_eq!(pool.len(), 300);
+        let icons: u64 = (0..300u64).map(|i| (64 + i) * 64 * 4).sum();
+        assert_eq!(pool.retained_bytes, icons);
+        // Full-screen frames stop once the budget is spent.
+        let mut frames = 0;
+        for i in 0..40u32 {
+            let slot = null_slot(1920 + i, 1080);
+            if pool.admit(slot.key(), slot).is_none() {
+                frames += 1;
+            }
+        }
+        assert!(pool.retained_bytes <= SAMPLED_FREE_BYTE_CAP);
+        assert!(frames > 0 && frames < 40, "frames={frames}");
+        // Taking and draining keep the account exact.
+        let key = null_slot(64, 64).key();
+        assert!(pool.take(&key).is_some());
+        assert_eq!(pool.len(), 299 + frames);
+        while pool.pop_any().is_some() {}
+        assert_eq!((pool.len(), pool.retained_bytes), (0, 0));
     }
 
     /// `target_free` has the same global cap for the same reason.

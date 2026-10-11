@@ -2660,7 +2660,7 @@ impl SampledVictimRoute {
 /// plus the one being acquired); beyond that a recycled slot is destroyed so a
 /// one-off geometry cannot pin memory for the whole guest lifetime. Bounds total
 /// retained memory to ~(distinct geometries × cap × slot size).
-const SAMPLED_FREE_CAP_PER_KEY: usize = 4;
+const SAMPLED_FREE_CAP_PER_KEY: usize = 8;
 /// **Global** cap on `sampled_free` across all keys. The per-key cap alone does
 /// not bound a *diverse* burst: a YouTube page-load evicts hundreds of distinct
 /// sampled geometries (thumbnails), each ≤ the per-key cap, so the pool grew to
@@ -2670,7 +2670,29 @@ const SAMPLED_FREE_CAP_PER_KEY: usize = 4;
 /// number a boot can be asked for; `block_frees` is still live. This
 /// global cap keeps the recycle pool from exceeding the working set; evictions
 /// past it are destroyed (freeing their slab range) instead of cached.
-const SAMPLED_FREE_CAP_TOTAL: usize = 64;
+///
+/// That reading was about retained *memory*, and a count is a poor proxy for
+/// it: 64 full-screen frames and 64 icons differ by three orders of magnitude.
+/// The memory bound is now [`SAMPLED_FREE_BYTE_CAP`], and this count is only a
+/// backstop on bookkeeping. At 64 the genie (minimize-to-Dock) animation, whose
+/// frames bind more than 64 distinct sampled images, destroyed the excess every
+/// frame and created it again the next: ~3 000 `vkCreateImage` a second on the
+/// device thread (`vk_create_sites sampled_image`, 29 256 → 53 798 in 8 s).
+/// Idle maintenance still drains the pool (`trim_recycle_pools`).
+const SAMPLED_FREE_CAP_TOTAL: usize = 1024;
+/// Device memory the recycled sampled images may hold at once.
+const SAMPLED_FREE_BYTE_CAP: u64 = 64 << 20;
+
+/// Bytes a sampled slot's image holds, from its geometry and format: what
+/// [`SAMPLED_FREE_BYTE_CAP`] counts against.
+fn sampled_slot_bytes(slot: &SampledSlot) -> u64 {
+    let texel =
+        crate::backend::vulkan::translate::pixel::bytes_per_texel(slot.format).unwrap_or(16);
+    u64::from(slot.width)
+        .saturating_mul(u64::from(slot.height))
+        .saturating_mul(u64::from(slot.layers.max(1)))
+        .saturating_mul(u64::from(texel))
+}
 /// A draw can feed back through at most the plain 2D identity views of the
 /// attachments its render pass carries: the decoded color table plus its one
 /// depth attachment. The producer shares duplicate binds of one attachment and
@@ -2801,6 +2823,15 @@ struct FreePool<K, V> {
     free: HashMap<K, Vec<V>>,
     per_key: usize,
     total: usize,
+    /// Retained entries, kept beside `free` so a cap check is O(1) rather
+    /// than a sum over every key on every admit.
+    retained: usize,
+    /// Bytes of device memory the retained entries hold, as `weigh` reports
+    /// them, and the most this pool may hold. A count cap alone cannot tell a
+    /// pool of icons from a pool of full-screen frames.
+    retained_bytes: u64,
+    byte_cap: u64,
+    weigh: fn(&V) -> u64,
     /// A take that found an entry to reuse.
     hits: u64,
     /// A take that found none, so the caller had to create.
@@ -2817,6 +2848,10 @@ impl<K: std::hash::Hash + Eq, V> FreePool<K, V> {
             free: HashMap::new(),
             per_key,
             total,
+            retained: 0,
+            retained_bytes: 0,
+            byte_cap: u64::MAX,
+            weigh: |_| 0,
             hits: 0,
             allocs: 0,
             admits: 0,
@@ -2824,22 +2859,43 @@ impl<K: std::hash::Hash + Eq, V> FreePool<K, V> {
         }
     }
 
+    /// Also bound the pool by the bytes its entries hold, as `weigh` reports
+    /// them.
+    fn with_byte_cap(mut self, byte_cap: u64, weigh: fn(&V) -> u64) -> Self {
+        self.byte_cap = byte_cap;
+        self.weigh = weigh;
+        self
+    }
+
     /// Retained entries across every key.
     fn len(&self) -> usize {
-        self.free.values().map(Vec::len).sum()
+        self.retained
+    }
+
+    fn note_in(&mut self, entry: &V) {
+        self.retained += 1;
+        self.retained_bytes = self.retained_bytes.saturating_add((self.weigh)(entry));
+    }
+
+    fn note_out(&mut self, entry: &V) {
+        self.retained = self.retained.saturating_sub(1);
+        self.retained_bytes = self.retained_bytes.saturating_sub((self.weigh)(entry));
     }
 
     /// Offer a retired entry for reuse. `None` means it was admitted; `Some(v)`
     /// hands it back because a cap was full and the caller must destroy it.
     /// Device-free, so the routing is unit-testable without a GPU.
     fn admit(&mut self, key: K, entry: V) -> Option<V> {
-        if self.len() >= self.total {
+        let weight = (self.weigh)(&entry);
+        if self.len() >= self.total || self.retained_bytes.saturating_add(weight) > self.byte_cap {
             self.cap_drops += 1;
             return Some(entry);
         }
         let list = self.free.entry(key).or_default();
         if list.len() < self.per_key {
             list.push(entry);
+            self.retained += 1;
+            self.retained_bytes = self.retained_bytes.saturating_add(weight);
             self.admits += 1;
             None
         } else {
@@ -2858,6 +2914,7 @@ impl<K: std::hash::Hash + Eq, V> FreePool<K, V> {
     /// `trim_recycle_pools` during maintenance. That asymmetry is real and was
     /// measured: one 4x4K video session held `sfree=203` against a `total` of 64.
     fn push_uncapped(&mut self, key: K, entry: V) {
+        self.note_in(&entry);
         self.free.entry(key).or_default().push(entry);
     }
 
@@ -2865,7 +2922,8 @@ impl<K: std::hash::Hash + Eq, V> FreePool<K, V> {
     /// so a boot can prove a per-frame realloc storm collapsed (`allocs` ≈ 0).
     fn take(&mut self, key: &K) -> Option<V> {
         let got = self.free.get_mut(key).and_then(Vec::pop);
-        if got.is_some() {
+        if let Some(entry) = &got {
+            self.note_out(entry);
             self.hits += 1;
         } else {
             self.allocs += 1;
@@ -2879,13 +2937,17 @@ impl<K: std::hash::Hash + Eq, V> FreePool<K, V> {
     where
         K: Clone,
     {
-        pop_any_pool_entry(&mut self.free)
+        let entry = pop_any_pool_entry(&mut self.free)?;
+        self.note_out(&entry);
+        Some(entry)
     }
 
     /// Empty the pool, yielding every retained entry for the caller to destroy.
     /// The census is cumulative and survives, so a teardown does not erase what
     /// the boot measured.
     fn drain(&mut self) -> impl Iterator<Item = V> + '_ {
+        self.retained = 0;
+        self.retained_bytes = 0;
         self.free.drain().flat_map(|(_, list)| list)
     }
 
