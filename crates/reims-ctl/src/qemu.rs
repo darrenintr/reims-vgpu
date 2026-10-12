@@ -15,7 +15,10 @@
 //! RAM as a shared memfd, which the library on Linux requires; the keyboard and tablet on a
 //! qemu-xhci controller, since on ICH9's EHCI the guest stops re-arming a device's interrupt
 //! transfers under GPU load and its input freezes; fixed PCI addresses (the AHCI controller at
-//! slot 2, where OpenCore's boot entries name it); `isa-applesmc` with Apple's SMC key, [`OSK`].
+//! slot 2, where OpenCore's boot entries name it); `isa-applesmc` with Apple's SMC key, [`OSK`];
+//! and `dump-guest-core=off`, which leaves guest RAM out of a core dump of QEMU: with it in, a
+//! crash's core takes the process tens of seconds to end (docs/qemu.md). QEMU refuses the
+//! option where the OS cannot leave memory out of a core (macOS has no `MADV_DONTDUMP`).
 //!
 //! `vmapple-arm64` follows scripts/run_vmapple.sh.
 
@@ -112,7 +115,7 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     let mem = format!("{}M", c.memory_mib);
     let mut push = |xs: &[&str]| a.extend(xs.iter().map(|s| s.to_string()));
     if c.profile.memfd_ram(ctx.host) {
-        push(&["-machine", "q35,memory-backend=ram"]);
+        push(&["-machine", "q35,memory-backend=ram,dump-guest-core=off"]);
         push(&[
             "-object",
             &format!("memory-backend-memfd,id=ram,size={mem},share=on"),
@@ -493,7 +496,7 @@ mod tests {
         let inv = invocation(&q35_vm(), &ctx(linux())).unwrap();
         let a = &inv.args;
         for pair in [
-            &["-machine", "q35,memory-backend=ram"][..],
+            &["-machine", "q35,memory-backend=ram,dump-guest-core=off"][..],
             &[
                 "-object",
                 "memory-backend-memfd,id=ram,size=12288M,share=on",
@@ -641,6 +644,7 @@ mod tests {
             assert!(has(&a, pair), "missing {pair:?} in {a:?}");
         }
         assert!(!a.iter().any(|x| x.contains("memfd")));
+        assert!(!a.iter().any(|x| x.contains("dump-guest-core")));
     }
 
     #[test]
