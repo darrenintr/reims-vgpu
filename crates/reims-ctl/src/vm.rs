@@ -20,6 +20,9 @@ pub struct VmConfig {
     pub profile: Profile,
     pub cpus: u32,
     pub memory_mib: u64,
+    /// How the vCPUs are laid out for the guest, and where they run on the host.
+    #[serde(default, skip_serializing_if = "Cpu::is_default")]
+    pub cpu: Cpu,
     /// The system disk, relative to the VM's directory unless absolute.
     pub disk: PathBuf,
     #[serde(default)]
@@ -79,6 +82,59 @@ impl ImageFormat {
         } else {
             ImageFormat::Raw
         })
+    }
+}
+
+/// The vCPUs' layout for the guest and their host CPUs (`[cpu]` in `vm.toml`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Cpu {
+    /// Threads per core the guest sees: 1, or 2 for cores with two threads each, as the host's
+    /// SMT cores have. `cpus` must be a multiple of it. x86-64 guests only.
+    pub threads_per_core: u32,
+    /// Where `start` pins each vCPU's thread on a Linux host: `off`, `auto` (whole host cores
+    /// from the last, leaving the first ones to QEMU's other threads and the host), or a list of
+    /// host CPUs such as `2-5,8-11`, one per vCPU (crate::pin).
+    pub pin: String,
+}
+
+impl Default for Cpu {
+    fn default() -> Cpu {
+        Cpu {
+            threads_per_core: 1,
+            pin: "off".into(),
+        }
+    }
+}
+
+impl Cpu {
+    fn is_default(&self) -> bool {
+        *self == Cpu::default()
+    }
+
+    /// Whether `start` pins the vCPUs.
+    pub fn pins(&self) -> bool {
+        !matches!(self.pin.trim(), "" | "off")
+    }
+
+    pub fn check(&self, cpus: u32, profile: Profile) -> Result<()> {
+        if !matches!(self.threads_per_core, 1 | 2) {
+            bail!(
+                "threads per core must be 1 or 2, not {}",
+                self.threads_per_core
+            );
+        }
+        if self.threads_per_core != 1 && profile != Profile::Q35X86_64 {
+            bail!("threads per core is an x86-64 setting");
+        }
+        if !cpus.is_multiple_of(self.threads_per_core) {
+            bail!(
+                "{cpus} vCPUs do not make whole cores of {} threads",
+                self.threads_per_core
+            );
+        }
+        crate::pin::Pin::parse(&self.pin)?;
+        Ok(())
     }
 }
 
@@ -364,6 +420,7 @@ impl VmConfig {
         if self.memory_mib < 2048 {
             bail!("memory must be at least 2 GiB, not {} MiB", self.memory_mib);
         }
+        self.cpu.check(self.cpus, self.profile)?;
         self.display.check()?;
         match self.profile {
             Profile::Q35X86_64 if self.q35.is_none() => bail!("{}: no [q35] settings", self.name),
@@ -664,6 +721,10 @@ mod tests {
             profile: Profile::Q35X86_64,
             cpus: 4,
             memory_mib: 8192,
+            cpu: Cpu {
+                threads_per_core: 2,
+                pin: "auto".into(),
+            },
             disk: "disk.qcow2".into(),
             disk_format: ImageFormat::Qcow2,
             stop_timeout_secs: 90,

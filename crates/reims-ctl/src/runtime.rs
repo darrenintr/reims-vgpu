@@ -353,6 +353,7 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
         if let Some(p) = pid(vm) {
             seen = true;
             if qmp::Qmp::connect(&sock, Duration::from_secs(2)).is_ok() {
+                pin_vcpus(vm, &sock);
                 return Ok(p);
             }
         } else if seen || Instant::now() > deadline - Duration::from_secs(50) {
@@ -369,6 +370,21 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
             }
         }
         std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+/// Pins the vCPUs as the VM's `[cpu] pin` says (crate::pin), and says what was done, or why
+/// not, in QEMU's log: a VM that runs unpinned still runs.
+fn pin_vcpus(vm: &Vm, sock: &Path) {
+    if !vm.config.cpu.pins() {
+        return;
+    }
+    let line = match crate::pin::apply(sock, &vm.config.cpu, vm.config.cpus) {
+        Ok(done) => done,
+        Err(e) => format!("reims-ctl: vCPUs not pinned: {e:#}"),
+    };
+    if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(vm.qemu_log()) {
+        let _ = writeln!(log, "{line}");
     }
 }
 

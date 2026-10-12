@@ -481,6 +481,55 @@ bytes help: smaller shaders, fewer pipelines per state. The driver's
 disk-cache cap, a cap of the runtime's, a binary's identity and binary
 records were each suspected first and ruled out.
 
+### Linux hosts: a CPU-bound host at 120 Hz
+
+A host whose CPU is weaker than its GPU (a Ryzen 5 3600, six cores and twelve
+threads, with a Radeon RX 7600 on RADV) runs out of CPU before GPU: the
+library turns the guest's command buffers into Vulkan work on the host's CPU,
+on QEMU's threads beside the vCPUs. What `reims-ctl` sets for such a host,
+here for 8 vCPUs as 4 cores of 2 threads, 8 GiB and 120 Hz:
+
+```sh
+reims-ctl set mac --cpus 8 --threads-per-core 2 --pin auto --memory 8G --refresh 120
+reims-ctl set mac --gpu "AMD Radeon RX 7600"   # a name or number from reims-ctl gpus
+```
+
+- **`--threads-per-core 2`** gives the guest `-smp 8,sockets=1,cores=4,threads=2`.
+- **`--pin auto`** has `start` pin each vCPU's thread, once QMP answers, to one
+  host CPU (`crates/reims-ctl/src/pin.rs`). The CPUs are whole host cores from
+  the last, both threads of each, with each guest core on one host core: on the
+  3600, vCPUs 0 to 7 go to CPUs 2, 8, 3, 9, 4, 10, 5 and 11. Cores 0 and 1 stay
+  free for QEMU's other threads: the library's FIFO, display and window threads,
+  and Mesa's. `auto` refuses to take every core. A list such as `2-5,8-11`
+  names the CPUs itself, one per vCPU. QEMU's log says what was pinned, or why
+  nothing was. A VM started from a script that `reims-ctl command` printed is
+  not pinned.
+- **`--refresh 120`** offers the guest 120 Hz modes (`REIMS_VGPU_WINDOW_REFRESH`).
+  The guest's frames complete when the GPU does, not at the host screen's
+  vsync (`crates/reims-vgpu-vulkan/src/swapchain.rs`). So the guest runs at
+  120 Hz on a slower screen too, but the window shows no more than the
+  screen's own rate.
+
+What RADV costs the CPU, from the measurements above ("Linux hosts: AMD GPUs
+and udmabuf"): each live import adds about 0.55 µs to every submission, and an
+import lives as long as the guest buffer it backs. A guest with Safari open
+held 4,551 imports, about 2.5 ms of CPU for each command buffer submitted.
+That cost grows with what the guest has open, not with what it draws. Raising
+udmabuf's module limits does not lower it: it only cuts the chunks of the few
+imports past the limits, and 5,095 of 5,119 took one chunk anyway. RADV also
+has one graphics queue, so the window's presents share it with the guest's
+work (`shared-present-queue`).
+
+Not measured: none of this has been timed on a 3600 and RX 7600 host, and no
+setting here has been shown to hold 120 frames a second. To see where frames
+go, set `REIMS_VGPU_STATS=1` (`reims-ctl set mac --env REIMS_VGPU_STATS=1`).
+Each second, QEMU's log then gets a line per display: the guest's presents per
+second and the longest gap between two, and the window's draws and their GPU
+time ([api.md](api.md), "Frame statistics"). During an animation, a guest that
+presents fewer than 120 frames a second while the window's GPU time stays
+small is waiting on the CPU. `top -H -p <QEMU's pid>` shows which threads hold
+it: the vCPUs (`CPU n/KVM`), or the library's (`reims-vgpu.*`).
+
 ### x86-64 macOS guests: Metal's error mode
 
 An x86-64 macOS guest needs one setting, made once inside the guest. On a

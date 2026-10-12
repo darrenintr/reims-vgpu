@@ -975,6 +975,18 @@ impl App {
                 &c.cpus.to_string(),
                 &format!("vCPUs; this host has {}.", create::host_cpus()),
             ),
+            Field::text(
+                "threads",
+                "Threads per core",
+                &c.cpu.threads_per_core.to_string(),
+                "x86-64: 1, or 2 for cores of two threads (8 vCPUs at 2 are 4 cores).",
+            ),
+            Field::text(
+                "pin",
+                "Pin vCPUs",
+                &c.cpu.pin,
+                "Linux: off, auto (host cores from the last), or host CPUs such as 2-5,8-11.",
+            ),
             Field::text("memory", "Memory", &format_mib(c.memory_mib), "Such as 8G."),
             Field::text(
                 "displays",
@@ -1580,6 +1592,11 @@ fn installer_change(vm: &Vm, f: &Form) -> Result<Option<Option<PathBuf>>> {
 fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
     let c = &mut vm.config;
     c.cpus = f.text("cpus").parse().context("CPU cores: a number")?;
+    c.cpu.threads_per_core = f
+        .text("threads")
+        .parse()
+        .context("threads per core: a number")?;
+    c.cpu.pin = f.text("pin").trim().to_owned();
     c.memory_mib = parse_size_mib(&f.text("memory")).context("memory")?;
     c.display.count = f.text("displays").parse().context("displays: a number")?;
     c.display.resolution = f.text("resolution");

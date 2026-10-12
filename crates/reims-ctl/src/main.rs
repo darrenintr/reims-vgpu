@@ -10,6 +10,7 @@ mod host;
 mod install;
 mod logs;
 mod paths;
+mod pin;
 mod qemu;
 mod qmp;
 mod runtime;

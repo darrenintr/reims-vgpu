@@ -118,14 +118,15 @@ reims-ctl start mac                             # a window opens for each guest 
 ### Day to day
 
 `reims-ctl` with no command opens its interactive interface: create a VM, start it (a window for
-each display), stop it (the guest shuts down, or is powered off after a timeout), edit its CPUs,
-memory, displays, resolution, HiDPI, borderless windows, GPU, audio and logs, change its installer,
+each display), stop it (the guest shuts down, or is powered off after a timeout), edit its CPUs
+(and, on Linux, the host cores they are pinned to), memory, displays, resolution, HiDPI, borderless windows, GPU, audio and logs, change its installer,
 print the exact QEMU command it runs, and zip its logs with the host's details into Downloads for a
 bug report.
 
 ```sh
 reims-ctl list                  # the VMs and whether they run
 reims-ctl set mac --memory 12G --resolution host   # applies at the next start
+reims-ctl set mac --cpus 8 --threads-per-core 2 --pin auto   # 4 SMT cores, pinned (Linux)
 reims-ctl command mac           # the QEMU command it runs, as a shell script
 reims-ctl report mac            # logs, settings and the host's details, zipped, for a bug report
 reims-ctl update                # pull the checkout and install again

@@ -297,6 +297,12 @@ pub struct SetArgs {
     /// RAM, such as 8G
     #[arg(long)]
     pub memory: Option<String>,
+    /// x86-64: threads per core the guest sees, 1 or 2 (8 vCPUs at 2 are 4 cores)
+    #[arg(long)]
+    pub threads_per_core: Option<u32>,
+    /// Linux: pin each vCPU to a host CPU at start: off, auto, or a list such as 2-5,8-11
+    #[arg(long)]
+    pub pin: Option<String>,
     #[arg(long)]
     pub displays: Option<u32>,
     /// WIDTHxHEIGHT, or host
@@ -719,7 +725,18 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
     );
     add("kind", c.profile.describe().into());
     add("directory", paths::tilde(&vm.dir));
-    add("cpus", c.cpus.to_string());
+    let mut cpus = c.cpus.to_string();
+    if c.cpu.threads_per_core > 1 {
+        cpus.push_str(&format!(
+            " ({} cores of {} threads)",
+            c.cpus / c.cpu.threads_per_core,
+            c.cpu.threads_per_core
+        ));
+    }
+    if c.cpu.pins() {
+        cpus.push_str(&format!(", pinned {}", c.cpu.pin));
+    }
+    add("cpus", cpus);
     add("memory", format_mib(c.memory_mib));
     // A disk in the VM's directory by its file name: the directory is the line above.
     let disk = vm.disk();
@@ -904,6 +921,12 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
     }
     if let Some(m) = &a.memory {
         c.memory_mib = parse_size_mib(m)?;
+    }
+    if let Some(t) = a.threads_per_core {
+        c.cpu.threads_per_core = t;
+    }
+    if let Some(p) = &a.pin {
+        c.cpu.pin = p.trim().to_owned();
     }
     if let Some(n) = a.displays {
         c.display.count = n;
