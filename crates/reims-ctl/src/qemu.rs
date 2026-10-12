@@ -130,9 +130,14 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         cpu.push_str(q.cpu_flags.trim());
     }
     push(&["-cpu", &cpu]);
+    let threads = c.cpu.threads_per_core.max(1);
     push(&[
         "-smp",
-        &format!("{0},sockets=1,cores={0},threads=1", c.cpus),
+        &format!(
+            "{},sockets=1,cores={},threads={threads}",
+            c.cpus,
+            c.cpus / threads
+        ),
     ]);
     push(&[
         "-global",
@@ -434,6 +439,7 @@ mod tests {
                 profile: Profile::Q35X86_64,
                 cpus: 6,
                 memory_mib: 12288,
+                cpu: Default::default(),
                 disk: "disk.qcow2".into(),
                 disk_format: ImageFormat::Qcow2,
                 stop_timeout_secs: 90,
@@ -521,6 +527,15 @@ mod tests {
         assert!(!a.iter().any(|x| x == "-usb"), "no EHCI");
         assert!(inv.unset.contains(&"REIMS_VGPU_WINDOW".to_string()));
         assert!(inv.unset.contains(&"REIMS_VGPU_LOG".to_string()));
+    }
+
+    #[test]
+    fn q35_gives_the_guest_smt_cores_where_asked() {
+        let mut vm = q35_vm();
+        vm.config.cpus = 8;
+        vm.config.cpu.threads_per_core = 2;
+        let inv = invocation(&vm, &ctx(linux())).unwrap();
+        assert!(has(&inv.args, &["-smp", "8,sockets=1,cores=4,threads=2"]));
     }
 
     #[test]

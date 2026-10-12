@@ -220,6 +220,7 @@ fn base_config(spec: &Spec, profile: Profile, disk: PathBuf, disk_format: ImageF
         profile,
         cpus: spec.cpus.unwrap_or_else(default_cpus),
         memory_mib: spec.memory_mib.unwrap_or_else(default_memory_mib),
+        cpu: Default::default(),
         disk,
         disk_format,
         stop_timeout_secs: 90,

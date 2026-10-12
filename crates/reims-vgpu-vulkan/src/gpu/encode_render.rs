@@ -1831,7 +1831,8 @@ impl Reach {
         let mut written: Vec<_> = (self.used_textures.iter())
             .map(|m| (Whether::Writes, m.clone()))
             .collect();
-        written.extend(self.at_slots(inherits, [false, false, inherits.is_none()]));
+        let buffers = [false, false, inherits.is_none()];
+        written.extend(self.at_slots(inherits, buffers, |_| true));
         written
     }
 
@@ -1843,14 +1844,16 @@ impl Reach {
     /// whose commands run no tile function and take the encoder's buffers only where they inherit
     /// them. `None` where it writes none.
     fn kept(&self, inherits: Option<Inherits>) -> Option<Whether> {
-        let used = (self.used_textures.iter()).chain(&self.used_buffers);
-        let mut written: Vec<_> = (used.filter(|m| m.kept.holds()))
-            .map(|_| Whether::Writes)
-            .collect();
+        let mut used = (self.used_textures.iter()).chain(&self.used_buffers);
+        if used.any(|m| m.kept.holds()) {
+            return Some(Whether::Writes);
+        }
+        // Only the objects over such memory are taken, so a draw that binds none clones none.
         let buffers = inherits.is_none_or(|i| i.buffers);
-        let slots = self.at_slots(inherits, [buffers, buffers, inherits.is_none()]);
-        written.extend((slots.into_iter()).filter_map(|(w, m)| m.kept.holds().then_some(w)));
-        written.into_iter().find(Whether::holds)
+        let slots = self.at_slots(inherits, [buffers, buffers, inherits.is_none()], |m| {
+            m.kept.holds()
+        });
+        slots.into_iter().map(|(w, _)| w).find(Whether::holds)
     }
 
     /// What a draw, or an execution whose commands take `inherits` of the encoder, may write at
@@ -1872,8 +1875,14 @@ impl Reach {
     /// texture to read, sample or write answers no state ("Fragment shader cannot be used with
     /// indirect command buffers"), with one taking buffers or an argument buffer of a texture a
     /// state; an execution that inherits a state made without it, of such a function, faults
-    /// its command buffer (`PageFault`), the texture bound unwritten.
-    fn at_slots(&self, inherits: Option<Inherits>, buffers: [bool; 3]) -> Vec<(Whether, Memory)> {
+    /// its command buffer (`PageFault`), the texture bound unwritten. Only the objects whose
+    /// memory `take` holds are taken.
+    fn at_slots(
+        &self,
+        inherits: Option<Inherits>,
+        buffers: [bool; 3],
+        take: impl Fn(&Memory) -> bool,
+    ) -> Vec<(Whether, Memory)> {
         let mut written = Vec::new();
         let state = match inherits {
             Some(i) if !i.pipeline => None,
@@ -1900,10 +1909,14 @@ impl Reach {
                 None => Whether::Writes,
             };
             for (&slot, m) in (self.buffers[stage].iter()).filter(|_| buffers[stage]) {
-                written.push((at(false, slot), m.clone()));
+                if take(m) {
+                    written.push((at(false, slot), m.clone()));
+                }
             }
             for (&slot, m) in (self.textures[stage].iter()).filter(|_| state.is_some()) {
-                written.push((at(true, slot), m.clone()));
+                if take(m) {
+                    written.push((at(true, slot), m.clone()));
+                }
             }
         }
         written
@@ -2405,8 +2418,19 @@ impl VulkanRenderEncoder {
                 Bind::Buffers(stage, first, memory) => reach.bind(stage, true, first, memory),
                 Bind::Textures(stage, first, memory) => reach.bind(stage, false, first, memory),
                 Bind::Used(textures, buffers, true) => {
-                    reach.used_textures.extend(textures);
-                    reach.used_buffers.extend(buffers);
+                    // Kept once each: what a draw reads of them is the same for a copy, and a
+                    // pass that makes the same objects resident before each draw would otherwise
+                    // have each draw scan them all again.
+                    for m in textures {
+                        if !reach.used_textures.contains(&m) {
+                            reach.used_textures.push(m);
+                        }
+                    }
+                    for m in buffers {
+                        if !reach.used_buffers.contains(&m) {
+                            reach.used_buffers.push(m);
+                        }
+                    }
                 }
                 Bind::Used(_, _, false) => {}
             }
