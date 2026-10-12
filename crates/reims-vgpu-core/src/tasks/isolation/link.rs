@@ -15,6 +15,7 @@
 //!   the same surface, as it reaches a process it is sent to ([`own_surface`]).
 
 use std::any::Any;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -66,7 +67,7 @@ pub(super) struct Connection<P: Platform> {
     life: Arc<TaskLife>,
     next_reply: AtomicU64,
     /// The host's `Reply`s the service has not answered; `None` once the connection is over.
-    pending: Mutex<Option<Vec<PendingReply>>>,
+    pending: Mutex<Option<VecDeque<PendingReply>>>,
     connection_queue: SerialQueue,
     link_queue: SerialQueue,
 }
@@ -87,7 +88,7 @@ impl<P: Platform> Connection<P> {
             }),
             life,
             next_reply: AtomicU64::new(0),
-            pending: Mutex::new(Some(Vec::new())),
+            pending: Mutex::new(Some(VecDeque::new())),
             connection_queue: SerialQueue::new(platform.threads(), "reims-vgpu.task-connection"),
             link_queue: SerialQueue::new(platform.threads(), "reims-vgpu.task-link"),
         });
@@ -184,8 +185,10 @@ impl<P: Platform> Connection<P> {
     fn take_pending(&self, id: u64) -> Option<Box<dyn Any + Send>> {
         let mut table = self.pending.lock();
         let t = table.as_mut()?;
+        // Replies mostly come in the order they were relayed, so the entry is mostly the first,
+        // which a deque takes without moving the rest.
         let at = t.iter().position(|(k, _)| *k == id)?;
-        Some(t.remove(at).1)
+        t.remove(at).map(|(_, r)| r)
     }
 
     /// Releases every pending `Reply` without running it, outside the table's lock (a release
@@ -226,7 +229,7 @@ impl<P: Platform> Connection<P> {
         let mut table = self.pending.lock();
         match table.as_mut() {
             Some(t) => {
-                t.push((id, Box::new(original)));
+                t.push_back((id, Box::new(original)));
                 true
             }
             None => {
