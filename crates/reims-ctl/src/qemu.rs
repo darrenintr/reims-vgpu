@@ -6,7 +6,9 @@
 //!   (`0` would keep apple-gfx headless), never a window of QEMU's own;
 //! - a QMP socket (`-qmp`), through which reims-ctl stops the VM and changes its CD;
 //! - QEMU's pid file;
-//! - user networking with virtio-net, and an optional SSH port forward;
+//! - user networking with virtio-net, and an optional SSH port forward; with networking off,
+//!   `-nic none`, without which QEMU gives the machine its default NIC on user networking (on
+//!   q35 an e1000e in the first free slot, 1, where the root port's address is);
 //! - a USB Audio Class device on the host's audio backend: x86-64 macOS 26 has no Intel HDA
 //!   driver, and Safari's Media Source players fail without an output device;
 //! - with logs on: the library's log (`REIMS_VGPU_LOG`), the serial console, timestamps.
@@ -334,6 +336,9 @@ fn audiodev(vm: &Vm, ctx: &Ctx) -> String {
 fn common(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     let c = &vm.config;
     let mut push = |xs: &[&str]| a.extend(xs.iter().map(|s| s.to_string()));
+    if !c.network.enabled {
+        push(&["-nic", "none"]);
+    }
     push(&["-display", "none"]);
     if c.logs.enabled {
         push(&["-serial", &format!("file:{}", vm.serial_log().display())]);
@@ -542,6 +547,26 @@ mod tests {
         vm.config.cpu.threads_per_core = 2;
         let inv = invocation(&vm, &ctx(linux())).unwrap();
         assert!(has(&inv.args, &["-smp", "8,sockets=1,cores=4,threads=2"]));
+    }
+
+    #[test]
+    fn network_off_gives_the_machine_no_nic() {
+        let mut q35 = q35_vm();
+        q35.config.network.enabled = false;
+        let mut vmapple = q35.clone();
+        vmapple.config.profile = Profile::VmappleArm64;
+        vmapple.config.q35 = None;
+        vmapple.config.vmapple = Some(Vmapple {
+            aux: "aux.img".into(),
+            ecid: 1234,
+        });
+        for (vm, host) in [(&q35, linux()), (&vmapple, mac())] {
+            let a = invocation(vm, &ctx(host)).unwrap().args;
+            assert!(has(&a, &["-nic", "none"]), "{a:?}");
+            assert!(!a.iter().any(|x| x == "-netdev" || x.contains("net-pci")));
+        }
+        let a = invocation(&q35_vm(), &ctx(linux())).unwrap().args;
+        assert!(!a.iter().any(|x| x == "-nic"));
     }
 
     #[test]
