@@ -366,8 +366,7 @@ def _held_pipeline(what):
                     C.set_pipeline(pso) + C.set_buffers(0, [(out, off)]) + C.dispatch_threads((16, 1, 1), (16, 1, 1)))]
 
     t.run(dispatch(0), resources=[(out, 0)], label="double_gid")
-    need = 256 if what == "function_retyped" else 1
-    st = g.hold(dispatch(0x40), [(out, 0)], "double_gid again", need=need)
+    st = g.hold(dispatch(0x40), [(out, 0)], "double_gid again")
     if what == "deleted":
         g.work(*delete_object(1, 1006, pso), label="40, operation 1006: the pipeline")
     elif what == "function_deleted":
@@ -379,10 +378,6 @@ def _held_pipeline(what):
         g.work(*delete_object(1, 1005, fn), label="40, operation 1005: its function")
         g.work(*delete_object(1, 1006, pso), label="40, operation 1006: the pipeline")
         rewrite_entry(t, fn, 0, va=0, length=0)
-        t.dump(ova, 0x80, "the first dispatch")
-        g.release_last(need, "released: the host dies in-process, the service under isolation")
-        s.events("end")
-        return s
     g.release(st, "released")
     t.dump(ova, 0x80, "the first dispatch, and the held one")
     s.events("end")
@@ -398,13 +393,86 @@ def interplay_lifetime_held_pipeline():
     pipeline live, which changes nothing; the pipeline with its entry then
     retyped 0, so the release faults ("Failed to create
     ComputePipelineState"); and both, with the function's entry retyped 0:
-    making the pipeline again resolves its function to nil, which Metal
-    aborts on (docs/testing.md, section 7.4): the host dies at the release
-    in every setup, an isolated task's included, since the abort is inside
-    Metal. The death is the scenario's end: its exec waits for 256 NOPs on
-    the gate, rung at once, so it lands in the wait for the fault every
-    run."""
+    making the pipeline again looks its function up from the empty entry,
+    which raises the function lookup's failure, so the release faults
+    ("function lookup failed") in every setup, where a nil function would
+    have Metal abort (docs/testing.md, section 7.4)."""
     return [_held_pipeline(w) for w in ("deleted", "function_deleted", "retyped", "function_retyped")]
+
+
+@scenario
+def interplay_lifetime_emptied_resource():
+    """A buffer whose entry the guest has emptied (type 0, offset all ones),
+    as a guest empties a task's entries when the process that owns it ends,
+    named by the compute lists that look resources up untyped, each before a
+    dispatch of the pipeline a first dispatch made: UseResources (0x87) and
+    MemoryBarrierWithResources (0xd6) in a serial encoder take it as nil,
+    which Metal skips, and their dispatches run; UseResources in a concurrent
+    encoder (0xdb 1), where Metal ends the process at a nil entry
+    (interplay_decodewalk_26), raises instead ("resource lookup failed"), and
+    the exec faults before its dispatch, in every setup. The buffer is never
+    listed, so the exec's own resource list does not fault first."""
+    from pgtest.diff_util import K_DOUBLE
+    s = Scenario("interplay_lifetime_emptied_resource", doc=interplay_lifetime_emptied_resource.__doc__)
+    s.bring_up()
+    t = Lab(s)
+    pso = t.kernel(K_DOUBLE)
+    out, ova = t.shared()
+    gone, _ = t.shared(listed=False)
+    t.ready()
+
+    def dispatch(off, records=b"", concurrent=False):
+        prefix = C.dispatch_type(1) if concurrent else b""
+        return [seg(abi.ENC_COMPUTE, prefix + C.set_pipeline(pso) + C.set_buffers(0, [(out, off)]) + records
+                    + C.dispatch_threads((16, 1, 1), (16, 1, 1)))]
+
+    t.run(dispatch(0), label="double_gid")
+    rewrite_entry(t, gone, 0, va=u64_max(), length=0)
+    t.run(dispatch(0x40, C.use_resources([out, gone])), label="0x87 [out, emptied], serial")
+    t.run(dispatch(0x80, C.barrier_resources([gone])), label="0xd6 [emptied], serial")
+    t.run(dispatch(0xc0, C.use_resources([out, gone]), concurrent=True), fault=True,
+          label="0x87 [out, emptied], concurrent")
+    t.dump(ova, 0x100, "three dispatches of four")
+    s.events("end")
+    return s
+
+
+@scenario
+def interplay_lifetime_emptied_resource_render():
+    """A buffer whose entry the guest has emptied (type 0, offset all ones),
+    as a guest empties a task's entries when the process that owns it ends,
+    named before a triangle by the render lists that look resources up
+    untyped, UseResources (0x87) and UseResourcesWithStages (0x89): nil to
+    each, which Metal skips, and the triangle draws as without it, in every
+    setup. So does a ref past the object list, nil to 0x89 (measured: Metal
+    skips a nil entry of useResources:count:usage:stages: as it does one of
+    useResources:count:usage:). The buffer is never listed, so the exec's own
+    resource list does not fault first."""
+    from scenarios.render_state import TRI, StateTask, case
+    from pgtest import render_lib as R
+    s = Scenario("interplay_lifetime_emptied_resource_render",
+                 doc=interplay_lifetime_emptied_resource_render.__doc__)
+    s.bring_up()
+    st = StateTask(s)
+    gone, _ = st.t.buffer()
+    st.t.bufs.remove(gone)
+    st.start()
+    p = R.pipeline_state
+    tri = [p(st.p_vbuf), st.vb(), R.draw16(TRI, 0, 3)]
+    case(s, st, "the triangle", tri)
+    rewrite_entry(st.t, gone, 0, va=u64_max(), length=0)
+    case(s, st, "0x87 [pos, emptied], then the triangle", [R.use_resources([st.pos, gone], 1)] + tri)
+    case(s, st, "0x89 [pos, emptied], then the triangle", [R.use_resources_stages([st.pos, gone], 1, 1)] + tri)
+    past = st.t.ol.length() // 12
+    case(s, st, "0x89 [pos, past the list], then the triangle",
+         [R.use_resources_stages([st.pos, past], 1, 1)] + tri)
+    st.t.delete()
+    s.events("end")
+    return s
+
+
+def u64_max():
+    return (1 << 64) - 1
 
 
 @scenario
