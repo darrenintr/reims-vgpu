@@ -801,6 +801,22 @@ an RTX 5080 Laptop GPU host with a macOS 26.6.1 guest on 2026-10-11:
 - With `usb-audio` the guest lists "QEMU" as its default output, and the
   same YouTube video plays.
 
+### x86-64 macOS guests: no sleep
+
+A q35 guest is offered no S3 (`-global ICH9-LPC.disable_s3=1`, which
+`reims-ctl` passes). q35's wakeup resets every device, and `apple-gfx-pci`'s
+reset is the library's (`rvg_device_reset`): every task, display and FIFO the
+guest's driver made is gone, and macOS's driver does not make them again.
+Measured with the macOS 26 guest on the Ryzen 5 3600 host (2026-10-13): left
+idle, it entered S3 after 615 s; after `system_wakeup` and input, QEMU ran,
+the library logged `device reset` and `guest display on port 0 destroyed`, and
+the guest presented nothing again (a black window); a second boot, idle at the
+login window, entered S3 after 602 s and woke the same way. With S3 disabled,
+the same guest at the same window had not suspended after 783 s, and went on
+presenting at the screen's rate. Keeping the device across a wakeup would need
+`apple-gfx-pci` to skip its reset for `RESET_TYPE_WAKEUP`, or to suspend and
+resume it through the library's API (`apple-gfx.c`'s TODO).
+
 ### x86-64 macOS guests: installers and recovery
 
 A macOS installer or recovery image boots to its Recovery UI on

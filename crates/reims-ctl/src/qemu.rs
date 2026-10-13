@@ -143,6 +143,11 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         "-global",
         "ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off",
     ]);
+    // No S3 for the guest: q35's wakeup resets every device, apple-gfx-pci's reset is the
+    // library's device reset, and macOS's driver never sets the device up again, so a guest that
+    // slept on its idle timer woke to a black screen for good (macOS 26, 2026-10-13: "device
+    // reset", then no present). Without S3 the guest's display sleeps instead.
+    push(&["-global", "ICH9-LPC.disable_s3=1"]);
     push(&[
         "-device",
         "pcie-root-port,bus=pcie.0,addr=0x1,slot=1,x-speed=16,x-width=32",
@@ -495,6 +500,7 @@ mod tests {
             ],
             &["-accel", "kvm", "-m", "12288M"],
             &["-smp", "6,sockets=1,cores=6,threads=1"],
+            &["-global", "ICH9-LPC.disable_s3=1"],
             &["-device", &format!("isa-applesmc,osk={OSK}")],
             &[
                 "-drive",
