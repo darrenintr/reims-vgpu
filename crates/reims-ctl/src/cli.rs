@@ -300,7 +300,8 @@ pub struct SetArgs {
     /// x86-64: threads per core the guest sees, 1 or 2 (8 vCPUs at 2 are 4 cores)
     #[arg(long)]
     pub threads_per_core: Option<u32>,
-    /// Linux: pin each vCPU to a host CPU at start: off, auto, or a list such as 2-5,8-11
+    /// Linux: pin each vCPU to a host CPU at start: off, auto (the default), or a list such as
+    /// 2-5,8-11
     #[arg(long)]
     pub pin: Option<String>,
     #[arg(long)]

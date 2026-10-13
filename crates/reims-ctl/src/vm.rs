@@ -94,15 +94,24 @@ pub struct Cpu {
     pub threads_per_core: u32,
     /// Where `start` pins each vCPU's thread on a Linux host: `off`, `auto` (whole host cores
     /// from the last, leaving the first ones to QEMU's other threads and the host), or a list of
-    /// host CPUs such as `2-5,8-11`, one per vCPU (crate::pin).
+    /// host CPUs such as `2-5,8-11`, one per vCPU (crate::pin). [`DEFAULT_PIN`] where `vm.toml`
+    /// names none.
     pub pin: String,
 }
+
+/// The pin of a VM whose `vm.toml` names none: `auto` on Linux, where unpinned vCPUs freeze the
+/// guest while the host is busy (crate::pin), and `off` on macOS, where nothing pins.
+pub const DEFAULT_PIN: &str = if cfg!(target_os = "linux") {
+    "auto"
+} else {
+    "off"
+};
 
 impl Default for Cpu {
     fn default() -> Cpu {
         Cpu {
             threads_per_core: 1,
-            pin: "off".into(),
+            pin: DEFAULT_PIN.into(),
         }
     }
 }
@@ -712,6 +721,20 @@ mod tests {
         for bad in ["", "-a", ".a", "a b", "a/b", &"x".repeat(65)] {
             assert!(check_name(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn pin_defaults_to_auto_on_linux_and_stays_off_when_named() {
+        let toml = "name = \"t\"\nprofile = \"q35-x86_64\"\ncpus = 8\nmemory_mib = 8192\n\
+                    disk = \"disk.qcow2\"\n";
+        let c: VmConfig = toml::from_str(toml).unwrap();
+        assert_eq!(c.cpu.pin, DEFAULT_PIN);
+        assert_eq!(c.cpu.pins(), cfg!(target_os = "linux"));
+        let mut off = c.clone();
+        off.cpu.pin = "off".into();
+        let text = toml::to_string_pretty(&off).unwrap();
+        assert_eq!(text.contains("pin = \"off\""), cfg!(target_os = "linux"));
+        assert_eq!(toml::from_str::<VmConfig>(&text).unwrap().cpu.pin, "off");
     }
 
     #[test]

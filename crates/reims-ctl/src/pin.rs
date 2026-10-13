@@ -15,6 +15,13 @@
 //! first thread of a core of its own while there are cores, then the second threads.
 //!
 //! A VM started from a script `reims-ctl command` printed is not pinned.
+//!
+//! **`auto` is the default on Linux** (`vm::DEFAULT_PIN`). Measured on a Ryzen 5 3600 with an
+//! RX 7600 (RADV, Linux 7.3) and an 8-vCPU macOS 26 guest at 100 Hz, while a 12-job release
+//! build ran on the host, the vCPUs alternately unpinned and pinned in one boot, two rounds each
+//! (2026-10-13): unpinned, the guest presented 4 to 46 frames a second, with stalls of 420 to
+//! 870 ms several times a run; pinned, 27 to 39, none longer than 252 ms. With the host idle both
+//! present at the screen's rate. A VM that names `pin = "off"` keeps it.
 
 use crate::qmp;
 use anyhow::{Context, Result, bail};

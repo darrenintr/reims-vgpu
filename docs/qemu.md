@@ -495,15 +495,16 @@ reims-ctl set mac --gpu "AMD Radeon RX 7600"   # a name or number from reims-ctl
 ```
 
 - **`--threads-per-core 2`** gives the guest `-smp 8,sockets=1,cores=4,threads=2`.
-- **`--pin auto`** has `start` pin each vCPU's thread, once QMP answers, to one
-  host CPU (`crates/reims-ctl/src/pin.rs`). The CPUs are whole host cores from
-  the last, both threads of each, with each guest core on one host core: on the
-  3600, vCPUs 0 to 7 go to CPUs 2, 8, 3, 9, 4, 10, 5 and 11. Cores 0 and 1 stay
-  free for QEMU's other threads: the library's FIFO, display and window threads,
-  and Mesa's. `auto` refuses to take every core. A list such as `2-5,8-11`
-  names the CPUs itself, one per vCPU. QEMU's log says what was pinned, or why
-  nothing was. A VM started from a script that `reims-ctl command` printed is
-  not pinned.
+- **`--pin auto`**, the default on Linux, has `start` pin each vCPU's thread,
+  once QMP answers, to one host CPU (`crates/reims-ctl/src/pin.rs`). A VM
+  whose `vm.toml` names no pin takes it; `--pin off` keeps vCPUs unpinned. The
+  CPUs are whole host cores from the last, both threads of each, with each
+  guest core on one host core: on the 3600, vCPUs 0 to 7 go to CPUs 2, 8, 3,
+  9, 4, 10, 5 and 11. Cores 0 and 1 stay free for QEMU's other threads: the
+  library's FIFO, display and window threads, and Mesa's. `auto` refuses to
+  take every core. A list such as `2-5,8-11` names the CPUs itself, one per
+  vCPU. QEMU's log says what was pinned, or why nothing was. A VM started from
+  a script that `reims-ctl command` printed is not pinned.
 - **`--refresh 120`** offers the guest 120 Hz modes (`REIMS_VGPU_WINDOW_REFRESH`).
   The guest's frames complete when the GPU does, not at the host screen's
   vsync (`crates/reims-vgpu-vulkan/src/swapchain.rs`). So the guest runs at
@@ -520,8 +521,28 @@ imports past the limits, and 5,095 of 5,119 took one chunk anyway. RADV also
 has one graphics queue, so the window's presents share it with the guest's
 work (`shared-present-queue`).
 
-Not measured: none of this has been timed on a 3600 and RX 7600 host, and no
-setting here has been shown to hold 120 frames a second. To see where frames
+Measured on a Ryzen 5 3600 with an RX 7600 (RADV, Linux 7.3), the macOS 26
+guest at 8 vCPUs and 8 GiB on a 1920x1080 window whose screen runs at 100 Hz
+(2026-10-13):
+- **Idle host**: the guest presents at the screen's rate (a text caret's
+  animation came at 100 a second), the window's GPU time is about 2.4 ms, and
+  the exec queue completes about 1,700 command buffers a second, 0.3 ms from
+  commit to handler at the median and under 3 ms at the 95th percentile.
+  Pointer motion changes none of it.
+- **Busy host** (a 12-job release build): unpinned, the guest fell to 2 to 46
+  presents a second, with stalls of 0.4 to 1.6 s several times a run, and
+  commit to handler reached 5 to 16 ms at the median. With the vCPUs pinned as
+  `auto` pins them, alternated with unpinned in one boot, two rounds each: 27
+  to 39 a second, no stall longer than 252 ms. Unpinned under the build, as at
+  idle, the FIFO threads spent 86% of their samples waiting for the guest's
+  bytes: what the build slows is the guest, not the library.
+- **What does not help**: the build at nice 19 (the guest still fell to 14 to
+  43 a second), and the library's threads at nice -10 through rtkit (5 to 42).
+  QEMU alone on one CCX (CPUs 3-5 and 9-11) with the build on the other held 74
+  to 78 a second; with QEMU on one CCX and the build anywhere, the stalls came
+  back. Cores and caches shared with the build cost the guest, not CPU time.
+
+No setting here has been shown to hold 120 frames a second. To see where frames
 go, set `REIMS_VGPU_STATS=1` (`reims-ctl set mac --env REIMS_VGPU_STATS=1`).
 Each second, QEMU's log then gets a line per display: the guest's presents per
 second and the longest gap between two, and the window's draws and their GPU
