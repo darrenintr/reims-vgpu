@@ -537,7 +537,9 @@ guest at 8 vCPUs and 8 GiB on a 1920x1080 window whose screen runs at 100 Hz
   idle, the FIFO threads spent 86% of their samples waiting for the guest's
   bytes: what the build slows is the guest, not the library.
 - **What does not help**: the build at nice 19 (the guest still fell to 14 to
-  43 a second), and the library's threads at nice -10 through rtkit (5 to 42).
+  43 a second), the library's threads at nice -10 through rtkit (5 to 42),
+  and 4 vCPUs pinned to two cores in place of 8 pinned to four (22 to 42,
+  against 28 to 43, at the login window).
   QEMU alone on one CCX (CPUs 3-5 and 9-11) with the build on the other held 74
   to 78 a second; with QEMU on one CCX and the build anywhere, the stalls came
   back. Cores and caches shared with the build cost the guest, not CPU time.
