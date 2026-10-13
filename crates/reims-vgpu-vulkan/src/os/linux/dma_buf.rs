@@ -38,13 +38,25 @@
 //! Pieces of the block of zeros read-only aliases share ([`super::import::allocate_zeros`]) are
 //! made of a file of zeros of the import's own instead, as an import's twin maps private zeros
 //! there: the GPU's writes stay in it and never reach the block.
+//!
+//! **One dma-buf for the same pages** ([`Leases`]). A chunk of exactly the runs of file pages a
+//! dma-buf already made is of (the same files, offsets and lengths, in order), while some source
+//! still holds that dma-buf, is answered with that dma-buf again (a new descriptor of it) rather
+//! than a new one: the runtime then imports it once for every buffer over those pages
+//! (metal2vulkan's shared imports), where each import would add its cost to every submission
+//! above, and udmabuf pins the pages once. A source holds each dma-buf it was answered with until
+//! the runtime drops the source, which it does once every import of the source's went; the last
+//! holder to go lets the dma-buf go. The pages are the same either way: a file page a dma-buf
+//! pins stays what both show, as no file of the library's has pages dropped while it is mapped.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::{Arc, OnceLock};
 
 use metal2vulkan_runtime::DmaBufChunk;
+use reims_vgpu_core::sync::Mutex;
 
 use super::files::{self, Backing};
 use super::vm;
@@ -143,6 +155,59 @@ fn device() -> Result<&'static OwnedFd, Refusal> {
     opened.as_ref().map_err(|e| Refusal::Device(Arc::clone(e)))
 }
 
+/// What a dma-buf is of ([`MADE`]): each run of its pages, as its file's identity (the address of
+/// the backing table's shared descriptor, which [`Made::_files`] keeps alive, so no other file
+/// takes it), offset and length, in order.
+type Pages = Vec<(usize, u64, u64)>;
+
+/// A dma-buf some source holds ([`Leases`]), by the pages it is of.
+struct Made {
+    /// A descriptor of the dma-buf, from which each source answered with it gets its own.
+    fd: OwnedFd,
+    /// The files of its runs, kept so their identities stay theirs.
+    _files: Vec<Arc<OwnedFd>>,
+    /// The sources holding it.
+    holders: usize,
+}
+
+/// Every dma-buf some source holds, by the pages it is of (module docs).
+static MADE: Mutex<BTreeMap<Pages, Made>> = Mutex::new(BTreeMap::new());
+
+/// The dma-bufs one source was answered with, which it holds until it drops (module docs): each
+/// [`MADE`] entry's holder count falls with it, and an entry no source holds any more goes, its
+/// descriptor closed.
+#[derive(Default)]
+pub(crate) struct Leases(Vec<Pages>);
+
+impl Drop for Leases {
+    fn drop(&mut self) {
+        let mut made = MADE.lock();
+        for pages in self.0.drain(..) {
+            let Some(entry) = made.get_mut(&pages) else {
+                continue;
+            };
+            entry.holders -= 1;
+            if entry.holders == 0 {
+                made.remove(&pages);
+            }
+        }
+    }
+}
+
+impl Leases {
+    /// Move `other`'s dma-bufs into these, held as long as these are.
+    pub(crate) fn extend(&mut self, mut other: Leases) {
+        self.0.append(&mut other.0);
+    }
+}
+
+/// The pages a chunk of `runs` is of ([`Pages`]).
+fn pages_of(runs: &[Run<Arc<OwnedFd>>]) -> Pages {
+    (runs.iter())
+        .map(|r| (Arc::as_ptr(&r.file).addr(), r.offset, r.length))
+        .collect()
+}
+
 /// A run of file pages: `length` bytes of `file` from `offset`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Run<F> {
@@ -229,8 +294,14 @@ fn padded<F: Clone>(
 /// Dma-bufs of the `length` bytes from `first`, whole pages, each resolved through the backing
 /// table, which in order are those bytes: one piece for each run of a file's pages that follow on,
 /// the block of zeros' pieces from a file of zeros of the import's own, cut into chunks within
-/// udmabuf's limits at multiples of `granule` from `first` (module docs).
-pub(crate) fn of_pages(first: u64, length: u64, granule: u64) -> Result<Vec<DmaBufChunk>, Refusal> {
+/// udmabuf's limits at multiples of `granule` from `first` (module docs). A chunk of the same pages
+/// as a dma-buf some source holds is that dma-buf again; `leases` holds each one answered.
+pub(crate) fn of_pages(
+    first: u64,
+    length: u64,
+    granule: u64,
+    leases: &mut Leases,
+) -> Result<Vec<DmaBufChunk>, Refusal> {
     let page = vm::page_size();
     debug_assert!(first.is_multiple_of(page) && length.is_multiple_of(page));
     let resolved = files::pieces(first, length).ok_or(Refusal::Unresolved)?;
@@ -282,14 +353,59 @@ pub(crate) fn of_pages(first: u64, length: u64, granule: u64) -> Result<Vec<DmaB
         length: pad,
     };
     let cut = padded(&mut runs, granule, limits, pad).ok_or_else(|| refused(&runs))?;
+    let mut answered = Leases::default();
     let made = cut.iter().map(|chunk| {
-        let fd = create(device, chunk)?;
+        let fd = held(device, chunk, &mut answered)?;
         Ok(DmaBufChunk {
             fd,
             length: chunk.iter().map(|r| r.length).sum(),
         })
     });
-    made.collect()
+    let made = made.collect::<Result<Vec<_>, Refusal>>()?;
+    leases.extend(answered);
+    Ok(made)
+}
+
+/// A descriptor of a dma-buf of `runs`: of the one some source holds for those pages ([`MADE`]),
+/// else of a new one, kept there; `leases` holds it either way (module docs).
+fn held(
+    device: &OwnedFd,
+    runs: &[Run<Arc<OwnedFd>>],
+    leases: &mut Leases,
+) -> Result<OwnedFd, Refusal> {
+    let pages = pages_of(runs);
+    let mut made = MADE.lock();
+    if let Some(entry) = made.get_mut(&pages) {
+        let fd = (entry.fd.as_fd())
+            .try_clone_to_owned()
+            .map_err(Refusal::Kernel)?;
+        entry.holders += 1;
+        leases.0.push(pages);
+        return Ok(fd);
+    }
+    // udmabuf pins the pages inside the call, which other threads' chunks wait behind; a chunk of
+    // other pages made meanwhile is a dma-buf of its own either way.
+    drop(made);
+    let fd = create(device, runs)?;
+    let kept = fd.as_fd().try_clone_to_owned().map_err(Refusal::Kernel)?;
+    let mut made = MADE.lock();
+    match made.get_mut(&pages) {
+        // Another thread made one of the same pages meanwhile: both stay, this one held by its
+        // own source alone.
+        Some(_) => return Ok(fd),
+        None => {
+            made.insert(
+                pages.clone(),
+                Made {
+                    fd: kept,
+                    _files: runs.iter().map(|r| Arc::clone(&r.file)).collect(),
+                    holders: 1,
+                },
+            );
+        }
+    }
+    leases.0.push(pages);
+    Ok(fd)
 }
 
 /// One dma-buf of `runs`, in order (`UDMABUF_CREATE_LIST`).
@@ -498,7 +614,7 @@ mod tests {
                     .write_volatile(0x10 + i as u8)
             };
         }
-        let chunks = of_pages(at + page, 2 * page, page).unwrap();
+        let chunks = of_pages(at + page, 2 * page, page, &mut Leases::default()).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].length, 2 * page);
         assert_eq!(read_through(&chunks[0], 0), 0x11);
@@ -512,9 +628,76 @@ mod tests {
         );
         let private = vm::anonymous(None, page, "a test's private page").unwrap();
         assert!(matches!(
-            of_pages(private, page, page),
+            of_pages(private, page, page, &mut Leases::default()),
             Err(Refusal::Unresolved)
         ));
+    }
+
+    /// A source's leases hold each dma-buf it was answered with: one held by two sources goes
+    /// once both let it go, and the entries of others stay
+    #[test]
+    fn a_dma_buf_goes_once_every_source_holding_it_went() {
+        let file = vm::memfd(vm::page_size());
+        let pages: Pages = vec![(Arc::as_ptr(&file).addr(), 0, vm::page_size())];
+        let other: Pages = vec![(Arc::as_ptr(&file).addr(), 0, 2 * vm::page_size())];
+        for key in [&pages, &other] {
+            MADE.lock().insert(
+                key.clone(),
+                Made {
+                    fd: file.as_fd().try_clone_to_owned().unwrap(),
+                    _files: vec![Arc::clone(&file)],
+                    holders: 0,
+                },
+            );
+        }
+        let lease = || {
+            MADE.lock().get_mut(&pages).unwrap().holders += 1;
+            Leases(vec![pages.clone()])
+        };
+        let (first, mut second) = (lease(), lease());
+        second.extend(Leases::default());
+        drop(first);
+        assert!(
+            MADE.lock().contains_key(&pages),
+            "the second source holds it"
+        );
+        drop(second);
+        assert!(!MADE.lock().contains_key(&pages));
+        assert!(MADE.lock().contains_key(&other), "another dma-buf stays");
+        MADE.lock().remove(&other);
+    }
+
+    /// Two windows of the same pages, while a source holds the first's dma-buf, are answered with
+    /// that dma-buf again; once no source holds it, a window of them is a dma-buf of its own
+    #[test]
+    fn the_same_pages_are_one_dma_buf_while_a_source_holds_it() {
+        if !udmabuf() {
+            return;
+        }
+        let identity = |chunk: &DmaBufChunk| {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: an open descriptor; `fstat` writes the structure.
+            assert_eq!(
+                unsafe { libc::fstat(chunk.fd.as_raw_fd(), stat.as_mut_ptr()) },
+                0
+            );
+            // SAFETY: written above.
+            let stat = unsafe { stat.assume_init() };
+            (stat.st_dev, stat.st_ino)
+        };
+        let page = vm::page_size();
+        let at = vm::allocate_aliasable(2 * page).unwrap().addr().to_u64();
+        let mut first = Leases::default();
+        let a = of_pages(at, 2 * page, 2 * page, &mut first).unwrap();
+        let mut second = Leases::default();
+        let b = of_pages(at, 2 * page, 2 * page, &mut second).unwrap();
+        assert_eq!(identity(&a[0]), identity(&b[0]));
+        let mut third = Leases::default();
+        let part = of_pages(at, page, page, &mut third).unwrap();
+        assert_ne!(identity(&a[0]), identity(&part[0]), "other pages");
+        drop((first, second, third));
+        let c = of_pages(at, 2 * page, 2 * page, &mut Leases::default()).unwrap();
+        assert_ne!(identity(&a[0]), identity(&c[0]));
     }
 
     /// A view of more scattered pages than one dma-buf may hold is made of several, in order,
@@ -542,7 +725,13 @@ mod tests {
             );
             assert!(host.remap_shared_overwrite(to, from, page).is_ok());
         }
-        let chunks = of_pages(view.addr().to_u64(), count * page, page).unwrap();
+        let chunks = of_pages(
+            view.addr().to_u64(),
+            count * page,
+            page,
+            &mut Leases::default(),
+        )
+        .unwrap();
         assert!(chunks.len() >= 2);
         assert_eq!(chunks.iter().map(|c| c.length).sum::<u64>(), count * page);
         let mut at = 0;

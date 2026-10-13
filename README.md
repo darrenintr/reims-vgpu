@@ -41,8 +41,9 @@ It installs what the build needs (Homebrew on macOS; apt on Ubuntu and Debian, p
 CachyOS; Rust through rustup.rs), fetches `vendor/qemu`, builds the library and QEMU on it, installs
 QEMU into `~/.local/share/reims-ctl/qemu`, and `reims-ctl` into `~/.cargo/bin`. `vendor/qemu` is
 fetched from its public repository (`steelbrain/qemu-reims-vgpu`), at the commit this checkout
-pins, and Cargo fetches metal2vulkan from its public repository, at the commit the workspace's
-`Cargo.toml` names. `reims-ctl doctor` checks the host and the install.
+pins, and Cargo fetches metal2vulkan from its public repository (`darrenintr/metal2vulkan`, a
+fork of `steelbrain/metal2vulkan` that carries the RDNA3 path, [docs/qemu.md](docs/qemu.md)), at
+the commit the workspace's `Cargo.toml` names. `reims-ctl doctor` checks the host and the install.
 
 ### x86-64 guest on Linux (KVM)
 

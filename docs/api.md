@@ -233,6 +233,7 @@ Everything a host can set that shapes what the guest is offered or what the libr
 - **A mode's flags**: `RVG_DISPLAY_MODE_EDR` and `RVG_DISPLAY_MODE_10BPC` (the Rust API's `supports_edr`, `supports_10bpc`).
 - **Preferences**, in the Rust API only: `DisplayConfig::apply_preferences` takes the display's nits, and `DisplayMode::with_preferences` a mode's EDR and 10 bpc, from a `Preferences` reader the host gives. The library reads no preferences domain itself: `singleton::preferences()` answers every key absent.
 - **A display's window**: `RvgDisplayConfig.window` (above).
+- **The Vulkan platform on an RDNA3 GPU** (feature `vulkan`): an AMD discrete RDNA3 GPU (the Radeon RX 7600 and every other Navi 31, 32 and 33 GPU) on RADV from Mesa 26.2.4 reads its driver facts and defects as the Radeon 780M at Mesa 26.2.4, the GPU of the same driver and generation the runtime measured (the runtime's `DeviceOptions::rdna3_stand_in`). Without it such a GPU is an identity the runtime has not measured, which takes the exact path in place of each answer RADV is measured to give. With it the GPU itself does the work: BC1 to BC3 textures are sampled from their blocks, with no decoded twin to decode the guest's CPU writes into on the CPU; an indexed indirect draw is one draw bounded by the device's range, with no compute pre-pass; a mipmap chain reads its first level in place; generated commands are preprocessed by the driver. The runtime logs the stand-in once per device (`metal2vulkan-facts-stand-in`). None of it is measured on the GPU itself: `REIMS_VGPU_RDNA3=0` turns it off, and a difference it makes from Metal's answer is a finding to report with the GPU and Mesa release.
 - **Cargo features**, for a host that builds the library: `vulkan` (`reims-vgpu`, `reims-vgpu-c`) puts the API on the Vulkan platform, and `macos-sdl` (on by default) builds SDL3's window into the macOS library ([development.md](development.md), "Features").
 - **The environment.** The library reads these once per process; an unset or unparsable value is the default.
 
@@ -244,9 +245,10 @@ Everything a host can set that shapes what the guest is offered or what the libr
   | `REIMS_VGPU_WINDOW_IMPL` | macOS: `sdl` opens SDL3's window in place of AppKit's, in a build with `macos-sdl` |
   | `REIMS_VGPU_STRICT` | the Vulkan platform: `1` ends the process at each difference from Metal's answer it would otherwise log |
   | `REIMS_VGPU_EXACT` | the Vulkan platform: the runtime's exact forms in place of its fast ones, by field ("The Vulkan platform's exact forms", above) |
+  | `REIMS_VGPU_RDNA3` | the Vulkan platform: `0`, `false`, `no` or `off` keeps an AMD RDNA3 GPU (the Radeon RX 7600 among them) on RADV from its own identity, not the measured Radeon 780M's ("The Vulkan platform on an RDNA3 GPU", above) |
   | `REIMS_VGPU_CENSUS_DIR` | the Vulkan platform on Linux, a diagnostic for inventory runs: each difference that would end the process is recorded in that directory and logged instead, and the run says it is not faithful to Metal; ignored on macOS |
 
-  `REIMS_VGPU_WINDOW` is QEMU's, not the library's: `0` keeps `apple-gfx` headless under `-display none` (docs/qemu.md, "Window mode"). Of these, only `REIMS_VGPU_STRICT`, `REIMS_VGPU_EXACT` and `REIMS_VGPU_CENSUS_DIR` change what the guest or host observes, and only on the Vulkan platform; `REIMS_VGPU_WINDOW_SCREENS` and `_REFRESH` change the modes a window display with `RVG_WINDOW_MATCH_HOST_SCREEN` offers its guest.
+  `REIMS_VGPU_WINDOW` is QEMU's, not the library's: `0` keeps `apple-gfx` headless under `-display none` (docs/qemu.md, "Window mode"). Of these, only `REIMS_VGPU_STRICT`, `REIMS_VGPU_EXACT`, `REIMS_VGPU_RDNA3` and `REIMS_VGPU_CENSUS_DIR` change what the guest or host observes, and only on the Vulkan platform; `REIMS_VGPU_WINDOW_SCREENS` and `_REFRESH` change the modes a window display with `RVG_WINDOW_MATCH_HOST_SCREEN` offers its guest.
 
 ### cbindgen
 
