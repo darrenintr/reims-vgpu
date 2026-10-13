@@ -12,7 +12,10 @@
 //! The CPUs are ordered by host core, each core's threads together ([`order`]): with
 //! `threads_per_core = 2` guest core `k` (vCPUs `2k` and `2k + 1`) runs on the two threads of one
 //! host core, as the guest's scheduler expects of SMT siblings; with 1, each vCPU takes the
-//! first thread of a core of its own while there are cores, then the second threads.
+//! first thread of a core of its own if that leaves at least one whole core for the host.
+//! Larger guests keep the compact allocation, using SMT threads to leave host cores free.
+//! On a 6-core, 12-thread host, a 4-vCPU guest with 1 thread per core therefore uses four
+//! physical cores rather than sharing two cores' execution resources.
 //!
 //! A VM started from a script `reims-ctl command` printed is not pinned.
 //!
@@ -32,7 +35,8 @@ use std::path::Path;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Pin {
     Off,
-    /// Whole host cores from the last, enough for every vCPU, leaving at least one.
+    /// Host cores from the last, spreading single-thread guest cores when there is room,
+    /// otherwise using SMT capacity, and always leaving at least one whole host core.
     Auto,
     /// These host CPUs, one per vCPU.
     List(Vec<u32>),
@@ -161,13 +165,17 @@ pub fn choose(
             if all.is_empty() {
                 bail!("pin auto: the host shows no CPU topology; give a CPU list");
             }
+            // A small non-SMT guest should get independent execution resources. Counting
+            // both host threads here would fit four vCPUs onto only two physical cores.
+            // Keep the compact SMT fallback when spreading would take every host core.
+            let spread = threads_per_core == 1 && n < all.len();
             let mut taken = Vec::new();
             let mut held = 0;
             for core in all.iter().rev() {
                 if held >= n {
                     break;
                 }
-                held += core.len();
+                held += if spread { 1 } else { core.len() };
                 taken.push(core.clone());
             }
             if held < n || taken.len() == all.len() {
@@ -299,8 +307,59 @@ mod tests {
         assert_eq!(got, vec![2, 3, 4, 5, 8, 9, 10, 11]);
         assert_eq!(
             choose(&Pin::Auto, &ryzen_3600(), 3, 1).unwrap(),
-            vec![4, 5, 10]
+            vec![3, 4, 5]
         );
+    }
+
+    #[test]
+    fn four_vcpus_get_four_physical_cores_unless_the_guest_requests_smt() {
+        let topology = ryzen_3600();
+        assert_eq!(
+            choose(&Pin::Auto, &topology, 4, 1).unwrap(),
+            vec![2, 3, 4, 5]
+        );
+        assert_eq!(
+            choose(&Pin::Auto, &topology, 4, 2).unwrap(),
+            vec![4, 10, 5, 11]
+        );
+    }
+
+    #[test]
+    fn spreading_keeps_a_whole_core_for_the_host_and_falls_back_to_smt() {
+        let topology = ryzen_3600();
+        assert_eq!(
+            choose(&Pin::Auto, &topology, 5, 1).unwrap(),
+            vec![1, 2, 3, 4, 5]
+        );
+        assert_eq!(
+            choose(&Pin::Auto, &topology, 6, 1).unwrap(),
+            vec![3, 4, 5, 9, 10, 11]
+        );
+        assert_eq!(
+            choose(&Pin::Auto, &topology, 10, 1).unwrap(),
+            vec![1, 2, 3, 4, 5, 7, 8, 9, 10, 11]
+        );
+    }
+
+    #[test]
+    fn spreading_uses_topology_with_offline_siblings_and_sparse_cpu_ids() {
+        let topology: Vec<HostCpu> = ryzen_3600()
+            .into_iter()
+            .filter(|c| !matches!(c.cpu, 1 | 7 | 10))
+            .collect();
+        assert_eq!(
+            choose(&Pin::Auto, &topology, 4, 1).unwrap(),
+            vec![2, 3, 4, 5]
+        );
+        let no_smt: Vec<HostCpu> = ryzen_3600()
+            .into_iter()
+            .filter(|c| c.cpu < 6)
+            .collect();
+        assert_eq!(
+            choose(&Pin::Auto, &no_smt, 4, 1).unwrap(),
+            vec![2, 3, 4, 5]
+        );
+        assert!(choose(&Pin::Auto, &no_smt, 6, 1).is_err());
     }
 
     #[test]

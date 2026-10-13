@@ -481,6 +481,38 @@ bytes help: smaller shaders, fewer pipelines per state. The driver's
 disk-cache cap, a cap of the runtime's, a binary's identity and binary
 records were each suspected first and ruled out.
 
+### Linux hosts: four vCPUs on a Ryzen 5 3600
+
+For a four-vCPU, 8 GiB VM on a Ryzen 5 3600 with an RX 7600:
+
+```sh
+reims-ctl set mac --cpus 4 --threads-per-core 1 --pin auto --memory 8G
+```
+
+Restart through `reims-ctl start mac` to apply the settings. With the CPU
+numbering in `pin.rs`'s Ryzen fixture, automatic pinning gives vCPUs 0 to 3
+host CPUs 2, 3, 4 and 5, each on a different physical core. Cores 0 and 1
+have no pinned vCPU. QEMU's GPU, display and other host threads remain free
+to run on any CPU; this is not exclusive CPU isolation. Actual CPU numbers
+come from sysfs, and QEMU's log reports the mapping.
+
+Read from code: the earlier allocator counted both SMT threads when choosing
+host cores, even with `threads_per_core = 1`. Four vCPUs therefore used
+CPUs 4, 5, 10 and 11, sharing two physical cores. Automatic pinning now
+spreads a single-thread-per-core guest when it can leave at least one whole
+host core unused by vCPUs. Larger guests retain the compact SMT allocation;
+explicit CPU lists and two-thread-per-core guests keep their mappings.
+
+The regression tests check core selection, including the fallback at six
+vCPUs, sparse CPU numbering and a host without SMT. This is an allocation
+fix, not a measured FPS improvement. The eight-vCPU measurements below do
+not validate this four-core placement. On the target host, compare parent
+and changed release builds with the same four-vCPU/eight-GiB settings,
+refresh rate, resolution and guest-disk copies. Alternate build order under
+both idle and busy host conditions, and record boot-to-desktop time,
+application-launch pauses, presentation rate and longest frame gap with
+`REIMS_VGPU_STATS=1`. Keep cold and warm runs separate.
+
 ### Linux hosts: a CPU-bound host at 120 Hz
 
 A host whose CPU is weaker than its GPU (a Ryzen 5 3600, six cores and twelve
