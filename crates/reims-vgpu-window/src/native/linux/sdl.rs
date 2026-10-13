@@ -19,8 +19,16 @@
 //! its swapchain and surface go ([`close`], `crate::sdl::shell::released`).
 //!
 //! **Input** is SDL's events ([`input_event`], `super::input`). While captured, the window grabs
-//! the keyboard (`SDL_SetWindowKeyboardGrab`): on Wayland the compositor's shortcuts inhibitor, so
-//! its own shortcuts reach the guest.
+//! the keyboard (`SDL_SetWindowKeyboardGrab`), so the compositor's own shortcuts reach the guest:
+//! on Wayland through the compositor's shortcuts inhibitor (keyboard-shortcuts-inhibit), under
+//! XWayland through an X keyboard grab, which XWayland hands the compositor
+//! (xwayland-keyboard-grab). SDL holds the grab only while the window has the keyboard, and takes
+//! it when the window gains it. SDL 3.4.18 opens windows through XWayland on a Wayland compositor
+//! without fifo-v1 (read from its code), and cosmic-comp has none. Measured 2026-10-13 on
+//! cosmic-comp 1.9.0, nested: through either route, while captured, its shortcuts (Super alone,
+//! Super+Q, Super+A, Alt+Tab) stay unused and their keys reach the guest, a click that focuses the
+//! window included; not captured, Super+Q closes the window. Each capture and release is logged
+//! with whether SDL holds the grab ([`grab_keyboard`]).
 
 use std::sync::Arc;
 
@@ -274,16 +282,47 @@ pub(crate) fn input_event(shell: &mut Shell, kind: u32, event: &SDL_Event) -> bo
     }
 }
 
-/// Grabs the keyboard while captured, and lets it go (the module doc).
+/// Grabs the keyboard while captured, and lets it go (the module doc), logging what that left.
 pub(crate) fn grab_keyboard(shell: &Shell, captured: bool) {
     // SAFETY: the window is SDL's, on this thread.
-    let grabbed = unsafe { SDL_SetWindowKeyboardGrab(shell.sdl, captured) };
-    if !grabbed {
-        log::debug!(
-            target: "reims_vgpu_window",
-            "keyboard grab {captured}: {}",
-            crate::sdl::sdl_error()
-        );
+    let asked = unsafe { SDL_SetWindowKeyboardGrab(shell.sdl, captured) };
+    let refused = (!asked).then(crate::sdl::sdl_error);
+    // SAFETY: as above.
+    let held = unsafe { SDL_GetWindowKeyboardGrab(shell.sdl) };
+    // SAFETY: as above.
+    let flags = unsafe { SDL_GetWindowFlags(shell.sdl) };
+    log::info!(
+        target: "reims_vgpu_window",
+        "window {:?}: {}",
+        shell.window.title(),
+        grab_outcome(
+            captured,
+            (flags & SDL_WINDOW_INPUT_FOCUS).0 != 0,
+            held,
+            refused.as_deref()
+        )
+    );
+}
+
+/// What a change of capture left: whether `captured`, whether the window has the keyboard
+/// (`focused`), whether SDL then holds the keyboard grab (`held`), and the error where SDL refused
+/// it.
+fn grab_outcome(captured: bool, focused: bool, held: bool, refused: Option<&str>) -> String {
+    match (captured, held, refused) {
+        (true, true, _) => "keyboard captured; SDL holds the keyboard grab, so the compositor's \
+                            shortcuts go to the guest"
+            .into(),
+        (true, false, Some(error)) => format!(
+            "keyboard captured, but SDL cannot grab the keyboard ({error}): the compositor keeps \
+             its own shortcuts"
+        ),
+        (true, false, None) => {
+            "keyboard captured; SDL grabs the keyboard once the window has it".into()
+        }
+        (false, _, _) if !focused => "keyboard released: the window lost the keyboard, and the \
+                                      compositor's shortcuts are its own again"
+            .into(),
+        (false, _, _) => "keyboard released: the compositor's shortcuts are its own again".into(),
     }
 }
 
@@ -338,6 +377,35 @@ mod tests {
         assert_eq!(
             input.0.take(),
             vec![ToHost::Key(KeyEvent::up(0x04)), pointer]
+        );
+    }
+
+    /// Each capture and release is logged with whether SDL holds the keyboard grab, and a release
+    /// with whether the window lost the keyboard
+    #[test]
+    fn a_change_of_capture_says_whether_sdl_holds_the_grab() {
+        assert_eq!(
+            grab_outcome(true, true, true, None),
+            "keyboard captured; SDL holds the keyboard grab, so the compositor's shortcuts go to \
+             the guest"
+        );
+        assert_eq!(
+            grab_outcome(true, false, false, None),
+            "keyboard captured; SDL grabs the keyboard once the window has it"
+        );
+        assert_eq!(
+            grab_outcome(true, true, false, Some("no inhibitor")),
+            "keyboard captured, but SDL cannot grab the keyboard (no inhibitor): the compositor \
+             keeps its own shortcuts"
+        );
+        assert_eq!(
+            grab_outcome(false, false, false, None),
+            "keyboard released: the window lost the keyboard, and the compositor's shortcuts are \
+             its own again"
+        );
+        assert_eq!(
+            grab_outcome(false, true, false, None),
+            "keyboard released: the compositor's shortcuts are its own again"
         );
     }
 }
