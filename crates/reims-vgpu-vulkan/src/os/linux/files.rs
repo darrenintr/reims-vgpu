@@ -29,6 +29,7 @@
 //! The table is a leaf lock: nothing is called under it.
 
 use std::collections::BTreeMap;
+use std::ops::Bound::Excluded;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
@@ -72,6 +73,16 @@ pub(crate) struct Piece {
     pub(crate) length: u64,
     pub(crate) backing: Backing,
     pub(crate) prot: i32,
+}
+
+/// A borrowed piece while the table is locked: `offset` is its first byte in `backing.fd`.
+/// Permission checks need neither an owned file reference nor a list of pieces.
+struct Resolved<'a> {
+    at: u64,
+    length: u64,
+    backing: &'a Backing,
+    offset: u64,
+    prot: i32,
 }
 
 /// The table (module docs).
@@ -128,21 +139,68 @@ impl Table {
         Some(run)
     }
 
-    /// The run holding byte `at`: its first byte and itself.
-    fn run_at(&self, at: u64) -> Option<(u64, &Run)> {
-        (self.runs.range(..=at).next_back())
-            .filter(|(_, run)| at < run.end)
-            .map(|(&first, run)| (first, run))
-    }
-
-    /// The first run starting after `at`, before `end`: its first byte.
-    fn next_run(&self, at: u64, end: u64) -> Option<u64> {
-        self.runs.range(at..end).next().map(|(&first, _)| first)
-    }
-
     /// The registration holding byte `at`.
     fn registered_at(&self, at: u64) -> Option<&Registered> {
         self.registered.iter().find(|r| r.first <= at && at < r.end)
+    }
+
+    /// Visits a range's pieces under the table's lock, borrowing their files. Seek once for
+    /// the run holding the first byte, then walk subsequent runs in order instead of seeking
+    /// again for every piece of a fragmented view. A missing byte still makes the whole range
+    /// unresolved, even if an earlier piece had no read access.
+    fn visit(&self, first: u64, length: u64, mut visit: impl FnMut(Resolved<'_>)) -> Option<()> {
+        let end = first.checked_add(length)?;
+        if first == end {
+            return Some(());
+        }
+        let initial = self
+            .runs
+            .range(..=first)
+            .next_back()
+            .filter(|(_, run)| first < run.end);
+        let mut runs = initial
+            .into_iter()
+            .chain(self.runs.range((Excluded(first), Excluded(end))))
+            .peekable();
+        let mut at = first;
+        while at < end {
+            if let Some(&(&run_first, run)) = runs.peek()
+                && run_first <= at
+            {
+                let to = run.end.min(end);
+                visit(Resolved {
+                    at: at - first,
+                    length: to - at,
+                    backing: &run.backing,
+                    offset: run.backing.offset + (at - run_first),
+                    prot: run.prot,
+                });
+                at = to;
+                runs.next();
+                continue;
+            }
+            let registered = self.registered_at(at)?;
+            let next = runs.peek().map_or(end, |&(&start, _)| start);
+            let to = registered.end.min(end).min(next);
+            visit(Resolved {
+                at: at - first,
+                length: to - at,
+                backing: &registered.backing,
+                offset: registered.backing.offset + (at - registered.first),
+                prot: libc::PROT_READ | libc::PROT_WRITE,
+            });
+            at = to;
+        }
+        Some(())
+    }
+
+    /// Checks permissions without allocating a piece list or retaining each backing file.
+    fn readable(&self, first: u64, length: u64) -> Option<bool> {
+        let mut readable = true;
+        self.visit(first, length, |piece| {
+            readable &= piece.prot & libc::PROT_READ != 0;
+        })?;
+        Some(readable)
     }
 
     /// Drops what of the runs lies in `first..end`, keeping the rest of each.
@@ -230,36 +288,19 @@ pub(crate) fn forget(first: u64, length: u64) {
 /// The pieces of `length` bytes from `first`, each the bytes of one run or registration in
 /// order, those of a run cut where it ends; `None` where a byte has no file behind it.
 pub(crate) fn pieces(first: u64, length: u64) -> Option<Vec<Piece>> {
-    let end = first.checked_add(length)?;
     let table = TABLE.lock();
     let mut pieces = Vec::new();
-    let mut at = first;
-    while at < end {
-        if let Some((run_first, run)) = table.run_at(at) {
-            let to = run.end.min(end);
-            let mut backing = run.backing.clone();
-            backing.offset += at - run_first;
-            pieces.push(Piece {
-                at: at - first,
-                length: to - at,
-                backing,
-                prot: run.prot,
-            });
-            at = to;
-            continue;
-        }
-        let registered = table.registered_at(at)?;
-        let to = (registered.end.min(end)).min(table.next_run(at, end).unwrap_or(end));
-        let mut backing = registered.backing.clone();
-        backing.offset += at - registered.first;
+    table.visit(first, length, |piece| {
         pieces.push(Piece {
-            at: at - first,
-            length: to - at,
-            backing,
-            prot: libc::PROT_READ | libc::PROT_WRITE,
+            at: piece.at,
+            length: piece.length,
+            backing: Backing {
+                fd: Arc::clone(&piece.backing.fd),
+                offset: piece.offset,
+            },
+            prot: piece.prot,
         });
-        at = to;
-    }
+    })?;
     Some(pieces)
 }
 
@@ -275,8 +316,7 @@ pub(crate) fn protect(first: u64, length: u64, prot: i32) {
 /// each lies in a run or a registration, readable where each has read access; `None` where one
 /// lies in neither.
 pub(crate) fn readable(first: u64, length: u64) -> Option<bool> {
-    let pieces = pieces(first, length)?;
-    Some(pieces.iter().all(|p| p.prot & libc::PROT_READ != 0))
+    TABLE.lock().readable(first, length)
 }
 
 /// Whether a byte of `length` bytes from `first` lies in a registration.
@@ -401,6 +441,199 @@ mod tests {
             .iter()
             .map(|p| (p.at, p.length, p.backing.offset))
             .collect()
+    }
+
+    /// The seek-per-piece resolution used before the ordered walk, kept as a differential
+    /// oracle for boundaries, overlapping registrations, permissions and file identities.
+    fn reference_pieces(table: &Table, first: u64, length: u64) -> Option<Vec<Piece>> {
+        let end = first.checked_add(length)?;
+        let mut pieces = Vec::new();
+        let mut at = first;
+        while at < end {
+            let run = table
+                .runs
+                .range(..=at)
+                .next_back()
+                .filter(|(_, run)| at < run.end);
+            let (to, backing, offset, prot) = match run {
+                Some((&start, run)) => (
+                    run.end.min(end),
+                    &run.backing,
+                    run.backing.offset + (at - start),
+                    run.prot,
+                ),
+                None => {
+                    let r = table.registered_at(at)?;
+                    let next = table.runs.range(at..end).next().map_or(end, |(&s, _)| s);
+                    (
+                        r.end.min(end).min(next),
+                        &r.backing,
+                        r.backing.offset + (at - r.first),
+                        libc::PROT_READ | libc::PROT_WRITE,
+                    )
+                }
+            };
+            pieces.push(Piece {
+                at: at - first,
+                length: to - at,
+                backing: Backing {
+                    fd: Arc::clone(&backing.fd),
+                    offset,
+                },
+                prot,
+            });
+            at = to;
+        }
+        Some(pieces)
+    }
+
+    #[test]
+    fn ordered_walk_matches_seeks_through_fragmented_and_registered_ranges() {
+        let (f, g) = (file(), file());
+        let backing = |fd: &Arc<OwnedFd>, offset| Backing {
+            fd: Arc::clone(fd),
+            offset,
+        };
+        let mut table = Table::default();
+        for (first, end, fd) in [(4, 92, &f), (70, 190, &g)] {
+            table.registered.push(Registered {
+                first,
+                end,
+                backing: backing(fd, first * 3),
+                count: 1,
+            });
+        }
+        for first in (8..240).step_by(4) {
+            let prot = if first % 12 == 0 {
+                libc::PROT_NONE
+            } else {
+                libc::PROT_READ
+            };
+            table.record(first, first + 2, backing(&g, first * 7), prot);
+        }
+        for first in 0..=256 {
+            for length in [0, 1, 2, 7, 31, 127, 257] {
+                let expected = reference_pieces(&table, first, length);
+                let mut got = Vec::new();
+                let resolved = table.visit(first, length, |p| {
+                    got.push(Piece {
+                        at: p.at,
+                        length: p.length,
+                        backing: Backing {
+                            fd: Arc::clone(&p.backing.fd),
+                            offset: p.offset,
+                        },
+                        prot: p.prot,
+                    });
+                });
+                assert_eq!(resolved.is_some(), expected.is_some(), "{first}+{length}");
+                if let Some(ref expected) = expected {
+                    assert_eq!(shape(&got), shape(expected), "{first}+{length}");
+                    for (a, b) in got.iter().zip(expected) {
+                        assert_eq!(a.prot, b.prot);
+                        assert!(Arc::ptr_eq(&a.backing.fd, &b.backing.fd));
+                    }
+                }
+                assert_eq!(
+                    table.readable(first, length),
+                    expected.map(|ps| ps.iter().all(|p| p.prot & libc::PROT_READ != 0)),
+                    "{first}+{length}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn permission_walk_preserves_holes_empty_ranges_and_overflow() {
+        let mut table = Table::default();
+        table.record(
+            10,
+            20,
+            Backing {
+                fd: file(),
+                offset: 0,
+            },
+            libc::PROT_NONE,
+        );
+        assert_eq!(table.readable(10, 10), Some(false));
+        // Do not return false early: the unresolved tail requires the caller's read probe.
+        assert_eq!(table.readable(10, 11), None);
+        assert_eq!(table.readable(0, 0), Some(true));
+        assert_eq!(table.readable(u64::MAX, 0), Some(true));
+        assert_eq!(table.readable(u64::MAX, 1), None);
+        table.record(
+            u64::MAX - 2,
+            u64::MAX,
+            Backing {
+                fd: file(),
+                offset: 0,
+            },
+            libc::PROT_READ,
+        );
+        assert_eq!(table.readable(u64::MAX - 1, 1), Some(true));
+    }
+
+    /// CPU-only microbenchmark, not a measure of guest FPS. Run in release mode with
+    /// `cargo test -p reims-vgpu-vulkan fragmented_permission_walk_benchmark --release
+    /// -- --ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore = "manual CPU microbenchmark; reports timings, has no timing threshold"]
+    fn fragmented_permission_walk_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let f = file();
+        for count in [1, 64, 1024, 16_384] {
+            let mut table = Table::default();
+            for i in 0..count {
+                table.record(
+                    i * 4096,
+                    (i + 1) * 4096,
+                    Backing {
+                        fd: Arc::clone(&f),
+                        offset: i * 8192,
+                    },
+                    libc::PROT_READ,
+                );
+            }
+            let length = count * 4096;
+            let repeats = 100;
+            let mut old = Vec::new();
+            let mut new = Vec::new();
+            for round in 0..6 {
+                // Alternate order to reduce systematic warmup and scheduling bias.
+                for reference in [round % 2 == 0, round % 2 != 0] {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "a manual CPU benchmark measures elapsed host time, not guest time"
+                    )]
+                    let start = Instant::now();
+                    for _ in 0..repeats {
+                        let result = if reference {
+                            reference_pieces(black_box(&table), 0, black_box(length))
+                                .map(|ps| ps.iter().all(|p| p.prot & libc::PROT_READ != 0))
+                        } else {
+                            black_box(&table).readable(0, black_box(length))
+                        };
+                        assert_eq!(black_box(result), Some(true));
+                    }
+                    let elapsed = start.elapsed().as_secs_f64() / f64::from(repeats);
+                    if reference {
+                        old.push(elapsed);
+                    } else {
+                        new.push(elapsed);
+                    }
+                }
+            }
+            old.sort_by(f64::total_cmp);
+            new.sort_by(f64::total_cmp);
+            println!(
+                "{count} runs: reference {:.3} us, walk {:.3} us, {:.2}x",
+                old[3] * 1e6,
+                new[3] * 1e6,
+                old[3] / new[3],
+            );
+        }
     }
 
     // The table is the process's: each test uses address ranges of its own, far apart.
