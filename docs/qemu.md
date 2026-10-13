@@ -585,6 +585,38 @@ presents fewer than 120 frames a second while the window's GPU time stays
 small is waiting on the CPU. `top -H -p <QEMU's pid>` shows which threads hold
 it: the vCPUs (`CPU n/KVM`), or the library's (`reims-vgpu.*`).
 
+### Linux hosts: what a command buffer costs on RADV
+
+Measured with the macOS 26.7.1 guest on the Ryzen 5 3600 and RX 7600 host
+(RADV of Mesa 26.2.4, Linux 7.3, 8 vCPUs, 1920x1080 at 100 Hz, 2026-10-13),
+the library at `21930c51`, with counters added to a local copy of the
+runtime's scheduler for the measurement only:
+- **Where animations stop.** A CSS animation in Safari (one command buffer a
+  frame) holds 100 presents a second, 2.5 ms of window GPU time. A Finder
+  window's minimize (the genie) shows about 20 frames and its restore about
+  9, at roughly 2,200 command buffers a second, close to 50 a frame. App
+  launches run at the same rate: Chess's took 4.1 to 4.5 s to its first
+  window. Neither the guest (about 80% idle, WindowServer 9 to 13%) nor the
+  GPU is busy then; the runtime's scheduler thread is, at 70 to 88%.
+- **The submission.** About one `DRM_IOCTL_AMDGPU_CS` per command buffer,
+  0.27 to 0.39 ms each (median 0.29 ms under strace), 83% of the scheduler's
+  busy samples. 160 to 220 buffer imports and 44 to 58 texture imports
+  (`DmaBufImage`) were live, which at about 0.55 µs each ("AMD GPUs and
+  udmabuf") account for about 0.14 ms of it.
+- **The scheduler's passes.** Every batch waits for its submission checks
+  (the library sets one on each command buffer), so the committing thread's
+  pass submits nothing and the scheduler thread runs the checks and submits
+  the batch: 80 to 85% of batches 50 µs or less after their commit, about
+  10% 1 to 5 ms or more. A pass that submits anything submits one batch:
+  there is no backlog that one `vkQueueSubmit` could take several of.
+- **What did not help.** `RADV_PERFTEST=localbos` brought the median ioctl
+  from 0.293 to 0.270 ms and left the genie as it was. The guest's disk on
+  `virtio-blk-pci` (macOS 26 has `AppleVirtIOStorage`) in place of SATA
+  moved no launch past noise. amdgpu's user queues, which take submissions
+  without the CS ioctl, are off for this GPU (`user_queue=-1`,
+  `userq_ip_mask = 0`; `amdgpu.user_queue=1` on the kernel's command line
+  turns them on) and were not measured.
+
 ### x86-64 macOS guests: Metal's error mode
 
 An x86-64 macOS guest needs one setting, made once inside the guest. On a
