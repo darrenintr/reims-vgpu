@@ -148,6 +148,9 @@ pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
 /// Warnings about the host for a start that would still work.
 pub fn warnings(vm: &Vm, host: Host) -> Vec<String> {
     let mut w = Vec::new();
+    if vm.config.profile == Profile::Q35X86_64 {
+        w.extend(crate::opencore::missing_kext(vm));
+    }
     if host.os == Os::Linux {
         // docs/qemu.md, "Linux hosts: vm.max_map_count": guest memory views take a mapping per
         // run of 16 KiB pages; the stock 65,530 holds about 770 MiB of them.

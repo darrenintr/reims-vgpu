@@ -9,6 +9,7 @@ mod gpu;
 mod host;
 mod install;
 mod logs;
+mod opencore;
 mod paths;
 mod pin;
 mod qemu;

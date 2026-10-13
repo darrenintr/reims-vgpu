@@ -19,6 +19,8 @@ clap = { version = "4.6.7", features = ["derive", "env", "wrap_help"] }
 crc32fast = "1.5.2"
 flate2 = "1.1.10"
 libc = "0.2.190"
+# An x86-64 VM's OpenCore config.plist, for the Mac it presents (opencore.rs).
+plist = "1.10.1"
 # The viewer's frames for the kitty and iTerm2 image protocols (view/encode.rs).
 png = "0.18.1"
 ratatui = "0.30.2"

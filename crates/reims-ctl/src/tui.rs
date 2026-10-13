@@ -12,7 +12,7 @@ use crate::gpu::GpuInfo;
 use crate::host::{Host, Os, Profile};
 use crate::update::Channel;
 use crate::vm::{Registry, Vm, format_mib, parse_resolution, parse_size_mib};
-use crate::{install, logs, paths, runtime, update};
+use crate::{install, logs, opencore, paths, runtime, update};
 use anyhow::{Context, Result, bail};
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
@@ -99,6 +99,7 @@ enum Action {
     None,
     Delete { vm: String, keep_files: bool },
     ForceStop(String),
+    UpdateOpencore(String),
     Update(Option<Channel>),
     Quit,
 }
@@ -545,6 +546,7 @@ impl App {
             KeyCode::Char('b') => self.report(),
             KeyCode::Char('d') | KeyCode::Delete => self.ask_delete(),
             KeyCode::Char('u') => self.ask_update(),
+            KeyCode::Char('U') => self.ask_update_opencore(),
             KeyCode::Char('r') => {
                 let _ = self.reload();
                 self.say("reloaded", Level::Info);
@@ -569,6 +571,11 @@ impl App {
                 }
                 Err(e) => self.say(&format!("{e:#}"), Level::Error),
             },
+            Action::UpdateOpencore(name) => {
+                self.spawn(&name.clone(), "making a new OpenCore image", move |p| {
+                    opencore::renew(&mut Registry::load()?.open(&name)?, p)
+                });
+            }
             Action::ForceStop(name) => {
                 let Some(vm) = self
                     .rows
@@ -673,6 +680,51 @@ impl App {
                         keep_files: true,
                     },
                 ),
+            ],
+            choice: 0,
+        });
+    }
+
+    fn ask_update_opencore(&mut self) {
+        let Some(vm) = self.selected_vm() else { return };
+        let name = vm.name().to_string();
+        let Some(q) = &vm.config.q35 else {
+            self.say(
+                &format!("{name} boots no OpenCore: only x86-64 VMs do"),
+                Level::Info,
+            );
+            return;
+        };
+        if runtime::running(&vm) {
+            self.say(&format!("{name} is running: stop it first"), Level::Warn);
+            return;
+        }
+        let image = vm.path(&q.opencore);
+        let id = match opencore::Config::read(&image, q.opencore_format).and_then(|c| c.identity())
+        {
+            Ok(id) => id,
+            Err(e) => {
+                let image = paths::tilde(&image);
+                self.say(
+                    &format!("{name}: read the Mac {image} presents: {e:#}"),
+                    Level::Error,
+                );
+                return;
+            }
+        };
+        self.overlay = Some(Overlay::Confirm {
+            title: format!("Make {name} a new OpenCore image?"),
+            body: format!(
+                "reims-util makes it a new OpenCore image, with what it carries now, such as \
+                 ReimsVgpu.kext, which macOS 26 needs for a display wider than 2048 pixels and for \
+                 GPU-accelerated Chrome. It presents the same Mac, a {} with serial {}, and the VM \
+                 keeps its OVMF variables, which hold its boot entries.\n\nThe image it \
+                 replaces is deleted, with anything else changed in it.",
+                id.model, id.serial
+            ),
+            options: vec![
+                ("Cancel", Action::None),
+                ("Make it", Action::UpdateOpencore(name)),
             ],
             choice: 0,
         });
@@ -1729,6 +1781,9 @@ reims-ctl runs macOS VMs on QEMU with reims-vgpu: each VM's displays open in win
   b           write a bug report: its logs, settings, command and this host's details,
               zipped into your Downloads folder
   d           delete it
+  U           make it a new OpenCore image (x86-64) with the installed reims-util, presenting
+              the same Mac: an older image lacks ReimsVgpu.kext, which macOS 26 needs for
+              displays wider than 2048 pixels and GPU-accelerated Chrome
   u           update reims-ctl and QEMU from your reims-vgpu checkout
   r           reload the list
   ?           this help

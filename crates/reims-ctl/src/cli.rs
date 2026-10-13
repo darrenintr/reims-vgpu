@@ -3,7 +3,7 @@
 use crate::create::{self, DiskSource, ImportMode, Spec};
 use crate::host::{Host, Profile};
 use crate::vm::{self, Registry, Vm, format_mib, parse_size_mib};
-use crate::{gpu, install, logs, paths, qemu, runtime, update, view};
+use crate::{gpu, install, logs, opencore, paths, qemu, runtime, update, view};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use std::io::Write;
@@ -89,6 +89,10 @@ pub enum Cmd {
     Insert { name: String, path: PathBuf },
     /// Take the installer out of a VM (x86-64)
     Eject { name: String },
+    /// Replace a VM's OpenCore image (x86-64) with one the installed reims-util makes, presenting
+    /// the same Mac
+    #[command(name = "update-opencore", after_help = UPDATE_OPENCORE_HELP)]
+    UpdateOpencore { name: String },
     /// List the GPUs a VM can be given (Linux)
     Gpus,
     /// Print the end of a VM's QEMU log, or its serial console's
@@ -149,6 +153,14 @@ go to the guest as a US keyboard's and a tablet's.
 
 Ctrl-] disconnects; the VM keeps running. Alt+key is Cmd+key. The Cmd, Opt, Ctrl and Shift \
 buttons on the top row hold that key for the next key or click.";
+
+const UPDATE_OPENCORE_HELP: &str = "\
+An image an older reims-util made lacks what a newer one's carries, such as ReimsVgpu.kext, which \
+macOS 26 needs for a display wider than 2048 pixels and for GPU-accelerated Chrome. The new image \
+presents the same Mac (its model, serial number, MLB, UUID and ROM, read from the old image's \
+config.plist), so macOS sees no new machine, and the VM keeps its OVMF variables, which hold its \
+boot entries. Whatever else was changed in the old image is not carried over. The VM must be \
+stopped; reims-ctl update installs the reims-util this reims-ctl needs.";
 
 /// `--flag`, `--flag=true`, `--flag false`.
 fn bool_arg() -> clap::Arg {
@@ -429,6 +441,13 @@ pub fn main(cli: Cli) -> Result<i32> {
         Cmd::Eject { name } => {
             let mut vm = Registry::load()?.open(&name)?;
             println!("{}", set_installer(&mut vm, None, &mut |_| {})?);
+        }
+        Cmd::UpdateOpencore { name } => {
+            let mut vm = Registry::load()?.open(&name)?;
+            println!(
+                "{}",
+                opencore::renew(&mut vm, &mut |p| println!("{name}: {p}"))?
+            );
         }
         Cmd::Gpus => gpus(host),
         Cmd::Logs {
