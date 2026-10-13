@@ -851,6 +851,25 @@ presenting at the screen's rate. Keeping the device across a wakeup would need
 `apple-gfx-pci` to skip its reset for `RESET_TYPE_WAKEUP`, or to suspend and
 resume it through the library's API (`apple-gfx.c`'s TODO).
 
+### x86-64 macOS guests: the SMC's key index
+
+macOS 26 enumerates the SMC's keys by index (command 0x12) and asks each key's
+type (0x13), and sends neither a length byte: it polls for the answer once
+the fourth byte is in. Upstream's `isa-applesmc` knew only the read command
+and answered both as unknown (0x82), and the guest retried without end.
+Measured with the macOS 26.7.1 guest on the Ryzen 5 3600 host (2026-10-13):
+`PerfPowerServices` held a vCPU at 100% from boot (11:53 of CPU in 12:45),
+about 60,000 port accesses a second reached QEMU (`memory_region_ops_read`
+on `applesmc-cmd` and `applesmc-err`), and the idle desktop kept the vCPU
+threads at 20 to 67% each. vendor/qemu now carries `#KEY` and answers both
+commands. On the same saved disk, booted on each QEMU: no SMC access in a
+1 s trace, `PerfPowerServices` at 2 s of CPU in its first 2:20, and the
+vCPU threads at 0.6 to 3% each at the idle desktop. Launch times moved little,
+about 5 to 10% (Notes 2.30 to 2.17 s to its first window, Chess 4.51 to
+4.14 s), and a Finder window's minimize animation not at all (about 20
+frames in both). What bounds those is the library's per-command-buffer cost
+("Linux hosts: a CPU-bound host at 120 Hz").
+
 ### x86-64 macOS guests: installers and recovery
 
 A macOS installer or recovery image boots to its Recovery UI on
