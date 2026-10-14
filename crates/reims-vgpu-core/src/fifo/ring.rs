@@ -211,6 +211,8 @@ impl<P: Platform> Fifo<P> {
     /// One wait for ring bytes, under `lock`'s guard `g`: a poke, a root's `written` or a
     /// drain wakes it.
     fn wait_for_bytes(&self, g: &mut MutexGuard<'_, ()>) {
+        // The burst ends: what the thread held back goes now, with the ring's lock free.
+        MutexGuard::unlocked(g, crate::rt::thread::before_block);
         #[cfg(test)]
         self.waiting_for_bytes.fetch_add(1, Ordering::SeqCst);
         self.bytes.wait(g);

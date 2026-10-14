@@ -17,13 +17,27 @@
 //! 41 ms, and the 95th from 130 ms to 51 ms. So each thread here starts with the affinity of the
 //! process's main thread, which a host that pins only its vCPUs leaves unpinned, and which a
 //! host that confines the whole process (`taskset`) sets for every thread.
+//!
+//! **A FIFO thread's submissions go together.** The guest rings a FIFO's doorbell for several
+//! command buffers at a time (about 11 a wake on the tahoe guest, 2026-10-14), and on RADV each
+//! submission's ioctl walks every buffer object the device has (`amdgpu_cs_ioctl`: the list's
+//! sort, each object's lock and reservation sync), which the scheduler and the FIFO threads spent
+//! most of their CPU time in. So a FIFO thread defers its commits' submissions
+//! (`metal2vulkan_runtime::defer_submissions`) and submits them together each time before it blocks
+//! (`reims_vgpu_core::rt::thread::set_before_block`): for ring bytes, where a burst ends, for room
+//! among its stamps, or for other channels' stamps. The runtime submits them sooner wherever
+//! something waits on them, and within a millisecond in any case.
 
 use std::sync::Arc;
 
+use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::os::{Threads, TimerClock};
 use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal};
 
 use super::clock::LinuxClock;
+
+/// The FIFO threads' name (`reims_vgpu_core::fifo`).
+const FIFO_THREAD: &str = "reims-vgpu.fifo";
 
 /// The bytes of a thread's name Linux keeps (`TASK_COMM_LEN` less its NUL).
 const NAME_BYTES: usize = 15;
@@ -45,7 +59,17 @@ fn spawn_thread(name: &'static str, stack_size: usize, body: Box<dyn FnOnce() + 
         .stack_size(stack_size)
         .spawn(move || {
             take_process_affinity();
-            body()
+            // A FIFO thread holds back the GPU work it commits until it would block, and then
+            // submits it together (module docs).
+            let fifo = name == FIFO_THREAD;
+            if fifo {
+                reims_vgpu_core::rt::thread::set_before_block(rt::flush_deferred_submissions);
+                rt::defer_submissions(true);
+            }
+            body();
+            if fifo {
+                rt::defer_submissions(false);
+            }
         });
     if made.is_err() {
         fatal(DeathId::Platform {
