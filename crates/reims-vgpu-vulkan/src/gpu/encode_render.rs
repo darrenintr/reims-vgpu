@@ -2520,6 +2520,7 @@ impl VulkanRenderEncoder {
         mut call: impl FnMut(&mut rt::RenderCommandEncoder, K) -> Result<(), rt::Error>,
     ) -> RaiseResult<()> {
         self.pipelined(sel);
+        crate::gpu::timing::count_draw();
         match drawn {
             Some((shape, k)) => {
                 self.bfloat_drawn(sel);

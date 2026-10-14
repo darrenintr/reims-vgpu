@@ -1289,6 +1289,19 @@ fn fate(kind: rt::Degradation, placement: native::Placement, census: bool, stric
     }
 }
 
+/// Whether every occurrence of every degradation is written to the trace
+/// (`REIMS_VGPU_TRACE_DEGRADE`, with `REIMS_VGPU_TRACE`): a diagnostic, which only the sink's
+/// relaying and the trace see.
+pub fn trace_degradations() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("REIMS_VGPU_TRACE_DEGRADE").is_some());
+    *ON
+}
+
+/// The kinds the trace saw, which the runtime announces once without it.
+static TRACED_KINDS: reims_vgpu_core::sync::Mutex<Vec<rt::Degradation>> =
+    reims_vgpu_core::sync::Mutex::new(Vec::new());
+
 /// The runtime's message sink (`DeviceOptions::messages`, [`crate::platform`]): a degradation
 /// of [`DIES`] is relayed and counted, or in strict mode kept for the call here it was announced
 /// inside to die at, or, announced outside every call here, dies now, ending the process (the
@@ -1302,6 +1315,19 @@ pub fn notice(message: &rt::DebugMessage) {
         relay(message);
         return;
     };
+    if trace_degradations() && reims_vgpu_core::trace::on() {
+        let kind = notice.degradation;
+        // deg: an occurrence of a degradation, its code
+        reims_vgpu_core::trace::event_text("deg", &[], kind.code());
+        // A kind announced once without the trace goes on only at its first occurrence.
+        if !DIES.contains(&kind) && !HEARD.contains(&kind) {
+            let mut seen = TRACED_KINDS.lock();
+            if seen.contains(&kind) {
+                return;
+            }
+            seen.push(kind);
+        }
+    }
     if !DIES.contains(&notice.degradation) {
         if HEARD.contains(&notice.degradation) {
             HEARING.with(|h| {

@@ -152,6 +152,7 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::host::HostPtr;
+use reims_vgpu_core::num::ToU64;
 use reims_vgpu_core::platform::os::vm::{HostVm, KernReturn, VmProt};
 use reims_vgpu_core::platform::types::ResourceAddressRange;
 use reims_vgpu_core::raise::RaiseResult;
@@ -499,7 +500,7 @@ impl Backing {
             return Ok(false);
         };
         let alias = Arc::new(alias);
-        let (first, keep) = Arc::clone(&alias).into_runtime();
+        let (first, keep) = Arc::clone(&alias).into_runtime(ImportSite::Replace);
         rebind(first, keep)?;
         let own = {
             let mut aliased = self.alias.lock();
@@ -852,13 +853,14 @@ impl Alias {
     /// they are mapped (read-only, on Linux), a writable twin of them ([`crate::os::import_view`]),
     /// whose first byte this answers, and which the keep-alive holds too: the GPU's writes then
     /// reach the pages, where Metal drops them ([`Alias::writes_kept`]).
-    pub(crate) fn into_runtime(self: Arc<Self>) -> (NonNull<u8>, rt::KeepAlive) {
+    pub(crate) fn into_runtime(self: Arc<Self>, site: ImportSite) -> (NonNull<u8>, rt::KeepAlive) {
         let first = self.at;
         let view = crate::os::import_view(first, self.length);
         let imported = view.at();
         self.kept.store(view.writes_kept(), Ordering::Release);
         let (_, twin) = view.release(first, None);
-        (imported, keep_alive((twin, self)))
+        let traced = ImportTrace::new(site, first, self.length, imported);
+        (imported, keep_alive((twin, self, traced)))
     }
 
     /// Whether the runtime imports the alias through a writable twin of read-only pages, whose
@@ -878,6 +880,65 @@ impl Alias {
 impl Drop for Alias {
     fn drop(&mut self) {
         let _ = OsVm::new().deallocate(HostPtr::from_ptr(self.at.as_ptr()), self.length);
+    }
+}
+
+/// Where an import of host memory was made, as the trace names it ([`ImportTrace`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ImportSite {
+    /// A no-copy buffer over host memory core gives (`newBufferWithBytesNoCopy`: task pages, the
+    /// EFI framebuffer).
+    NoCopyBytes,
+    /// A no-copy buffer a descriptor names (a detached buffer).
+    NoCopyDescriptor,
+    /// A buffer over a surface's alias.
+    Surface,
+    /// A heap over guest ranges.
+    Heap,
+    /// A buffer's replaced backing.
+    Replace,
+    /// A buffer over a surface, imported at its base address.
+    SurfaceBase,
+}
+
+impl ImportSite {
+    /// The site's number in the trace.
+    fn code(self) -> u64 {
+        match self {
+            Self::NoCopyBytes => 1,
+            Self::NoCopyDescriptor => 2,
+            Self::Surface => 3,
+            Self::Heap => 4,
+            Self::Replace => 5,
+            Self::SurfaceBase => 6,
+        }
+    }
+}
+
+/// The trace of one import of host memory by the runtime, with `REIMS_VGPU_TRACE` set
+/// ([`reims_vgpu_core::trace`]): `imp` as it is made (the site, the first byte given, its
+/// length, the first byte imported), and `impfree` as its keep-alive goes, once the runtime
+/// freed the import (the first byte imported). A diagnostic: it holds nothing and reads nothing
+/// with an effect, and the keep-alive drops it last.
+pub(crate) struct ImportTrace(u64);
+
+impl ImportTrace {
+    pub(crate) fn new(
+        site: ImportSite,
+        given: NonNull<u8>,
+        length: u64,
+        imported: NonNull<u8>,
+    ) -> Self {
+        let at = imported.as_ptr().addr().to_u64();
+        let given = given.as_ptr().addr().to_u64();
+        reims_vgpu_core::trace::event("imp", &[site.code(), given, length, at]);
+        Self(at)
+    }
+}
+
+impl Drop for ImportTrace {
+    fn drop(&mut self) {
+        reims_vgpu_core::trace::event("impfree", &[self.0]);
     }
 }
 

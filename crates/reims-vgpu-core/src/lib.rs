@@ -54,3 +54,4 @@ pub mod sync;
 pub mod tasks;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
+pub mod trace;

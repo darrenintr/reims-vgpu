@@ -32,6 +32,11 @@ impl SharedEvent<VulkanPlatform> for VulkanSharedEvent {
 
     /// The value becomes at least `signaled_value`; the runtime refuses no value.
     fn set_signaled_value(&self, signaled_value: u64) -> RaiseResult<()> {
+        // evset: event, value: the guest's or the device's host set
+        reims_vgpu_core::trace::event(
+            "evset",
+            &[crate::gpu::command::event_id(self), signaled_value],
+        );
         plain(|| rt::SharedEvent::set_signaled_value(self, signaled_value));
         Ok(())
     }
