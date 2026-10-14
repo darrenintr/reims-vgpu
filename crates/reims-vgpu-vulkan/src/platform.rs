@@ -313,9 +313,10 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
             .collect();
         if std::env::var_os(reims_vgpu_core::trace::ENV_VAR).is_some() {
             reims_vgpu_core::trace::set_clock(crate::gpu::timing::trace_clock);
-            if crate::answer::trace_degradations() {
+            if crate::answer::trace_degradations() && reims_vgpu_core::trace::on() {
                 // Every occurrence reaches the sink, which writes each to the trace and relays
-                // a kind the runtime announces once only the first time.
+                // a kind the runtime announces once only the first time: only where the trace's
+                // file opened, the sink's own condition, so a refused file changes nothing.
                 options.announce_each = rt::Degradation::ALL.iter().copied().collect();
             }
         }

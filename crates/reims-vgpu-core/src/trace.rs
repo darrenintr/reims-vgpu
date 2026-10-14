@@ -7,10 +7,12 @@
 //! event is written and [`on`] answers `false`, and no event reads anything with an effect. Each
 //! site's comment names its event and its values.
 //!
-//! Lines are buffered and written when the buffer fills or a quarter second after the last
-//! write: a process that ends loses at most that quarter second.
+//! Lines are buffered, and written when the buffer fills or with the first event a quarter second
+//! or more after the last write. Lines still buffered when events stop wait for the next event,
+//! or for a death ([`flush_before_death`]); a process that ends otherwise loses them.
 
 use std::cell::Cell;
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufWriter, Write as _};
@@ -63,17 +65,32 @@ pub fn on() -> bool {
 
 fn writer() -> Option<&'static Mutex<Writer>> {
     WRITER
-        .get_or_init(|| {
-            let path = std::env::var_os(ENV_VAR)?;
-            let file = File::create(&path)
-                .inspect_err(|e| log::warn!("{ENV_VAR}: {}: {e}", path.to_string_lossy()))
-                .ok()?;
-            Some(Mutex::new(Writer {
-                out: BufWriter::with_capacity(1 << 20, file),
-                flushed: 0,
-            }))
-        })
+        .get_or_init(|| open(&std::env::var_os(ENV_VAR)?))
         .as_ref()
+}
+
+/// The file at `path`, created afresh; `None`, with a warning, where it is refused.
+fn open(path: &OsStr) -> Option<Mutex<Writer>> {
+    let file = File::create(path)
+        .inspect_err(|e| log::warn!("{ENV_VAR}: {}: {e}", path.to_string_lossy()))
+        .ok()?;
+    Some(Mutex::new(Writer {
+        out: BufWriter::with_capacity(1 << 20, file),
+        flushed: 0,
+    }))
+}
+
+/// Writes the lines the buffer holds to the file, for a death, which ends the process with no
+/// `Drop` run ([`crate::raise::death`]). It opens no file, and takes the file's lock only where
+/// it is free: the dying thread may hold it, or a thread the death stops before it lets go.
+pub fn flush_before_death() {
+    if let Some(mut w) = WRITER
+        .get()
+        .and_then(Option::as_ref)
+        .and_then(Mutex::try_lock)
+    {
+        let _ = w.out.flush();
+    }
 }
 
 /// Writes one event, `kind` and `values`, timed now.
@@ -157,5 +174,33 @@ mod tests {
         event("cmd", &[1, 2]);
         event_text("cbcommit", &[1], "a label");
         assert_eq!(now(), 7);
+    }
+
+    /// With a file, each event is a line, its thread's name written once before its first, a
+    /// text's spaces as `_`; a death's flush writes what the buffer held
+    #[test]
+    fn a_line_per_event() {
+        // nextest runs each test in a process of its own, where the file is this one
+        let path = std::env::temp_dir().join(format!("rvg-trace-{}.txt", std::process::id()));
+        assert!(WRITER.set(open(path.as_os_str())).is_ok());
+        set_clock(|| 7);
+        assert!(on());
+        event("imp", &[6, 0x4000, 64, 0x4000]);
+        event_text("cbcommit", &[1], "a label");
+        event("impfree", &[0x4000]);
+        flush_before_death();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let name = std::thread::current()
+            .name()
+            .unwrap_or("unnamed")
+            .replace(char::is_whitespace, "_");
+        assert_eq!(
+            text,
+            format!(
+                "7 1 thread 1 {name}\n7 1 imp 6 16384 64 16384\n7 1 cbcommit 1 a_label\n\
+                 7 1 impfree 16384\n"
+            )
+        );
     }
 }
