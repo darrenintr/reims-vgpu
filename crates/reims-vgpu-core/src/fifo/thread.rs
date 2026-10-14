@@ -115,7 +115,7 @@ impl<P: Platform> Fifo<P> {
             return Ok(false);
         };
         // What the thread held back goes before it waits on other channels, which may wait on it.
-        crate::rt::thread::before_block();
+        let _ = crate::rt::thread::before_block();
         // The quiesced flag is read only once the waits are done
         Ok(device.wait_stamps(barriers, self)? && !self.quiesced.load(Ordering::SeqCst))
     }

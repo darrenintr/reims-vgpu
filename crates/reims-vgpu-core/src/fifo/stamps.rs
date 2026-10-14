@@ -215,7 +215,7 @@ impl StampQueue {
         if st.pending_count() == STAMP_QUEUE_CAPACITY {
             // Room comes as work completes: what the thread held back goes first, unlocked.
             drop(st);
-            crate::rt::thread::before_block();
+            let _ = crate::rt::thread::before_block();
             st = imp::lock(&self.state);
         }
         while st.pending_count() == STAMP_QUEUE_CAPACITY {
