@@ -268,6 +268,8 @@ pub(crate) fn die(id: DeathId, detail: Option<&str>) -> ! {
     use std::io::Write as _;
     // One write, so the line never interleaves with another thread's.
     let _ = std::io::stderr().write_all(line.as_bytes());
+    // The trace's last lines, the events that led here (a diagnostic).
+    crate::trace::flush_before_death();
     #[allow(clippy::disallowed_methods)] // the one fatal path's abort (6.4)
     std::process::abort()
 }

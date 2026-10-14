@@ -2009,8 +2009,11 @@ pub(crate) mod tests {
     /// its buffer go at the release, Metal's moment, and with the buffer the deallocator runs,
     /// which drops the surface's last reference. The surface's memory stays mapped until the
     /// runtime freed the import, after the command buffer completed
-    /// ([`crate::os::surface_memory_hold`]): its own memory, and a single range of core's mapping
-    /// of the guest's pages, which core then unmaps through the platform's VM. An i915 execbuffer
+    /// ([`crate::os::surface_memory_hold`]): its own memory, and a single range of pages the
+    /// platform's VM mapped, which the test unmaps through it as core's mapping's release would.
+    /// Core makes no surface over such a range (a single range is a page of the host's own RAM,
+    /// which no hold defers), so the second case pins only the unmap hold the surface's hold
+    /// carries. An i915 execbuffer
     /// that lists an import whose pages are unmapped fails, which ANV answers as the device lost
     /// (`crate::remap`'s docs). The command buffer reads another texture through its ID, so no
     /// command of it names the surface's. Linux's: on macOS IOSurface's memory is the surface's own

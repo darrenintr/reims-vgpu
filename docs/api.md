@@ -248,8 +248,10 @@ Everything a host can set that shapes what the guest is offered or what the libr
   | `REIMS_VGPU_RDNA3` | the Vulkan platform: `0`, `false`, `no` or `off` keeps an AMD RDNA3 GPU (the Radeon RX 7600 among them) on RADV from its own identity, not the measured Radeon 780M's ("The Vulkan platform on an RDNA3 GPU", above) |
   | `REIMS_VGPU_DMA_BUF_RACE_FIX` | the Vulkan platform on Linux: defaults to on; `0`, `false`, `no` or `off` (case and surrounding spaces ignored) restores separate DMA-BUFs for concurrent cache misses on identical pages; ordinary cache hits still share. Read at the first DMA-BUF request; restart the VM process after changing it (docs/qemu.md, "Slow icon generation after login") |
   | `REIMS_VGPU_CENSUS_DIR` | the Vulkan platform on Linux, a diagnostic for inventory runs: each difference that would end the process is recorded in that directory and logged instead, and the run says it is not faithful to Metal; ignored on macOS |
+  | `REIMS_VGPU_TRACE` | the Vulkan platform, a diagnostic for profiling: a timeline of the device's work, a line per event, written to the file it names (core's `trace` module); the Metal platform writes nothing |
+  | `REIMS_VGPU_TRACE_DEGRADE` | with `REIMS_VGPU_TRACE`, `1`: every occurrence of every difference from Metal the runtime announces is written to the trace; the log is as without it |
 
-  `REIMS_VGPU_WINDOW` is QEMU's, not the library's: `0` keeps `apple-gfx` headless under `-display none` (docs/qemu.md, "Window mode"). Of these, only `REIMS_VGPU_STRICT`, `REIMS_VGPU_EXACT`, `REIMS_VGPU_RDNA3` and `REIMS_VGPU_CENSUS_DIR` change what the guest or host observes, and only on the Vulkan platform; `REIMS_VGPU_WINDOW_SCREENS` and `_REFRESH` change the modes a window display with `RVG_WINDOW_MATCH_HOST_SCREEN` offers its guest.
+  `REIMS_VGPU_WINDOW` is QEMU's, not the library's: `0` keeps `apple-gfx` headless under `-display none` (docs/qemu.md, "Window mode"). Of these, only `REIMS_VGPU_STRICT`, `REIMS_VGPU_EXACT`, `REIMS_VGPU_RDNA3` and `REIMS_VGPU_CENSUS_DIR` change what the guest or host observes, and only on the Vulkan platform (the trace variables change only the trace and the log lines); `REIMS_VGPU_WINDOW_SCREENS` and `_REFRESH` change the modes a window display with `RVG_WINDOW_MATCH_HOST_SCREEN` offers its guest.
 
 ### cbindgen
 

@@ -18,12 +18,15 @@
 //!   ([`surface_memory_hold`]): a device's import of the pages at the surface's base address
 //!   holds one until the runtime has freed the import, so the pages stay mapped while it lives
 //!   (`VK_EXT_external_memory_host`), though the surface's last reference went at Metal's
-//!   moment. One over a single range maps nothing of its own: the range is core's mapping, which
-//!   core unmaps through the platform's VM, so the hold holds that unmap instead
-//!   ([`crate::remap::UnmapHold`]). A hold is no reference: the retain count stays the objects'.
-//!   Measured on an Iris
-//!   Xe (Mesa 26.2.4's ANV, i915): ANV puts every live import in each execbuffer, and one whose
-//!   pages are unmapped fails it with `EFAULT`, which ANV answers as the device lost.
+//!   moment. One over a single range maps nothing of its own. Core makes such a surface only
+//!   over one page of the host's own RAM, which a memory map names (core's walk of the guest's
+//!   page table gives each page by the memory map's host address), and which the host maps and
+//!   unmaps, not the library ([`crate::remap`]'s docs, "Not reported"). Its hold is an unmap hold
+//!   on the range ([`crate::remap::UnmapHold`]), which defers an unmap only of pages mapped
+//!   through the platform's VM, so for such a surface it defers nothing. A hold is no
+//!   reference: the retain count stays the objects'. Measured on an Iris Xe (Mesa 26.2.4's ANV,
+//!   i915): ANV puts every live import in each execbuffer, and one whose pages are unmapped
+//!   fails it with `EFAULT`, which ANV answers as the device lost.
 //! - **What it answers** is the spec's: its planes, rows and sizes, its allocation size exactly
 //!   as given. It holds no values (`IOSurfaceCopyValue`): nothing in the process sets one.
 //!   `lock` and `unlock` do nothing.
@@ -137,7 +140,8 @@ impl Drop for Memory {
 
 /// A hold on the memory `surface` mapped, which keeps it mapped while it lives, the surface gone
 /// or not, and counts no reference of the surface; for one over a single range of the guest's
-/// pages, which maps nothing, an unmap hold on that range of core's mapping (module docs).
+/// pages, which maps nothing, an unmap hold on that range, which defers nothing for a range of
+/// the host's own RAM, the only one core makes such a surface over (module docs).
 pub(crate) fn surface_memory_hold(surface: &LinuxSurface) -> impl Send + 'static {
     let data = surface.data();
     let memory = &data.memory;

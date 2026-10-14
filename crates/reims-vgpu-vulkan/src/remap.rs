@@ -106,8 +106,10 @@
 //!   pages it imported, as Metal's reads those it wired. A driver that validates such pages again
 //!   at each submission fails a submission that lists the import in that window: on Linux the
 //!   surface stand-in's own memory and views (`os::linux::surface`) are therefore held until the
-//!   free, by the keep-alive of a buffer over a surface at no offset (`surface_memory_hold`), and
-//!   so is core's unmap of the single range of its mapping a surface lies in, by an [`UnmapHold`].
+//!   free, by the keep-alive of a buffer over a surface at no offset (`surface_memory_hold`). A
+//!   surface over a single range of the guest's pages maps nothing: core makes one only over a
+//!   page of the host's own RAM ("Not reported", above), which no hold defers, and the
+//!   [`UnmapHold`] its hold carries defers an unmap only of pages [`VulkanVm`] maps.
 //!   Measured on an Iris Xe (Mesa 26.2.4's ANV, i915) before that hold: ANV lists every live
 //!   import in each execbuffer, and one listing an import whose pages a surface's release had
 //!   unmapped failed with `EFAULT`, which ANV answers as the device lost.
