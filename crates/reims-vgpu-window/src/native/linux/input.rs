@@ -33,7 +33,7 @@
 //! While captured, the window grabs the keyboard (`SDL_SetWindowKeyboardGrab`): on Wayland the
 //! compositor's shortcuts inhibitor, so its own shortcuts reach the guest.
 
-use crate::capture::Capture;
+use crate::capture::{Capture, UNCAPTURED_SUFFIX};
 use crate::config::{
     BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, ScrollEvent,
     WindowCallbacks,
@@ -160,12 +160,12 @@ impl Input {
         self.capture.is_captured()
     }
 
-    /// What the title ends with: the release chord while captured, nothing while not.
+    /// What the title ends with: the release chord while captured, that a click captures while not.
     pub(crate) fn title_suffix(&self) -> &'static str {
         if self.is_captured() {
             CAPTURED_SUFFIX
         } else {
-            ""
+            UNCAPTURED_SUFFIX
         }
     }
 
@@ -507,7 +507,7 @@ mod tests {
                 ToHost::Key(KeyEvent::up(0xE0)),
             ]
         );
-        assert_eq!(input.title_suffix(), "");
+        assert_eq!(input.title_suffix(), UNCAPTURED_SUFFIX);
     }
 
     /// Losing the keyboard lifts every key and button and releases capture

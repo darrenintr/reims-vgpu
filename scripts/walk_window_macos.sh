@@ -154,7 +154,7 @@ wait_for "Close other GPU-heavy apps"
 # ---------------------------------------------------------------- boot 1
 boot windowed || exit 1
 
-step O1 "One window opened by itself (QEMU runs with -display none), titled \"Reims vGPU\" (tests: handle::a_window_s_title_is_reims_vgpu_and_its_port)."
+step O1 "One window opened by itself (QEMU runs with -display none), titled \"Reims vGPU — click to capture input\" (tests: handle::a_window_s_title_is_reims_vgpu_and_its_port, capture::the_title_says_whether_input_is_captured)."
 step O2 "The VM is an app: a Dock icon, a ⌘Tab entry, and a menu bar with Quit, Hide and Hide Others, and a Window menu with Minimize, Zoom, Full Screen and Release Input."
 step O3 "The window shows the 1920x1080 1x guest a guest point per host point, shrunk to fit the screen's visible area (not at half size), the image scaled up on the GPU and sharp (tests: geometry::a_new_window_*)."
 step O4 "Display i opens on screen i: with only the built-in screen, the window is on it. With a second screen, skip unless REIMS_VGPU_WINDOW_SCREENS was set (tests: screens::*)."
@@ -200,7 +200,7 @@ step K2 "On an ISO keyboard, the key left of 1 and the key right of left Shift a
 step K3 "Caps Lock toggles as on a Mac keyboard (one press on, one off)."
 step K4 "A held key repeats at the guest's rate, with no doubled characters from the host's repeat (tests: keys::host_repeats_are_dropped, native::macos::input::host_repeats_are_dropped_at_the_view)."
 step K5 "Key-ups under Command reach the guest: hold ⌘, tap A then release: the guest selects all once and no key stays down (test: native::macos::input::key_ups_under_command_reach_the_guest)."
-step C2 "Press ⌃⌥⌘ together: capture is released, the title says so, and no key stays down in the guest (tests: capture::control_option_command_releases, native::macos::input::the_release_chord_lifts_every_key_and_releases)."
+step C2 "Press ⌃⌥⌘ together: capture is released, the title says \"click to capture input\" again, and no key stays down in the guest (tests: capture::control_option_command_releases, native::macos::input::the_release_chord_lifts_every_key_and_releases)."
 step C3 "Capture again, then hold a letter key and click another host app's window: capture is released, the host's ⌘Tab and Spotlight work again, and the letter stops repeating in the guest (tests: native::macos::input::losing_focus_*, native::macos::hotkeys::the_hot_keys_come_back_when_the_last_holder_lets_go)."
 step C4 "Uncaptured, ⌘ shortcuts drive the host's menu (⌘H hides the VM), and other keys go to the guest (tests: capture::uncaptured_command_goes_to_the_host)."
 

@@ -190,7 +190,9 @@ Unset or unparsable values give the defaults below.
   `test: capture::losing_focus_releases`,
   `test: native::macos::input::losing_focus_lifts_every_key_and_releases`,
   `test: native::macos::hotkeys::the_hot_keys_come_back_when_the_last_holder_lets_go`
-- The title says when input is captured and how to release it. `manual`
+- The title says whether input is captured: " — click to capture input"
+  while not, and how to release it while it is.
+  `test: capture::the_title_says_whether_input_is_captured`, `manual`
 - Uncaptured, ⌘ shortcuts drive the host's menu, and other keys go to the
   guest. `test: capture::uncaptured_command_goes_to_the_host`,
   `test: native::macos::input::uncaptured_command_keys_go_to_the_menu`
@@ -333,7 +335,8 @@ runtime's own device. The switches above apply, and `resolution=` too.
 - Capture: a click in the image captures, and the window then grabs the
   keyboard, so the compositor's own shortcuts (Super, Alt+Tab) reach the
   guest; Ctrl+Alt+Super releases; losing the keyboard releases; the title
-  says so. `test: native::linux::input::a_click_in_the_image_captures_and_is_sent`,
+  says whether input is captured, as on macOS, with Ctrl+Alt+Super to
+  release. `test: native::linux::input::a_click_in_the_image_captures_and_is_sent`,
   `test: native::linux::input::ctrl_alt_super_releases_capture`, `manual` (the grab)
 - Scrolling: the wheel's notches, or, where the host takes smooth
   scrolling, its lines at 10 points each, in no gesture (SDL gives no

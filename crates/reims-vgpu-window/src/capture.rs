@@ -38,6 +38,9 @@ pub struct Capture {
 const CAPTURED_SUFFIX: &str =
     " \u{2014} input captured (press \u{2303}\u{2325}\u{2318} to release)";
 
+/// What the title says while not captured, on every OS: that a click captures.
+pub(crate) const UNCAPTURED_SUFFIX: &str = " \u{2014} click to capture input";
+
 impl Capture {
     /// Not captured.
     pub fn new() -> Capture {
@@ -88,9 +91,13 @@ impl Capture {
     }
 
     /// The text the window's title ends with: what capture is on and how to release it while
-    /// captured, and nothing while not.
+    /// captured, and that a click captures while not.
     pub fn title_suffix(&self) -> &'static str {
-        if self.captured { CAPTURED_SUFFIX } else { "" }
+        if self.captured {
+            CAPTURED_SUFFIX
+        } else {
+            UNCAPTURED_SUFFIX
+        }
     }
 }
 
@@ -184,15 +191,18 @@ mod tests {
         assert!(!capture.resign_key());
     }
 
-    /// The title says so while captured, and how to release
+    /// The title says a click captures while not captured, and how to release while captured
     #[test]
-    fn the_title_says_when_captured() {
+    fn the_title_says_whether_input_is_captured() {
         let mut capture = Capture::new();
-        assert_eq!(capture.title_suffix(), "");
+        assert_eq!(capture.title_suffix(), " \u{2014} click to capture input");
         capture.click_in_image(true);
         assert!(capture.title_suffix().contains("captured"));
         assert!(capture.title_suffix().contains("\u{2303}\u{2325}\u{2318}"));
         capture.release();
-        assert_eq!(capture.title_suffix(), "");
+        assert_eq!(capture.title_suffix(), UNCAPTURED_SUFFIX);
+        capture.click_in_image(false);
+        capture.resign_key();
+        assert_eq!(capture.title_suffix(), UNCAPTURED_SUFFIX);
     }
 }
