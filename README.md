@@ -210,7 +210,7 @@ tree can run on it beside the Metal one.
 macOS already includes a paravirtual GPU driver named `AppleParavirtGPU.kext`, written against the
 host side Apple ships as `ParavirtualizedGraphics.framework`. reims-vgpu replaces that framework.
 It takes the guest's GPU command stream and runs it on Metal on a Mac, or on Vulkan on Linux
-through [`metal2vulkan`](https://github.com/steelbrain/metal2vulkan), and can draw each guest
+through [`metal2vulkan`](https://github.com/darrenintr/metal2vulkan), and can draw each guest
 display into a window of its own. QEMU's `apple-gfx` devices link it, on a Mac as on Linux. There
 is no custom macOS kext and no guest driver to install.
 
