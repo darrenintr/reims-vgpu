@@ -311,6 +311,14 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
             .into_iter()
             .chain(crate::answer::HEARD)
             .collect();
+        if std::env::var_os(reims_vgpu_core::trace::ENV_VAR).is_some() {
+            reims_vgpu_core::trace::set_clock(crate::gpu::timing::trace_clock);
+            if crate::answer::trace_degradations() {
+                // Every occurrence reaches the sink, which writes each to the trace and relays
+                // a kind the runtime announces once only the first time.
+                options.announce_each = rt::Degradation::ALL.iter().copied().collect();
+            }
+        }
         if let Some(home) = std::env::var_os("HOME") {
             options.shader_cache =
                 rt::ShaderCacheOptions::in_directory(PathBuf::from(home).join(SHADER_CACHE));

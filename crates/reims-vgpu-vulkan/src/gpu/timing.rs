@@ -57,6 +57,7 @@ use crate::os::OsClock;
 use reims_vgpu_core::platform::types::NsErrorText;
 use reims_vgpu_core::raise::RaiseResult;
 use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_core::trace;
 
 /// An encoder command or a commit that takes this long or longer is written.
 pub const SLOW_CALL: Duration = Duration::from_millis(5);
@@ -203,7 +204,8 @@ pub fn encoder_call<T>(sel: &str, pipeline: &AtomicU64, call: impl FnOnce() -> T
 /// [`LATE_COMPLETION`] or more after the commit began. A handler the runtime refuses (the command buffer was committed
 /// already, which the commit then refuses too) is no line.
 pub fn commit<T>(cb: &rt::CommandBuffer, commit: impl FnOnce() -> T) -> T {
-    if !on() {
+    let traced = trace::on();
+    if !on() && !traced {
         return commit();
     }
     let n = COMMITS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
@@ -211,6 +213,10 @@ pub fn commit<T>(cb: &rt::CommandBuffer, commit: impl FnOnce() -> T) -> T {
     let start = now();
     let host_start = rt::host_time();
     let late = queue.clone();
+    if traced {
+        // cbcommit: command buffer, commit number, queue label
+        trace::event_text("cbcommit", &[id(cb), n], &queue);
+    }
     let _ = cb.add_completed_handler(Box::new(move |cb: &rt::CommandBuffer| {
         let elapsed = elapsed_since(start);
         let times = Times {
@@ -221,6 +227,27 @@ pub fn commit<T>(cb: &rt::CommandBuffer, commit: impl FnOnce() -> T) -> T {
             gpu_end: cb.gpu_end_time().unwrap_or(0.0),
             handler: rt::host_time(),
         };
+        if traced {
+            // cbdone (timed at its handler): command buffer, commit number, then its commit,
+            // submission start and end, GPU start and end, in the trace's nanoseconds
+            trace::event_at(
+                nanos(times.handler),
+                "cbdone",
+                &[
+                    id(cb),
+                    n,
+                    nanos(times.commit),
+                    nanos(times.kernel_start),
+                    nanos(times.kernel_end),
+                    nanos(times.gpu_start),
+                    nanos(times.gpu_end),
+                ],
+            );
+            work_counts(cb);
+        }
+        if !on() {
+            return;
+        }
         let lines = SUMMARY.lock().add(&late, &times);
         for line in lines {
             log::debug!("{line}");
@@ -249,6 +276,10 @@ pub fn commit<T>(cb: &rt::CommandBuffer, commit: impl FnOnce() -> T) -> T {
         );
     }));
     let out = commit();
+    if traced {
+        // committed: command buffer: its commit returned
+        trace::event("committed", &[id(cb)]);
+    }
     let elapsed = elapsed_since(start);
     if elapsed >= SLOW_CALL {
         log::debug!(
@@ -258,6 +289,72 @@ pub fn commit<T>(cb: &rt::CommandBuffer, commit: impl FnOnce() -> T) -> T {
         );
     }
     out
+}
+
+/// A command buffer's number in the trace: its address.
+pub fn id(cb: &rt::CommandBuffer) -> u64 {
+    u64::try_from(std::ptr::from_ref(cb).addr()).unwrap_or_default()
+}
+
+/// Seconds of the runtime's host clock, in the trace's nanoseconds (its clock is the runtime's,
+/// [`trace_clock`]); 0 stays 0.
+fn nanos(seconds: f64) -> u64 {
+    if seconds <= 0.0 {
+        return 0;
+    }
+    std::time::Duration::try_from_secs_f64(seconds)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// The trace's clock: the runtime's host clock, in nanoseconds, so a command buffer's times and
+/// the trace's events are of one clock.
+pub fn trace_clock() -> u64 {
+    nanos(rt::host_time())
+}
+
+/// The draws encoded while the trace is on, which [`work_counts`] writes.
+static DRAWS: AtomicU64 = AtomicU64::new(0);
+
+/// Counts a draw for the trace ([`work_counts`]).
+pub fn count_draw() {
+    if trace::on() {
+        DRAWS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The runtime's counts of what its commit path did, written to the trace at most every 100 ms,
+/// and the draws encoded so far.
+fn work_counts(cb: &rt::CommandBuffer) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let t = trace::now();
+    let last = LAST.load(Ordering::Relaxed);
+    if t.saturating_sub(last) < 100_000_000
+        || LAST
+            .compare_exchange(last, t, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let c = cb.command_queue().device().work_counts();
+    // wc: the counts named in the order written, then the draws
+    trace::event(
+        "wc",
+        &[
+            c.timeline_waits,
+            c.command_pools_made,
+            c.live_tables_uploaded,
+            c.pipelines_pooled,
+            c.variant_pipelines_made,
+            c.host_step_sampler_sets_made,
+            c.ahead_render_passes_made,
+            c.storage_forms_taken,
+            c.addressable_buffers_made,
+            c.dispatch_pipelines_pooled,
+            c.creation_pipelines_made,
+            c.kept_backings_made,
+            DRAWS.load(Ordering::Relaxed),
+        ],
+    );
 }
 
 /// The host times of a command buffer, in seconds of the runtime's `host_time` clock, each 0

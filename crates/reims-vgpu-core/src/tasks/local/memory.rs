@@ -322,6 +322,13 @@ impl<P: Platform> LocalTask<P> {
             // (the host's `map_memory` callback's), which the host keeps until the guest unmaps
             // it; Metal gets the same memory with no deallocator.
             let bytes = unsafe { crate::platform::HostRange::new(pointer, length) };
+            // Trace `tbuf`: the task page, the length, the host address, 0 (the blocks setup) and
+            // the guest's task id.
+            let task = u64::from(self.task_id);
+            crate::trace::event(
+                "tbuf",
+                &[u64::from(page), length, pointer.addr().to_u64(), 0, task],
+            );
             match device {
                 Some(d) => d.new_buffer_over_host_memory(OnFault::Return, bytes, 0, None)?,
                 None => None,
@@ -342,6 +349,13 @@ impl<P: Platform> LocalTask<P> {
             // mapping's own, page-aligned: `virtual_mapping` refused anything else), and the
             // deallocator owns the mapping, so the range stays mapped until Metal runs it.
             let bytes = unsafe { crate::platform::HostRange::new(pointer, length) };
+            // Trace `tbuf`: the task page, the length, the host address, 1 (the map setup) and
+            // the guest's task id.
+            let task = u64::from(self.task_id);
+            crate::trace::event(
+                "tbuf",
+                &[u64::from(page), length, pointer.addr().to_u64(), 1, task],
+            );
             let buffer = match device {
                 Some(d) => {
                     d.new_buffer_over_host_memory(OnFault::Return, bytes, 0, Some(deallocator))
