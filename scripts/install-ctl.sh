@@ -277,17 +277,22 @@ if [[ $SKIP_QEMU == 0 ]]; then
   CONFIGURED="PKG_CONFIG_PATH=$PC ${CONFIGURE[*]}"
   # Configure again when the source, the options, the package's directory, or
   # the package itself changed: meson keeps the package's flags from configure
-  # (docs/lessons.md).
+  # (docs/lessons.md); and when ninja's dry run fails, as it does once a system
+  # update removed a library file build.ninja names (/usr/lib/libfdt.so.1.8.1).
   if [[ ! -f "$BUILD/build.ninja" ]] ||
     [[ "$(cat "$BUILD/configured-with" 2>/dev/null)" != "$CONFIGURED" ]] ||
-    ! cmp -s "$PC/reims-vgpu.pc" "$BUILD/reims-vgpu.pc.configured"; then
+    ! cmp -s "$PC/reims-vgpu.pc" "$BUILD/reims-vgpu.pc.configured" ||
+    ! ninja -C "$BUILD" -n >/dev/null 2>&1; then
     say "Configuring QEMU"
     (cd "$BUILD" && PKG_CONFIG_PATH="$PC" "${CONFIGURE[@]}")
     cp "$PC/reims-vgpu.pc" "$BUILD/reims-vgpu.pc.configured"
     printf '%s\n' "$CONFIGURED" >"$BUILD/configured-with"
   fi
   say "Building QEMU"
-  ninja -C "$BUILD"
+  # A build that stops configures again on the next run: when ninja has meson
+  # regenerate build.ninja, meson reuses the dependencies it found before, a
+  # removed one too, which the dry run above does not catch.
+  ninja -C "$BUILD" || { rm -f "$BUILD/configured-with"; die "QEMU's build stopped; the next run configures it again"; }
   STAGE="$CACHE/qemu-stage"
   rm -rf "$STAGE"
   DESTDIR="$STAGE" ninja -C "$BUILD" install >/dev/null
