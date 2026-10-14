@@ -94,19 +94,23 @@
 //! - **What is not ours to unmap**: memory a no-copy buffer lies in whose unmap is the host's or
 //!   the system's, which no hold defers: the host's own mapping in a device without a memory map
 //!   (`unmapMemory`, the blocks setup; QEMU passes a memory map, so a guest under QEMU never
-//!   reaches it, and only the suite's runner makes the blocks setup), an IOSurface's memory that
-//!   a buffer over it at no offset imports as it is (core's buffer over a guest's IOSurface,
-//!   `MapperRef`, whichever guest maps one), and on Linux the surface stand-in's own memory and
-//!   views (`os::linux::surface`). There the deallocator (the host's unmap, the surface's
-//!   release) may unmap the pages before the free, in the same release, or, where a command
-//!   buffer submitted before a texture over them was released still holds the import, until it
-//!   completes. Ground: MoltenVK's no-copy buffer keeps the
-//!   pages it was made over, which Metal wires as it makes the buffer (`tests/no_copy_remap.rs`
-//!   measures a remap under one), and NVIDIA's host-pointer import pins its
-//!   pages as it imports them (Linux drivers pin imported pages, the runtime's `host_memory`), so
-//!   on this platform's devices the GPU still reads the pages it imported, as Metal's reads those
-//!   it wired. A driver that validates such pages again at each submission (ANV's and i915's
-//!   userptr) would fail a submission that lists the import in that window.
+//!   reaches it, and only the suite's runner makes the blocks setup), and on macOS an IOSurface's
+//!   memory that a buffer over it at no offset imports as it is (core's buffer over a guest's
+//!   IOSurface, `MapperRef`, whichever guest maps one). There the deallocator (the host's unmap,
+//!   the surface's release) may unmap the pages before the free, in the same release, or, where
+//!   a command buffer submitted before a texture over them was released still holds the import,
+//!   until it completes. Ground: MoltenVK's no-copy buffer keeps the pages it was made over,
+//!   which Metal wires as it makes the buffer (`tests/no_copy_remap.rs` measures a remap under
+//!   one), and NVIDIA's host-pointer import pins its pages as it imports them (Linux drivers pin
+//!   imported pages, the runtime's `host_memory`), so on those devices the GPU still reads the
+//!   pages it imported, as Metal's reads those it wired. A driver that validates such pages again
+//!   at each submission fails a submission that lists the import in that window: on Linux the
+//!   surface stand-in's own memory and views (`os::linux::surface`) are therefore held until the
+//!   free, by the keep-alive of a buffer over a surface at no offset (`surface_memory_hold`), and
+//!   so is core's unmap of the single range of its mapping a surface lies in, by an [`UnmapHold`].
+//!   Measured on an Iris Xe (Mesa 26.2.4's ANV, i915) before that hold: ANV lists every live
+//!   import in each execbuffer, and one listing an import whose pages a surface's release had
+//!   unmapped failed with `EFAULT`, which ANV answers as the device lost.
 //!
 //! What a report costs, measured on the M3 Max (release build, 100,000 calls, three runs): with
 //! no no-copy buffer live, about 11 ns per wrapped block call, the task lookup and the runtime's

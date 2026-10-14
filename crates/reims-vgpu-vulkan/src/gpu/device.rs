@@ -533,9 +533,10 @@ impl VulkanDevice {
     /// allocation size), whose deallocator holds `surface` until the runtime releases the buffer,
     /// at Metal's moment (given a keep-alive), and whose range token is
     /// `token`, which the runtime drops as it frees the buffer's range. Over the surface's memory
-    /// itself, nothing of this platform's keeps it mapped: the surface's last release may unmap
-    /// it before the runtime frees its import (`crate::remap`'s docs, "What is not ours to
-    /// unmap"); over an alias, the keep-alive holds the alias until then.
+    /// itself, the keep-alive holds that memory until the runtime frees its import on Linux,
+    /// whatever the surface's last release (`crate::os::surface_memory_hold`), and nothing holds
+    /// it on macOS, where the surface's last release may unmap it before (`crate::remap`'s docs,
+    /// "What is not ours to unmap"); over an alias, the keep-alive holds the alias until then.
     ///
     /// At an offset into the surface's allocation (`kIOSurfaceOffset`,
     /// [`crate::os::surface_offset`]) the base address lies that far into it, and the buffer's last
@@ -590,7 +591,10 @@ impl VulkanDevice {
                  address",
                 crate::os::memory_kind(surface)
             );
-            (base, backing::keep_alive(()))
+            // The runtime runs the deallocator as it lets go of the buffer, which may drop the
+            // surface's last reference, and frees its import once nothing else holds it.
+            let hold = crate::os::surface_memory_hold(surface);
+            (base, backing::keep_alive(hold))
         } else {
             let first = u64::try_from(base.as_ptr().addr())
                 .unwrap_or(u64::MAX)
@@ -630,9 +634,10 @@ impl VulkanDevice {
                 .wrapping_add(usize::try_from(offset).unwrap_or(usize::MAX));
             (pointer(sel, HostPtr::from_ptr(from)), keep)
         };
-        // SAFETY: the surface's memory stays mapped while the surface lives, which the
-        // deallocator holds until the runtime lets go of the buffer; an alias of its allocation,
-        // which the keep-alive holds, until the runtime freed its import.
+        // SAFETY: an alias of the surface's allocation stays mapped until the runtime freed its
+        // import, which the keep-alive holds, and so does the surface's own memory on Linux
+        // (`surface_memory_hold`); on macOS that memory stays while the surface lives, which the
+        // deallocator holds until the runtime lets go of the buffer, Metal's moment.
         let memory = unsafe { crate::os::host_memory(base) };
         let contents = rt::BufferContents::NoCopy {
             memory,
@@ -1985,6 +1990,196 @@ pub(crate) mod tests {
             "the command buffer read the bytes"
         );
         assert_eq!(d.raw.work_counts().host_deallocators_delayed, 0);
+    }
+
+    /// A texture on a surface, whose buffer imports the surface's memory at its base address,
+    /// released with the surface's last reference while a command buffer that binds the device's
+    /// heap set runs: that command buffer may read any live texture through its ID, so the runtime
+    /// keeps the texture's image, which holds the import, until it completes, while the texture and
+    /// its buffer go at the release, Metal's moment, and with the buffer the deallocator runs,
+    /// which drops the surface's last reference. The surface's memory stays mapped until the
+    /// runtime freed the import, after the command buffer completed
+    /// ([`crate::os::surface_memory_hold`]): its own memory, and a single range of core's mapping
+    /// of the guest's pages, which core then unmaps through the platform's VM. An i915 execbuffer
+    /// that lists an import whose pages are unmapped fails, which ANV answers as the device lost
+    /// (`crate::remap`'s docs). The command buffer reads another texture through its ID, so no
+    /// command of it names the surface's. Linux's: on macOS IOSurface's memory is the surface's own
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_surface_textures_image_keeps_the_surfaces_memory() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
+
+        use reims_vgpu_core::host::PhysicalMemoryRange;
+        use reims_vgpu_core::num::ToU64 as _;
+        use reims_vgpu_core::platform::blit::ResourceRef;
+        use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
+        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
+        use reims_vgpu_core::platform::os::surface::{IoSurfaces as _, Surface as _, SurfaceSpec};
+        use reims_vgpu_core::platform::os::vm::HostVm as _;
+        use reims_vgpu_core::platform::resource::{Buffer, Library, Texture as _};
+        use reims_vgpu_core::platform::types::{CommandBufferStatus, MtlSize, NsRange};
+
+        use crate::gpu::resource::tests::bgra;
+
+        /// The kernel that keeps the GPU busy (`src/gpu/spin.metal`), as the test above uses it.
+        const SPIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/spin.metallib"));
+        /// The kernels that read a texture an argument buffer holds (`src/gpu/rgbx.metal`).
+        const RGBX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rgbx.metallib"));
+        const ROUNDS: u32 = 1_000;
+        /// `MTLResourceUsageRead`.
+        const READ: u64 = 1;
+        /// The surface's bytes: 64 x 32 BGRA texels.
+        const LEN: u64 = 64 * 32 * 4;
+        let wait = Duration::from_secs(30);
+        // Whether `done` came true within `wait`, polled each millisecond.
+        let within = |done: &dyn Fn() -> bool| {
+            (0..wait.as_millis()).any(|_| {
+                done() || {
+                    std::thread::sleep(Duration::from_millis(1));
+                    false
+                }
+            }) || done()
+        };
+        let d = dev();
+        let state = |metallib: &[u8], kernel: &str| {
+            let library = d.new_library(metallib).unwrap().unwrap().unwrap();
+            let function = library.new_function(OnFault::Die, kernel).unwrap().unwrap();
+            d.new_compute_pipeline_state_for_function(Some(&function))
+                .unwrap()
+                .unwrap()
+        };
+        let buffer = |length: u64| {
+            d.new_buffer_of_length(OnFault::Die, length, 0)
+                .unwrap()
+                .unwrap()
+        };
+        let spin = state(SPIN, "spin");
+        let held_read = state(RGBX, "rgbx_read_held_float");
+        let other = d
+            .new_texture(OnFault::Die, &bgra(4, 4, 0))
+            .unwrap()
+            .unwrap();
+        let queue = d.new_command_queue().unwrap();
+        // Core's mapping of the guest's pages the second surface lies in, as a memory map's.
+        let vm = crate::remap::VulkanVm::new();
+        let pages = vm.allocate_anywhere(LEN).unwrap();
+        let over_pages = SurfaceSpec {
+            pixel_format: u32::from_be_bytes(*b"BGRA"),
+            alloc_size: LEN,
+            width: 64,
+            height: 32,
+            bytes_per_element: 4,
+            bytes_per_row: 64 * 4,
+            element_width: 1,
+            element_height: 1,
+            client_address_ranges: Some(vec![PhysicalMemoryRange {
+                physical_address: pages.addr().to_u64(),
+                physical_length: LEN,
+            }]),
+            ..SurfaceSpec::default()
+        };
+        let surfaces = [
+            (crate::os::tests::bgra_surface(64, 32), false),
+            (
+                crate::os::OsSurfaces::new().create(&over_pages).unwrap(),
+                true,
+            ),
+        ];
+        for (surface, cores) in surfaces {
+            let base = surface.base_address();
+            let texture = d
+                .new_texture_on_surface(&bgra(64, 32, 0), Some(&surface), 0)
+                .unwrap()
+                .unwrap();
+            let (words, read, held) = (buffer(16), buffer(16), buffer(8));
+            let word = |i: usize| {
+                // SAFETY: one of the buffer's four words, which the kernel reads and writes.
+                unsafe { AtomicU32::from_ptr(words.contents().as_ptr::<u32>().add(i)) }
+            };
+            word(0).store(ROUNDS, Ordering::SeqCst);
+            // SAFETY: the argument buffer's 8 bytes, which no command uses yet.
+            unsafe {
+                held.contents()
+                    .as_ptr::<u64>()
+                    .write(other.gpu_resource_id())
+            };
+            let cb = queue.command_buffer(OnFault::Die).unwrap().unwrap();
+            let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
+            let resident = [Some(ResourceRef::Texture(&other))];
+            let one = MtlSize::new(1, 1, 1);
+            for cmd in [
+                ComputeCmd::SetComputePipelineState { state: Some(&spin) },
+                ComputeCmd::SetBuffers {
+                    buffers: &[Some(&words)],
+                    offsets: &[0],
+                    range: NsRange::new(0, 1),
+                },
+                ComputeCmd::DispatchThreads {
+                    threads_per_grid: one,
+                    threads_per_threadgroup: one,
+                },
+                ComputeCmd::SetComputePipelineState {
+                    state: Some(&held_read),
+                },
+                ComputeCmd::SetBuffers {
+                    buffers: &[Some(&read), Some(&held)],
+                    offsets: &[0, 0],
+                    range: NsRange::new(0, 2),
+                },
+                ComputeCmd::UseResources {
+                    resources: &resident,
+                    usage: READ,
+                },
+                ComputeCmd::DispatchThreads {
+                    threads_per_grid: one,
+                    threads_per_threadgroup: one,
+                },
+                ComputeCmd::EndEncoding,
+            ] {
+                e.encode(OnFault::Die, cmd).unwrap();
+            }
+            cb.commit(OnFault::Die).unwrap();
+            cb.wait_until_scheduled().unwrap();
+            let running = word(1).load(Ordering::SeqCst) == 0;
+            drop((texture, surface));
+            // Core's mapping's release (`Teardown::Vm`), once the surface went.
+            let unmapped = !cores
+                || crate::remap::VulkanVm::new()
+                    .deallocate(pages, LEN)
+                    .is_success();
+            let mapped_while_running = crate::os::mapped(base);
+            assert!(
+                running,
+                "released while the kernel ran (core's mapping: {cores})"
+            );
+            assert_eq!(
+                word(1).load(Ordering::SeqCst),
+                0,
+                "checked while the kernel ran (core's mapping: {cores})"
+            );
+            assert!(unmapped, "core's unmap answers success");
+            assert!(
+                mapped_while_running,
+                "the surface's memory stays mapped while the device imports it (core's mapping: \
+                 {cores})"
+            );
+            let ended = [CommandBufferStatus::COMPLETED, CommandBufferStatus::ERROR];
+            assert!(
+                within(&|| ended.contains(&cb.status())),
+                "the command buffer did not complete"
+            );
+            assert_eq!(
+                cb.status(),
+                CommandBufferStatus::COMPLETED,
+                "{:?}",
+                cb.error()
+            );
+            assert!(
+                within(&|| !crate::os::mapped(base)),
+                "unmapped once the import was freed (core's mapping: {cores})"
+            );
+        }
     }
 
     /// Every handle to one runtime device is one object

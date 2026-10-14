@@ -321,6 +321,11 @@ pub(crate) fn plane_shape(surface: &MetalSurface, plane: u64) -> Option<(u64, u6
     ))
 }
 
+/// What keeps `surface`'s memory mapped while a device imports it at its base address, the
+/// surface gone or not: nothing here. IOSurface's memory is the surface's own, and nothing but a
+/// reference of the surface, which the guest counts, keeps it.
+pub(crate) fn surface_memory_hold(_surface: &MetalSurface) -> impl Send + 'static {}
+
 /// The surface's key that names its YCbCr matrix (`kIOSurfaceYCbCrMatrix`).
 pub(crate) const MATRIX_KEY: &str = "IOSurfaceYCbCrMatrix";
 
