@@ -1,0 +1,109 @@
+diff --git a/crates/metal2vulkan-runtime/src/scheduler/coalesce.rs b/crates/metal2vulkan-runtime/src/scheduler/coalesce.rs
+index 2d4529f..70d48d9 100644
+--- a/crates/metal2vulkan-runtime/src/scheduler/coalesce.rs
++++ b/crates/metal2vulkan-runtime/src/scheduler/coalesce.rs
+@@ -30,8 +30,12 @@ use crate::exit_guard::{self, Call};
+ use ash::vk;
+ use std::sync::Arc;
+ 
+-/// The most batches one submission takes.
+-const RUN_LIMIT: usize = 64;
++/// The most batches one submission takes: 64, or `M2V_RUN_LIMIT` (1 to 1024), read once.
++fn run_limit() -> usize {
++    static LIMIT: std::sync::LazyLock<usize> =
++        std::sync::LazyLock::new(|| super::tuned("M2V_RUN_LIMIT", 64, 1..=1024) as usize);
++    *LIMIT
++}
+ 
+ /// Diagnostics (`M2V_SCHED_STATS`): submissions, the batches they took, and why each run ended.
+ pub(crate) mod stats {
+@@ -118,7 +122,7 @@ impl Coalesced {
+         if self.batches > 0 {
+             let end = if self.queue != Some(queue) {
+                 Some(0)
+-            } else if self.batches >= RUN_LIMIT {
++            } else if self.batches >= run_limit() {
+                 Some(1)
+             } else if self.conflicts(&part) {
+                 Some(2)
+diff --git a/crates/metal2vulkan-runtime/src/scheduler/mod.rs b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+index 37f4d98..b079e25 100644
+--- a/crates/metal2vulkan-runtime/src/scheduler/mod.rs
++++ b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+@@ -111,7 +111,7 @@ struct SchedulerShared {
+     /// `incoming` may hold commits: the thread does not wait while it is set.
+     pending: AtomicBool,
+     /// Since when `incoming` holds commits a deferring thread left there without a pass
+-    /// ([`defer_submissions`]): the thread takes them once they are [`DEFER_LIMIT`] old, should
++    /// ([`defer_submissions`]): the thread takes them once they are [`defer_limit`] old, should
+     /// no pass take them before.
+     deferred_since: Mutex<Option<std::time::Instant>>,
+     /// A batch waits at its gate for work to complete: the completion thread wakes the thread
+@@ -398,12 +398,34 @@ thread_local! {
+     static DEFERRED_TO: RefCell<Vec<Weak<SchedulerShared>>> = const { RefCell::new(Vec::new()) };
+ }
+ 
+-/// The commits a thread defers in a row before it submits them anyway.
+-const DEFER_COUNT: usize = 32;
++/// The commits a thread defers in a row before it submits them anyway: 32, or
++/// `M2V_DEFER_COUNT` (1 to 4096), read once.
++fn defer_count() -> usize {
++    static COUNT: std::sync::LazyLock<usize> =
++        std::sync::LazyLock::new(|| tuned("M2V_DEFER_COUNT", 32, 1..=4096) as usize);
++    *COUNT
++}
+ 
+ /// How long deferred commits wait at most for a pass before the thread takes them: a deferring
+-/// thread that waits on something its own deferred work must end bears at most this much.
+-const DEFER_LIMIT: Duration = Duration::from_millis(1);
++/// thread that waits on something its own deferred work must end bears at most this much. 1 ms,
++/// or `M2V_DEFER_LIMIT_US` microseconds (50 to 20000), read once.
++fn defer_limit() -> Duration {
++    static LIMIT: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
++        Duration::from_micros(tuned("M2V_DEFER_LIMIT_US", 1000, 50..=20_000))
++    });
++    *LIMIT
++}
++
++/// The value of the environment variable `name` where it is a whole number within `range`, else
++/// `default`: a tuning of the scheduler's for measuring (`M2V_SCHED_STATS` shows its effect), which
++/// changes when work is submitted, never what it does.
++pub(crate) fn tuned(name: &str, default: u64, range: std::ops::RangeInclusive<u64>) -> u64 {
++    std::env::var(name)
++        .ok()
++        .and_then(|v| v.trim().parse::<u64>().ok())
++        .filter(|v| range.contains(v))
++        .unwrap_or(default)
++}
+ 
+ /// Static registry of the schedulers holding deferred commits, for a flush from any thread.
+ static WITH_DEFERRED: Mutex<Vec<Weak<SchedulerShared>>> = Mutex::new(Vec::new());
+@@ -415,8 +437,8 @@ static ANY_DEFERRED: AtomicBool = AtomicBool::new(false);
+ /// pass (`on`), or no more, which submits what it deferred. A deferred commit goes into the
+ /// scheduler's `incoming` in commit order, where any pass takes it, the thread's included: a
+ /// commit from a thread that does not defer, [`flush_deferred_submissions`], any wait for a command
+-/// buffer or an event, the deferring thread's `DEFER_COUNT`th commit in a row, or the scheduler's
+-/// own thread once the oldest is [`DEFER_LIMIT`] old. Commit order is kept across threads, and no
++/// buffer or an event, the deferring thread's [`defer_count`]th commit in a row, or the scheduler's
++/// own thread once the oldest is [`defer_limit`] old. Commit order is kept across threads, and no
+ /// wait waits on deferred work for long.
+ pub fn defer_submissions(on: bool) {
+     DEFERRING.with(|d| d.set(on));
+@@ -485,7 +507,7 @@ fn defer(shared: &Arc<SchedulerShared>) {
+         r.set(n);
+         n
+     });
+-    if run >= DEFER_COUNT {
++    if run >= defer_count() {
+         let _ = flush_deferred_submissions();
+     }
+ }
+@@ -588,7 +610,7 @@ fn run(shared: &SchedulerShared) {
+         while !state.dirty && !state.stopping && !shared.pending.load(Ordering::SeqCst) {
+             // Deferred commits no pass took within the limit are this thread's to take.
+             let slice = match *lock(&shared.deferred_since) {
+-                Some(since) => match DEFER_LIMIT.checked_sub(since.elapsed()) {
++                Some(since) => match defer_limit().checked_sub(since.elapsed()) {
+                     Some(left) if !left.is_zero() => left,
+                     _ => break,
+                 },

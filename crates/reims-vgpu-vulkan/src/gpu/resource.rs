@@ -1783,7 +1783,11 @@ impl Texture<VulkanPlatform> for VulkanTexture {
     ) -> RaiseResult<()> {
         let sel = "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:";
         let raw = self.copied(sel);
-        let bytes = host_bytes(sel, pixel_bytes);
+        let bytes = crate::gpu::timing::resources::call(
+            "replaceRegion host bytes",
+            pixel_bytes.len(),
+            || host_bytes(sel, pixel_bytes),
+        );
         if self.gpu_read_only() {
             let rows = (bytes_per_row, bytes_per_image);
             return self.replaced_on_surface(sel, raw, (region, level, slice), &bytes, rows);
@@ -1791,15 +1795,17 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         if crate::os::TWINS_READ_ONLY && crate::gpu::writes::texture_kept(self) {
             crate::gpu::writes::kept_write(sel, "a CPU write of a texture into");
         }
-        send(sel, Policy::Dies, || {
-            raw.replace_region(
-                crate::gpu::region(region),
-                level,
-                slice,
-                &bytes,
-                bytes_per_row,
-                bytes_per_image,
-            )
+        crate::gpu::timing::resources::call(sel, pixel_bytes.len(), || {
+            send(sel, Policy::Dies, || {
+                raw.replace_region(
+                    crate::gpu::region(region),
+                    level,
+                    slice,
+                    &bytes,
+                    bytes_per_row,
+                    bytes_per_image,
+                )
+            })
         })
     }
 

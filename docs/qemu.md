@@ -547,6 +547,16 @@ reims-ctl set mac --gpu "AMD Radeon RX 7600"   # a name or number from reims-ctl
   the running VM took the 90th percentile of the gaps between frames from 87
   ms to 41 ms, and the 95th from 130 ms to 51 ms, with the GPU 17% busy at the
   median.
+- **`--confine llc`** (off by default; `[cpu] confine` in `vm.toml`) keeps
+  the whole QEMU process within the L3 caches its vCPUs use: with `--pin
+  auto` the vCPUs go to one CCX where they fit and leave one of its cores free
+  (4 vCPUs as 2 cores of 2 threads take CPUs 4, 10, 5 and 11 on the 3600),
+  and every other thread of QEMU, the library's included, gets that CCX's
+  CPUs. It answers the measurement below, where QEMU alone on one CCX held 74
+  to 78 presents a second under a host build and the vCPUs pinned with the
+  rest anywhere held 27 to 39; the setting itself is not measured yet. 8
+  vCPUs on the 3600 use both CCXs, so nothing is confined there, and the log
+  says so. It does not move the host's other work off the CCX.
 - **`--refresh 120`** offers the guest 120 Hz modes (`REIMS_VGPU_WINDOW_REFRESH`).
   The guest's frames complete when the GPU does, not at the host screen's
   vsync (`crates/reims-vgpu-vulkan/src/swapchain.rs`). So the guest runs at
@@ -646,6 +656,38 @@ caches apart; `REIMS_VGPU_RDNA3=0` on the changed build separates the stand-in f
 imports. To make the RX 7600 a measured identity of its own, run metal2vulkan's runtime lanes on
 it (docs/VALIDATION.md there) and add its `deviceID` and release to `MEASURED_DEVICES` and the
 clean defect lists; the stand-in is then no longer taken for it.
+
+### Linux hosts: what a command buffer costs on RADV
+
+Measured with the macOS 26.7.1 guest on the Ryzen 5 3600 and RX 7600 host
+(RADV of Mesa 26.2.4, Linux 7.3, 8 vCPUs, 1920x1080 at 100 Hz, 2026-10-13),
+the library at `21930c51`, with counters added to a local copy of the
+runtime's scheduler for the measurement only:
+- **Where animations stop.** A CSS animation in Safari (one command buffer a
+  frame) holds 100 presents a second, 2.5 ms of window GPU time. A Finder
+  window's minimize (the genie) shows about 20 frames and its restore about
+  9, at roughly 2,200 command buffers a second, close to 50 a frame. App
+  launches run at the same rate: Chess's took 4.1 to 4.5 s to its first
+  window. Neither the guest (about 80% idle, WindowServer 9 to 13%) nor the
+  GPU is busy then; the runtime's scheduler thread is, at 70 to 88%.
+- **The submission.** About one `DRM_IOCTL_AMDGPU_CS` per command buffer,
+  0.27 to 0.39 ms each (median 0.29 ms under strace), 83% of the scheduler's
+  busy samples. 160 to 220 buffer imports and 44 to 58 texture imports
+  (`DmaBufImage`) were live, which at about 0.55 µs each ("AMD GPUs and
+  udmabuf") account for about 0.14 ms of it.
+- **The scheduler's passes.** Every batch waits for its submission checks
+  (the library sets one on each command buffer), so the committing thread's
+  pass submits nothing and the scheduler thread runs the checks and submits
+  the batch: 80 to 85% of batches 50 µs or less after their commit, about
+  10% 1 to 5 ms or more. A pass that submits anything submits one batch:
+  there is no backlog that one `vkQueueSubmit` could take several of.
+- **What did not help.** `RADV_PERFTEST=localbos` brought the median ioctl
+  from 0.293 to 0.270 ms and left the genie as it was. The guest's disk on
+  `virtio-blk-pci` (macOS 26 has `AppleVirtIOStorage`) in place of SATA
+  moved no launch past noise. amdgpu's user queues, which take submissions
+  without the CS ioctl, are off for this GPU (`user_queue=-1`,
+  `userq_ip_mask = 0`; `amdgpu.user_queue=1` on the kernel's command line
+  turns them on) and were not measured.
 
 ### x86-64 macOS guests: Metal's error mode
 
@@ -786,6 +828,58 @@ Laptop GPU host on 2026-10-11 (macOS 26.6.1, one library build):
   and `interplay_lifetime_held_pipeline_function_retyped`). Seen once, in
   the RTX 3050 beta tester's log of a boot before the key was set.
 
+### Slow icon generation after login
+
+Icons that appear gradually while the desktop is slow need timings from that
+boot; their appearance alone does not identify a texture-upload bottleneck.
+Keep the error-mode key above set, and enable the host's existing timing target
+alongside display statistics before starting the VM (replace `mac` with its name):
+
+```sh
+reims-ctl set mac --env REIMS_VGPU_STATS=1
+reims-ctl set mac --env REIMS_VGPU_LOG=warn,reims_vgpu_vulkan::gpu::timing=debug
+```
+
+The QEMU log then records pipeline creation, slow encoder calls (uploads and
+mipmap generation included), and command-buffer submission/completion times.
+`resource summary` lines add the number of calls, requested bytes and total/max
+calling-thread wall time for import views, no-copy buffer creation, DMA-BUF
+sources and CPU texture uploads. They include calls shorter than the 5 ms
+slow-call threshold, so a burst of small imports is visible too. A summary is
+emitted by the next completed resource call after a second; an idle final
+partial interval is not flushed. These operations can nest and run on several
+threads: their totals overlap, are not CPU time, and must not be added together
+or treated as measured memory traffic. With the timing target off, these
+counters and clocks do not run.
+
+On Linux, concurrent DMA-BUF requests for identical file pages share the winning
+cache entry even if both requests initially miss. The redundant descriptor is
+closed before it reaches the runtime, preventing that race from leaving another
+live Vulkan import on RADV's submission list. The default-on
+`REIMS_VGPU_DMA_BUF_RACE_FIX` property controls this fix. Set it to `0`, `false`,
+`no` or `off` (case and surrounding spaces ignored) to keep separate DMA-BUFs
+when concurrent requests both miss; ordinary cache hits still share. The value
+is read at the first DMA-BUF request, so stop and start the VM process after
+changing it. With `mac` replaced by the VM's name:
+
+```sh
+reims-ctl set mac --env REIMS_VGPU_DMA_BUF_RACE_FIX=0  # old concurrent-miss path
+reims-ctl set mac --env REIMS_VGPU_DMA_BUF_RACE_FIX=1  # fixed path (the default)
+```
+
+Use one setting per boot. This property changes only DMA-BUF concurrent-miss
+sharing; resource timing remains controlled by `REIMS_VGPU_LOG`. It neither
+changes the RDNA3 policy nor replaces the guest's `METAL_ERROR_MODE=5` setting.
+The cache/lifetime regression exercises both property values without a GPU or
+`/dev/udmabuf`; it does not measure icon-generation latency.
+
+Compare the parent and changed release builds using copies of the same guest
+disk and the same icon-cache state. Preserve the cold-cache disk for both runs
+rather than letting the first run populate the second's icons. Record the time
+until icons finish, the longest presentation gap and the timings above. This
+environment has no GPU, KVM device or guest disk, so guest improvement is not yet
+measured.
+
 ### x86-64 macOS guests: thumbnail extensions
 
 On an x86-64 macOS 26 guest, Quick Look's image and video thumbnail
@@ -912,6 +1006,25 @@ the same guest at the same window had not suspended after 783 s, and went on
 presenting at the screen's rate. Keeping the device across a wakeup would need
 `apple-gfx-pci` to skip its reset for `RESET_TYPE_WAKEUP`, or to suspend and
 resume it through the library's API (`apple-gfx.c`'s TODO).
+
+### x86-64 macOS guests: the SMC's key index
+
+macOS 26 enumerates the SMC's keys by index (command 0x12) and asks each key's
+type (0x13), and sends neither a length byte: it polls for the answer once
+the fourth byte is in. Upstream's `isa-applesmc` knew only the read command
+and answered both as unknown (0x82), and the guest retried without end.
+Measured with the macOS 26.7.1 guest on the Ryzen 5 3600 host (2026-10-13):
+`PerfPowerServices` held a vCPU at 100% from boot (11:53 of CPU in 12:45),
+about 60,000 port accesses a second reached QEMU (`memory_region_ops_read`
+on `applesmc-cmd` and `applesmc-err`), and the idle desktop kept the vCPU
+threads at 20 to 67% each. vendor/qemu now carries `#KEY` and answers both
+commands. On the same saved disk, booted on each QEMU: no SMC access in a
+1 s trace, `PerfPowerServices` at 2 s of CPU in its first 2:20, and the
+vCPU threads at 0.6 to 3% each at the idle desktop. Launch times moved little,
+about 5 to 10% (Notes 2.30 to 2.17 s to its first window, Chess 4.51 to
+4.14 s), and a Finder window's minimize animation not at all (about 20
+frames in both). What bounds those is the library's per-command-buffer cost
+("Linux hosts: a CPU-bound host at 120 Hz").
 
 ### x86-64 macOS guests: installers and recovery
 

@@ -48,6 +48,25 @@
 //! the runtime drops the source, which it does once every import of the source's went; the last
 //! holder to go lets the dma-buf go. The pages are the same either way: a file page a dma-buf
 //! pins stays what both show, as no file of the library's has pages dropped while it is mapped.
+//!
+//! **Windows** (`REIMS_VGPU_DMA_BUF_WINDOWS`, off by default). Each import adds its cost to every
+//! submission (above), and the shared dma-bufs serve only a chunk of exactly the same pages. With
+//! windows on, a stretch of a request that one run of a file's pages covers, from a granule
+//! boundary of the request, is answered as an offset into a dma-buf of the whole aligned window of
+//! that file it lies in ([`windowed`]): a window of udmabuf's size limit (64 MiB by default),
+//! cut at multiples of that size from the file's start, clipped to the file's end. Every buffer
+//! over pages of one window then shares one import of it (metal2vulkan's chunks at offsets,
+//! `DmaBufRequest::offset_alignment`), so an 8 GiB guest's RAM is at most 128 imports, whatever
+//! the guest holds. The cost: udmabuf pins every page of a window, allocating those the guest
+//! never touched, for as long as any buffer over the window lives. A stretch whose offset in its
+//! window misses the request's offset alignment, or a request that takes no offsets (a
+//! texture's), is cut and made as before. The setting is read once, at the first request.
+//!
+//! **Concurrent misses.** `REIMS_VGPU_DMA_BUF_RACE_FIX` defaults to on. With `0`, `false`, `no`
+//! or `off` (case and surrounding spaces ignored), a creator that finds another creator's
+//! winning entry after its kernel call keeps its own dma-buf, as before the race fix. Ordinary
+//! cache hits still share. The setting is read once, at the first request, and requires a VM
+//! process restart to change.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -70,6 +89,38 @@ const CREATE_LIST: u64 = (1 << 30) | (8 << 16) | ((b'u' as u64) << 8) | 0x43;
 /// udmabuf's defaults, taken where the system shows no parameters.
 const DEFAULT_LIST_LIMIT: u64 = 1024;
 const DEFAULT_SIZE_LIMIT_MB: u64 = 64;
+
+/// Whether concurrent creators join the cache's winner, read once per process.
+fn race_fix() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        race_fix_value(std::env::var("REIMS_VGPU_DMA_BUF_RACE_FIX").ok().as_deref())
+    })
+}
+
+/// Whether requests are answered from windows of their files (module docs), read once per
+/// process: off unless `REIMS_VGPU_DMA_BUF_WINDOWS` is `1`, `true`, `yes` or `on`.
+fn windows() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| windows_value(std::env::var("REIMS_VGPU_DMA_BUF_WINDOWS").ok().as_deref()))
+}
+
+/// The default-off switch of [`windows`] (case and surrounding spaces ignored).
+fn windows_value(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// The default-on switch, using the same false values as `REIMS_VGPU_RDNA3`.
+fn race_fix_value(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0" | "false" | "no" | "off")
+    )
+}
 
 /// Why no dma-bufs were made of a range.
 #[derive(Debug)]
@@ -181,7 +232,7 @@ pub(crate) struct Leases(Vec<Pages>);
 
 impl Drop for Leases {
     fn drop(&mut self) {
-        let mut retired = Vec::with_capacity(self.0.len());
+        let mut retired = Vec::new();
         let mut made = MADE.lock();
         for pages in self.0.drain(..) {
             let Some(entry) = made.get_mut(&pages) else {
@@ -192,7 +243,7 @@ impl Drop for Leases {
                 retired.push(made.remove(&pages));
             }
         }
-        // Closing a dma-buf can unpin many pages. Other sources may use the table meanwhile.
+        // Closing a dma-buf can unpin its pages. Keep that work outside the shared table lock.
         drop(made);
         drop(retired);
     }
@@ -295,15 +346,184 @@ fn padded<F: Clone>(
     chunks(runs, granule, limits)
 }
 
+/// One chunk of a request as [`windowed`] plans it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Planned<F> {
+    /// The runs of a dma-buf of their own, in order, as [`chunks`] cuts them.
+    Pieces(Vec<Run<F>>),
+    /// `length` bytes `offset` bytes into a dma-buf of the whole of `window`.
+    Window {
+        window: Run<F>,
+        offset: u64,
+        length: u64,
+    },
+}
+
+impl<F> Planned<F> {
+    fn length(&self) -> u64 {
+        match self {
+            Planned::Pieces(runs) => runs.iter().map(|r| r.length).sum(),
+            Planned::Window { length, .. } => *length,
+        }
+    }
+}
+
+/// `runs`, the request's pages in order, planned as chunks at multiples of `granule` from its
+/// start, as [`chunks`] cuts them, but where a stretch from a granule boundary lies in one run
+/// and in the window `window_of` gives for its first file byte, at an offset into the window that
+/// is a multiple of `alignment`: that stretch is a [`Planned::Window`] chunk, as long as the run
+/// and the window allow, cut to a multiple of `granule` unless it ends the request. The rest goes
+/// through [`chunks`], granule by granule between windows. `None` where [`chunks`] refuses a
+/// stretch.
+///
+/// `window_of(file, offset)` answers the window of `file` that holds byte `offset`, as its start
+/// and length in the file, or `None` where the file takes none.
+fn windowed<F: Clone>(
+    runs: &[Run<F>],
+    granule: u64,
+    alignment: u64,
+    limits: Limits,
+    window_of: impl Fn(&F, u64) -> Option<(u64, u64)>,
+) -> Option<Vec<Planned<F>>> {
+    let total: u64 = runs.iter().map(|r| r.length).sum();
+    let mut planned = Vec::new();
+    let mut pending: Vec<Run<F>> = Vec::new();
+    // The run the last pending piece came from: the next bytes of the same run join it.
+    let mut pending_from = None;
+    let flush = |pending: &mut Vec<Run<F>>, planned: &mut Vec<Planned<F>>| -> Option<()> {
+        if pending.is_empty() {
+            return Some(());
+        }
+        let cut = chunks(pending, granule, limits)?;
+        planned.extend(cut.into_iter().map(Planned::Pieces));
+        pending.clear();
+        Some(())
+    };
+    // The next byte to place, as a run and an offset into it, and its offset in the request.
+    let (mut r, mut i, mut at) = (0, 0, 0);
+    while at < total {
+        let run = &runs[r];
+        let from = run.offset + i;
+        if alignment != 0 && at.is_multiple_of(granule) {
+            let window = window_of(&run.file, from).filter(|&(start, length)| {
+                start <= from && from < start + length && (from - start).is_multiple_of(alignment)
+            });
+            if let Some((start, length)) = window {
+                let reach = (run.length - i).min(start + length - from);
+                let take = if at + reach == total {
+                    reach
+                } else {
+                    reach - reach % granule
+                };
+                if take > 0 {
+                    flush(&mut pending, &mut planned)?;
+                    planned.push(Planned::Window {
+                        window: Run {
+                            file: run.file.clone(),
+                            offset: start,
+                            length,
+                        },
+                        offset: from - start,
+                        length: take,
+                    });
+                    at += take;
+                    (r, i) = if i + take == run.length {
+                        (r + 1, 0)
+                    } else {
+                        (r, i + take)
+                    };
+                    continue;
+                }
+            }
+        }
+        // Up to the next granule boundary (or the request's end) goes with the pieces.
+        let mut step = (granule - at % granule).min(total - at);
+        while step > 0 {
+            let run = &runs[r];
+            let take = (run.length - i).min(step);
+            match pending.last_mut() {
+                Some(last)
+                    if pending_from == Some(r) && last.offset + last.length == run.offset + i =>
+                {
+                    last.length += take;
+                }
+                _ => pending.push(Run {
+                    file: run.file.clone(),
+                    offset: run.offset + i,
+                    length: take,
+                }),
+            }
+            pending_from = Some(r);
+            step -= take;
+            at += take;
+            (r, i) = if i + take == run.length {
+                (r + 1, 0)
+            } else {
+                (r, i + take)
+            };
+        }
+    }
+    flush(&mut pending, &mut planned)?;
+    Some(planned)
+}
+
+/// [`windowed`] of `runs`, padded as [`padded`] pads them where it plans several chunks.
+fn windowed_padded<F: Clone>(
+    runs: &mut Vec<Run<F>>,
+    granule: u64,
+    alignment: u64,
+    limits: Limits,
+    window_of: impl Fn(&F, u64) -> Option<(u64, u64)>,
+    pad: impl FnOnce(u64) -> Run<F>,
+) -> Option<Vec<Planned<F>>> {
+    let plan = windowed(runs, granule, alignment, limits, &window_of)?;
+    let length: u64 = runs.iter().map(|r| r.length).sum();
+    let past = length.next_multiple_of(granule) - length;
+    if plan.len() == 1 || past == 0 {
+        return Some(plan);
+    }
+    runs.push(pad(past));
+    windowed(runs, granule, alignment, limits, &window_of)
+}
+
+/// The window of a file of `size` bytes that holds byte `offset` (module docs): from the multiple
+/// of `span` at or below it, `span` bytes or to the file's end, whole pages of `page` bytes.
+/// `None` past the file's end.
+fn window_in(offset: u64, size: u64, span: u64, page: u64) -> Option<(u64, u64)> {
+    let span = span - span % page;
+    if span == 0 || offset >= size {
+        return None;
+    }
+    let start = offset - offset % span;
+    let end = (start + span).min(size - size % page);
+    (end > offset).then(|| (start, end - start))
+}
+
+/// The bytes of the file `fd`, where it answers.
+fn file_size(fd: &OwnedFd) -> Option<u64> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the descriptor is open for the call, and `fstat` writes the structure.
+    if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: the call succeeded, so it wrote the structure.
+    let stat = unsafe { stat.assume_init() };
+    u64::try_from(stat.st_size).ok()
+}
+
 /// Dma-bufs of the `length` bytes from `first`, whole pages, each resolved through the backing
 /// table, which in order are those bytes: one piece for each run of a file's pages that follow on,
 /// the block of zeros' pieces from a file of zeros of the import's own, cut into chunks within
 /// udmabuf's limits at multiples of `granule` from `first` (module docs). A chunk of the same pages
 /// as a dma-buf some source holds is that dma-buf again; `leases` holds each one answered.
+///
+/// With windows on ([`windows`]) and an `offset_alignment` other than 0, a stretch one run of a
+/// file covers is an offset into a dma-buf of its window instead ([`windowed`]).
 pub(crate) fn of_pages(
     first: u64,
     length: u64,
     granule: u64,
+    offset_alignment: u64,
     leases: &mut Leases,
 ) -> Result<Vec<DmaBufChunk>, Refusal> {
     let page = vm::page_size();
@@ -356,14 +576,30 @@ pub(crate) fn of_pages(
         offset: 0,
         length: pad,
     };
-    let cut = padded(&mut runs, granule, limits, pad).ok_or_else(|| refused(&runs))?;
+    let plan = if windows() && offset_alignment != 0 {
+        let window_of =
+            |file: &Arc<OwnedFd>, offset| window_in(offset, file_size(file)?, limits.bytes, page);
+        windowed_padded(&mut runs, granule, offset_alignment, limits, window_of, pad)
+    } else {
+        padded(&mut runs, granule, limits, pad)
+            .map(|cut| cut.into_iter().map(Planned::Pieces).collect())
+    };
+    let plan = plan.ok_or_else(|| refused(&runs))?;
     let mut answered = Leases::default();
-    let made = cut.iter().map(|chunk| {
-        let fd = held(device, chunk, &mut answered)?;
-        Ok(DmaBufChunk {
-            fd,
-            length: chunk.iter().map(|r| r.length).sum(),
-        })
+    let made = plan.iter().map(|chunk| {
+        let length = chunk.length();
+        match chunk {
+            Planned::Pieces(runs) => Ok(DmaBufChunk {
+                fd: held(device, runs, &mut answered)?,
+                offset: 0,
+                length,
+            }),
+            Planned::Window { window, offset, .. } => Ok(DmaBufChunk {
+                fd: held(device, std::slice::from_ref(window), &mut answered)?,
+                offset: *offset,
+                length,
+            }),
+        }
     });
     let made = made.collect::<Result<Vec<_>, Refusal>>()?;
     leases.extend(answered);
@@ -377,13 +613,17 @@ fn held(
     runs: &[Run<Arc<OwnedFd>>],
     leases: &mut Leases,
 ) -> Result<OwnedFd, Refusal> {
-    held_with(runs, leases, || create(device, runs))
+    held_with(runs, leases, race_fix(), || create(device, runs))
 }
 
-/// Hold a chunk, making it outside the table's lock if no source already holds it.
+/// [`held`], with the kernel call supplied separately so its concurrent miss can be tested
+/// without a udmabuf device. With `join_races`, a racing creator joins the winner and drops its
+/// redundant dma-buf outside the table lock: pinning and unpinning pages must not block
+/// unrelated lookups.
 fn held_with(
     runs: &[Run<Arc<OwnedFd>>],
     leases: &mut Leases,
+    join_races: bool,
     create: impl FnOnce() -> Result<OwnedFd, Refusal>,
 ) -> Result<OwnedFd, Refusal> {
     let pages = pages_of(runs);
@@ -396,18 +636,17 @@ fn held_with(
         leases.0.push(pages);
         return Ok(fd);
     }
-    // udmabuf pins the pages inside the call, which other threads' chunks wait behind; a chunk of
-    // other pages made meanwhile is a dma-buf of its own either way.
+    // udmabuf pins pages inside the call. Let unrelated lookups continue while it runs, then
+    // recheck for another creator of these pages before publishing the result.
     drop(made);
     let fd = create()?;
+    let kept = fd.as_fd().try_clone_to_owned().map_err(Refusal::Kernel)?;
     let mut made = MADE.lock();
     match made.get_mut(&pages) {
-        // Another source won the race. Hold its object too, and close our duplicate outside
-        // the lock; the runtime shares imports by the dma-buf's identity, not by its pages.
-        Some(entry) => {
-            let shared = entry
-                .fd
-                .as_fd()
+        // Another thread made one of the same pages meanwhile: share its dma-buf too, so the
+        // runtime sees one identity and imports it once even during concurrent creation.
+        Some(entry) if join_races => {
+            let shared = (entry.fd.as_fd())
                 .try_clone_to_owned()
                 .map_err(Refusal::Kernel)?;
             entry.holders += 1;
@@ -415,8 +654,9 @@ fn held_with(
             drop(made);
             return Ok(shared);
         }
+        // Explicit comparison mode: retain the old behavior for concurrent cache misses.
+        Some(_) => return Ok(fd),
         None => {
-            let kept = fd.as_fd().try_clone_to_owned().map_err(Refusal::Kernel)?;
             made.insert(
                 pages.clone(),
                 Made {
@@ -454,10 +694,296 @@ fn create(device: &OwnedFd, runs: &[Run<Arc<OwnedFd>>]) -> Result<OwnedFd, Refus
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::sync::Barrier;
+
     use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
     use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm as _};
 
     use super::*;
+
+    const PAGE: u64 = 0x1000;
+
+    fn identity(fd: &OwnedFd) -> (u64, u64) {
+        let file = std::fs::File::from(fd.as_fd().try_clone_to_owned().unwrap());
+        let metadata = file.metadata().unwrap();
+        (metadata.dev(), metadata.ino())
+    }
+
+    #[test]
+    fn windows_are_default_off_and_take_the_documented_true_values() {
+        for off in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("off"),
+            Some("auto"),
+            Some("2"),
+        ] {
+            assert!(!windows_value(off), "{off:?}");
+        }
+        for on in ["1", "true", "yes", "on", " ON ", "True"] {
+            assert!(windows_value(Some(on)), "{on:?}");
+        }
+    }
+
+    /// A window is the multiple of the span at or below the byte, clipped to the file's whole
+    /// pages; none past the file's end.
+    #[test]
+    fn a_window_is_the_aligned_span_holding_the_byte() {
+        const SPAN: u64 = 64 << 20;
+        assert_eq!(window_in(0, 8 << 30, SPAN, PAGE), Some((0, SPAN)));
+        assert_eq!(
+            window_in(SPAN + 5 * PAGE, 8 << 30, SPAN, PAGE),
+            Some((SPAN, SPAN))
+        );
+        // The last window of a file whose size is no multiple of the span.
+        assert_eq!(
+            window_in(SPAN + PAGE, SPAN + 3 * PAGE, SPAN, PAGE),
+            Some((SPAN, 3 * PAGE))
+        );
+        assert_eq!(
+            window_in(SPAN + 3 * PAGE, SPAN + 3 * PAGE, SPAN, PAGE),
+            None
+        );
+        // A span that is no multiple of the page is cut to one.
+        assert_eq!(
+            window_in(0, 4 * PAGE, 2 * PAGE + 1, PAGE),
+            Some((0, 2 * PAGE))
+        );
+    }
+
+    /// Runs of files named by numbers, `(file, offset, length)` in pages.
+    fn runs(of: &[(u32, u64, u64)]) -> Vec<Run<u32>> {
+        (of.iter())
+            .map(|&(file, offset, length)| Run {
+                file,
+                offset: offset * PAGE,
+                length: length * PAGE,
+            })
+            .collect()
+    }
+
+    const LIMITS: Limits = Limits {
+        pieces: 1024,
+        bytes: 64 << 20,
+    };
+
+    /// Windows of 16 pages in every file but file 9.
+    fn sixteen(file: &u32, offset: u64) -> Option<(u64, u64)> {
+        (*file != 9).then(|| window_in(offset, 1 << 40, 16 * PAGE, PAGE))?
+    }
+
+    fn lengths(plan: &[Planned<u32>]) -> Vec<u64> {
+        plan.iter().map(|c| c.length() / PAGE).collect()
+    }
+
+    /// One run in one window is one chunk at its offset into the window, whatever the granule.
+    #[test]
+    fn a_run_in_one_window_is_an_offset_into_it() {
+        let plan = windowed(&runs(&[(1, 20, 3)]), 3 * PAGE, PAGE, LIMITS, sixteen).unwrap();
+        assert_eq!(
+            plan,
+            vec![Planned::Window {
+                window: Run {
+                    file: 1,
+                    offset: 16 * PAGE,
+                    length: 16 * PAGE
+                },
+                offset: 4 * PAGE,
+                length: 3 * PAGE,
+            }]
+        );
+    }
+
+    /// Without windows (an alignment of 0, or no file taking one) the plan is `chunks`', piece
+    /// for piece.
+    #[test]
+    fn without_windows_the_plan_is_the_pieces_cut() {
+        let of = runs(&[(1, 0, 3), (2, 7, 2), (1, 40, 5)]);
+        let cut = chunks(&of, 2 * PAGE, LIMITS).unwrap();
+        let pieces: Vec<Planned<u32>> = cut.into_iter().map(Planned::Pieces).collect();
+        assert_eq!(windowed(&of, 2 * PAGE, 0, LIMITS, sixteen).unwrap(), pieces);
+        let none = |_: &u32, _| None;
+        assert_eq!(windowed(&of, 2 * PAGE, PAGE, LIMITS, none).unwrap(), pieces);
+        let small = Limits {
+            pieces: 2,
+            bytes: 4 * PAGE,
+        };
+        let cut = chunks(&of, 2 * PAGE, small).unwrap();
+        let pieces: Vec<Planned<u32>> = cut.into_iter().map(Planned::Pieces).collect();
+        assert_eq!(windowed(&of, 2 * PAGE, PAGE, small, none).unwrap(), pieces);
+    }
+
+    /// Every cut lies a multiple of the granule from the request's start, a window's chunk ends
+    /// at the run's or the window's end cut back to the granule, and what no window takes goes
+    /// in pieces of its own.
+    #[test]
+    fn windows_and_pieces_meet_at_granules() {
+        // 2 pages of file 9 (no window), 5 of file 1 from page 14 (crossing a window at 16),
+        // then 3 of file 2.
+        let of = runs(&[(9, 0, 2), (1, 14, 5), (2, 3, 3)]);
+        let plan = windowed(&of, 2 * PAGE, PAGE, LIMITS, sixteen).unwrap();
+        assert_eq!(lengths(&plan), vec![2, 2, 2, 2, 2]);
+        let mut at = 0;
+        for chunk in &plan[..plan.len() - 1] {
+            at += chunk.length();
+            assert!(at.is_multiple_of(2 * PAGE));
+        }
+        assert!(matches!(plan[0], Planned::Pieces(_)));
+        assert_eq!(
+            plan[1],
+            Planned::Window {
+                window: Run {
+                    file: 1,
+                    offset: 0,
+                    length: 16 * PAGE
+                },
+                offset: 14 * PAGE,
+                length: 2 * PAGE,
+            }
+        );
+        assert_eq!(
+            plan[2],
+            Planned::Window {
+                window: Run {
+                    file: 1,
+                    offset: 16 * PAGE,
+                    length: 16 * PAGE
+                },
+                offset: 0,
+                length: 2 * PAGE,
+            }
+        );
+        // File 1's page 18 lies past a granule boundary only one page before its run ends: it
+        // and file 2's first page go in pieces, and file 2's last two pages in its window.
+        assert!(matches!(plan[3], Planned::Pieces(_)));
+        assert!(matches!(plan[4], Planned::Window { offset, .. } if offset == 4 * PAGE));
+        // With an alignment of 4 pages, only offsets into a window at multiples of it are taken.
+        let plan = windowed(&of, 2 * PAGE, 4 * PAGE, LIMITS, sixteen).unwrap();
+        assert!(plan.iter().all(|c| match c {
+            Planned::Window { offset, .. } => offset.is_multiple_of(4 * PAGE),
+            Planned::Pieces(_) => true,
+        }));
+        let total: u64 = plan.iter().map(Planned::length).sum();
+        assert_eq!(total, 10 * PAGE);
+    }
+
+    /// Several chunks are padded to the granule, the pad in the last chunk's pieces.
+    #[test]
+    fn several_windowed_chunks_are_padded() {
+        let mut of = runs(&[(1, 0, 4), (9, 0, 1)]);
+        let plan = windowed_padded(&mut of, 2 * PAGE, PAGE, LIMITS, sixteen, |past| Run {
+            file: 7,
+            offset: 0,
+            length: past,
+        })
+        .unwrap();
+        assert_eq!(lengths(&plan), vec![4, 2]);
+        let Planned::Pieces(last) = &plan[1] else {
+            panic!("{plan:?}");
+        };
+        assert_eq!(last.last().unwrap().file, 7);
+    }
+
+    #[test]
+    fn race_fix_is_default_on_and_accepts_the_documented_false_values() {
+        for on in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("true"),
+            Some("on"),
+            Some("auto"),
+        ] {
+            assert!(race_fix_value(on), "{on:?}");
+        }
+        for off in ["0", "false", "no", "off", " OFF ", "False", " No "] {
+            assert!(!race_fix_value(Some(off)), "{off:?}");
+        }
+    }
+
+    /// Both creators miss before either can publish. The switch chooses one identity or the
+    /// old separate identities, while ordinary cache hits and lease lifetimes stay shared.
+    /// Memfds stand in for the kernel's dma-bufs, without requiring a udmabuf device.
+    #[test]
+    fn concurrent_creators_obey_the_race_fix_switch() {
+        for join_races in [false, true] {
+            let runs = [Run {
+                file: vm::memfd(PAGE),
+                offset: 0,
+                length: PAGE,
+            }];
+            let pages = pages_of(&runs);
+            let barrier = Barrier::new(2);
+            let ((a, a_lease), (b, b_lease)) = std::thread::scope(|scope| {
+                let make = || {
+                    let mut lease = Leases::default();
+                    let fd = held_with(&runs, &mut lease, join_races, || {
+                        let fd = vm::memfd(PAGE).as_fd().try_clone_to_owned().unwrap();
+                        barrier.wait();
+                        Ok(fd)
+                    })
+                    .unwrap();
+                    (fd, lease)
+                };
+                let (a, b) = (scope.spawn(make), scope.spawn(make));
+                (a.join().unwrap(), b.join().unwrap())
+            });
+            assert_eq!(identity(&a) == identity(&b), join_races);
+            let holders = if join_races { 2 } else { 1 };
+            assert_eq!(MADE.lock().get(&pages).unwrap().holders, holders);
+            let winning_identity = identity(&MADE.lock().get(&pages).unwrap().fd);
+            let mut c_lease = Leases::default();
+            let c = held_with(&runs, &mut c_lease, join_races, || {
+                panic!("a live lease must be reused even with the race fix disabled")
+            })
+            .unwrap();
+            assert_eq!(winning_identity, identity(&c));
+            let remaining = if join_races || !b_lease.0.is_empty() {
+                2
+            } else {
+                1
+            };
+            drop(a);
+            drop(a_lease);
+            assert_eq!(MADE.lock().get(&pages).unwrap().holders, remaining);
+            drop(b);
+            drop(b_lease);
+            assert_eq!(MADE.lock().get(&pages).unwrap().holders, 1);
+            drop(c);
+            drop(c_lease);
+            assert!(!MADE.lock().contains_key(&pages));
+        }
+    }
+
+    #[test]
+    fn refused_creation_holds_no_lease_and_can_be_retried() {
+        let runs = [Run {
+            file: vm::memfd(PAGE),
+            offset: 0,
+            length: PAGE,
+        }];
+        let pages = pages_of(&runs);
+        let mut lease = Leases::default();
+        let refused = held_with(&runs, &mut lease, true, || {
+            Err(Refusal::Kernel(io::Error::from_raw_os_error(libc::ENOMEM)))
+        });
+        assert!(matches!(refused, Err(Refusal::Kernel(_))));
+        assert!(lease.0.is_empty());
+        assert!(!MADE.lock().contains_key(&pages));
+        let fd = held_with(&runs, &mut lease, true, || {
+            vm::memfd(PAGE)
+                .as_fd()
+                .try_clone_to_owned()
+                .map_err(Refusal::Kernel)
+        })
+        .unwrap();
+        assert_eq!(MADE.lock().get(&pages).unwrap().holders, 1);
+        drop(fd);
+        drop(lease);
+        assert!(!MADE.lock().contains_key(&pages));
+    }
 
     /// Whether this host has a udmabuf device this process opens: where it has none, the tests
     /// say so and check nothing.
@@ -637,7 +1163,7 @@ mod tests {
                     .write_volatile(0x10 + i as u8)
             };
         }
-        let chunks = of_pages(at + page, 2 * page, page, &mut Leases::default()).unwrap();
+        let chunks = of_pages(at + page, 2 * page, page, 0, &mut Leases::default()).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].length, 2 * page);
         assert_eq!(read_through(&chunks[0], 0), 0x11);
@@ -651,7 +1177,7 @@ mod tests {
         );
         let private = vm::anonymous(None, page, "a test's private page").unwrap();
         assert!(matches!(
-            of_pages(private, page, page, &mut Leases::default()),
+            of_pages(private, page, page, 0, &mut Leases::default()),
             Err(Refusal::Unresolved)
         ));
     }
@@ -690,66 +1216,6 @@ mod tests {
         MADE.lock().remove(&other);
     }
 
-    /// Concurrent creators both hold the winning object, even when both missed the first lookup.
-    /// Separate memfds stand in for udmabufs so this race needs neither a GPU nor `/dev/udmabuf`.
-    #[test]
-    fn concurrent_creators_hold_the_same_dma_buf() {
-        use std::os::unix::fs::MetadataExt as _;
-        use std::sync::Barrier;
-
-        let file = vm::memfd(vm::page_size());
-        let runs = [Run {
-            file: Arc::clone(&file),
-            offset: 0,
-            length: vm::page_size(),
-        }];
-        let pages = pages_of(&runs);
-        let creating = Barrier::new(2);
-        let acquire = || {
-            let mut leases = Leases::default();
-            let fd = held_with(&runs, &mut leases, || {
-                let separate = vm::memfd(vm::page_size());
-                creating.wait();
-                Ok(separate.as_fd().try_clone_to_owned().unwrap())
-            })
-            .unwrap();
-            (fd, leases)
-        };
-        let ((a, first), (b, second)) = std::thread::scope(|scope| {
-            let a = scope.spawn(acquire);
-            let b = scope.spawn(acquire);
-            (a.join().unwrap(), b.join().unwrap())
-        });
-        let identity = |fd: &OwnedFd| {
-            let file = std::fs::File::from(fd.as_fd().try_clone_to_owned().unwrap());
-            let metadata = file.metadata().unwrap();
-            (metadata.dev(), metadata.ino())
-        };
-        assert_eq!(identity(&a), identity(&b));
-        assert_eq!(MADE.lock().get(&pages).unwrap().holders, 2);
-        drop(first);
-        assert_eq!(MADE.lock().get(&pages).unwrap().holders, 1);
-        drop(second);
-        assert!(!MADE.lock().contains_key(&pages));
-    }
-
-    /// A failed creation leaves no lease or entry, so the same pages can be requested again.
-    #[test]
-    fn failed_creation_holds_no_dma_buf() {
-        let runs = [Run {
-            file: vm::memfd(vm::page_size()),
-            offset: 0,
-            length: vm::page_size(),
-        }];
-        let mut leases = Leases::default();
-        let result = held_with(&runs, &mut leases, || {
-            Err(Refusal::Kernel(io::Error::from_raw_os_error(libc::ENOMEM)))
-        });
-        assert!(matches!(result, Err(Refusal::Kernel(_))));
-        assert!(leases.0.is_empty());
-        assert!(!MADE.lock().contains_key(&pages_of(&runs)));
-    }
-
     /// Two windows of the same pages, while a source holds the first's dma-buf, are answered with
     /// that dma-buf again; once no source holds it, a window of them is a dma-buf of its own
     #[test]
@@ -771,15 +1237,15 @@ mod tests {
         let page = vm::page_size();
         let at = vm::allocate_aliasable(2 * page).unwrap().addr().to_u64();
         let mut first = Leases::default();
-        let a = of_pages(at, 2 * page, 2 * page, &mut first).unwrap();
+        let a = of_pages(at, 2 * page, 2 * page, 0, &mut first).unwrap();
         let mut second = Leases::default();
-        let b = of_pages(at, 2 * page, 2 * page, &mut second).unwrap();
+        let b = of_pages(at, 2 * page, 2 * page, 0, &mut second).unwrap();
         assert_eq!(identity(&a[0]), identity(&b[0]));
         let mut third = Leases::default();
-        let part = of_pages(at, page, page, &mut third).unwrap();
+        let part = of_pages(at, page, page, 0, &mut third).unwrap();
         assert_ne!(identity(&a[0]), identity(&part[0]), "other pages");
         drop((first, second, third));
-        let c = of_pages(at, 2 * page, 2 * page, &mut Leases::default()).unwrap();
+        let c = of_pages(at, 2 * page, 2 * page, 0, &mut Leases::default()).unwrap();
         assert_ne!(identity(&a[0]), identity(&c[0]));
     }
 
@@ -812,6 +1278,7 @@ mod tests {
             view.addr().to_u64(),
             count * page,
             page,
+            0,
             &mut Leases::default(),
         )
         .unwrap();

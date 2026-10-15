@@ -311,7 +311,9 @@ fn no_copy_release(
     length: u64,
     run: Option<rt::Deallocator>,
 ) -> (NonNull<u8>, Option<rt::Deallocator>, rt::KeepAlive, bool) {
-    let view = crate::os::import_view(start, length);
+    let view = crate::gpu::timing::resources::call("import view", length, || {
+        crate::os::import_view(start, length)
+    });
     let imported = view.at();
     let kept = view.writes_kept();
     let (run, twin) = view.release(start, run);
@@ -796,10 +798,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                 };
                 let descriptor = rt::BufferDescriptor::new(bytes.len(), options, contents)
                     .with_placement(placement);
-                match self
-                    .raw
-                    .new_buffer_with_descriptor(with_token(descriptor, token))
-                {
+                match crate::gpu::timing::resources::call(sel, bytes.len(), || {
+                    self.raw
+                        .new_buffer_with_descriptor(with_token(descriptor, token))
+                }) {
                     Ok(raw) => Ok(Some(raw)),
                     // Pages Metal makes no buffer over: nil.
                     Err(_) if !OsVm::new().readable(bytes.ptr(), bytes.len()) => Ok(None),

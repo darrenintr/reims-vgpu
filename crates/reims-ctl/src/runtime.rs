@@ -379,7 +379,7 @@ fn pin_vcpus(vm: &Vm, sock: &Path) {
     if !vm.config.cpu.pins() {
         return;
     }
-    let line = match crate::pin::apply(sock, &vm.config.cpu, vm.config.cpus) {
+    let line = match crate::pin::apply(sock, &vm.config.cpu, vm.config.cpus, pid(vm)) {
         Ok(done) => done,
         Err(e) => format!("reims-ctl: vCPUs not pinned: {e:#}"),
     };
