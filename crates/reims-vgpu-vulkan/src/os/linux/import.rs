@@ -151,9 +151,10 @@ pub(crate) unsafe fn host_memory(at: NonNull<u8>) -> rt::HostMemory {
     let source: rt::DmaBufSource = Arc::new(move |request: rt::DmaBufRequest| {
         let first = shown_at(request.start).as_ptr().addr().to_u64();
         let (length, granule) = (request.length, request.granule);
+        let alignment = request.offset_alignment;
         let mut answered = super::dma_buf::Leases::default();
         let chunks = crate::gpu::timing::resources::call("dma-buf source", length, || {
-            super::dma_buf::of_pages(first, length, granule, &mut answered)
+            super::dma_buf::of_pages(first, length, granule, alignment, &mut answered)
         });
         match chunks {
             Ok(chunks) => {
