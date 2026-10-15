@@ -181,6 +181,7 @@ pub(crate) struct Leases(Vec<Pages>);
 
 impl Drop for Leases {
     fn drop(&mut self) {
+        let mut retired = Vec::with_capacity(self.0.len());
         let mut made = MADE.lock();
         for pages in self.0.drain(..) {
             let Some(entry) = made.get_mut(&pages) else {
@@ -188,9 +189,12 @@ impl Drop for Leases {
             };
             entry.holders -= 1;
             if entry.holders == 0 {
-                made.remove(&pages);
+                retired.push(made.remove(&pages));
             }
         }
+        // Closing a dma-buf can unpin many pages. Other sources may use the table meanwhile.
+        drop(made);
+        drop(retired);
     }
 }
 
@@ -373,6 +377,15 @@ fn held(
     runs: &[Run<Arc<OwnedFd>>],
     leases: &mut Leases,
 ) -> Result<OwnedFd, Refusal> {
+    held_with(runs, leases, || create(device, runs))
+}
+
+/// Hold a chunk, making it outside the table's lock if no source already holds it.
+fn held_with(
+    runs: &[Run<Arc<OwnedFd>>],
+    leases: &mut Leases,
+    create: impl FnOnce() -> Result<OwnedFd, Refusal>,
+) -> Result<OwnedFd, Refusal> {
     let pages = pages_of(runs);
     let mut made = MADE.lock();
     if let Some(entry) = made.get_mut(&pages) {
@@ -386,14 +399,24 @@ fn held(
     // udmabuf pins the pages inside the call, which other threads' chunks wait behind; a chunk of
     // other pages made meanwhile is a dma-buf of its own either way.
     drop(made);
-    let fd = create(device, runs)?;
-    let kept = fd.as_fd().try_clone_to_owned().map_err(Refusal::Kernel)?;
+    let fd = create()?;
     let mut made = MADE.lock();
     match made.get_mut(&pages) {
-        // Another thread made one of the same pages meanwhile: both stay, this one held by its
-        // own source alone.
-        Some(_) => return Ok(fd),
+        // Another source won the race. Hold its object too, and close our duplicate outside
+        // the lock; the runtime shares imports by the dma-buf's identity, not by its pages.
+        Some(entry) => {
+            let shared = entry
+                .fd
+                .as_fd()
+                .try_clone_to_owned()
+                .map_err(Refusal::Kernel)?;
+            entry.holders += 1;
+            leases.0.push(pages);
+            drop(made);
+            return Ok(shared);
+        }
         None => {
+            let kept = fd.as_fd().try_clone_to_owned().map_err(Refusal::Kernel)?;
             made.insert(
                 pages.clone(),
                 Made {
@@ -665,6 +688,66 @@ mod tests {
         assert!(!MADE.lock().contains_key(&pages));
         assert!(MADE.lock().contains_key(&other), "another dma-buf stays");
         MADE.lock().remove(&other);
+    }
+
+    /// Concurrent creators both hold the winning object, even when both missed the first lookup.
+    /// Separate memfds stand in for udmabufs so this race needs neither a GPU nor `/dev/udmabuf`.
+    #[test]
+    fn concurrent_creators_hold_the_same_dma_buf() {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::sync::Barrier;
+
+        let file = vm::memfd(vm::page_size());
+        let runs = [Run {
+            file: Arc::clone(&file),
+            offset: 0,
+            length: vm::page_size(),
+        }];
+        let pages = pages_of(&runs);
+        let creating = Barrier::new(2);
+        let acquire = || {
+            let mut leases = Leases::default();
+            let fd = held_with(&runs, &mut leases, || {
+                let separate = vm::memfd(vm::page_size());
+                creating.wait();
+                Ok(separate.as_fd().try_clone_to_owned().unwrap())
+            })
+            .unwrap();
+            (fd, leases)
+        };
+        let ((a, first), (b, second)) = std::thread::scope(|scope| {
+            let a = scope.spawn(acquire);
+            let b = scope.spawn(acquire);
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        let identity = |fd: &OwnedFd| {
+            let file = std::fs::File::from(fd.as_fd().try_clone_to_owned().unwrap());
+            let metadata = file.metadata().unwrap();
+            (metadata.dev(), metadata.ino())
+        };
+        assert_eq!(identity(&a), identity(&b));
+        assert_eq!(MADE.lock().get(&pages).unwrap().holders, 2);
+        drop(first);
+        assert_eq!(MADE.lock().get(&pages).unwrap().holders, 1);
+        drop(second);
+        assert!(!MADE.lock().contains_key(&pages));
+    }
+
+    /// A failed creation leaves no lease or entry, so the same pages can be requested again.
+    #[test]
+    fn failed_creation_holds_no_dma_buf() {
+        let runs = [Run {
+            file: vm::memfd(vm::page_size()),
+            offset: 0,
+            length: vm::page_size(),
+        }];
+        let mut leases = Leases::default();
+        let result = held_with(&runs, &mut leases, || {
+            Err(Refusal::Kernel(io::Error::from_raw_os_error(libc::ENOMEM)))
+        });
+        assert!(matches!(result, Err(Refusal::Kernel(_))));
+        assert!(leases.0.is_empty());
+        assert!(!MADE.lock().contains_key(&pages_of(&runs)));
     }
 
     /// Two windows of the same pages, while a source holds the first's dma-buf, are answered with
