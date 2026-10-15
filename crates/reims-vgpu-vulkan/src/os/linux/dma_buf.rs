@@ -53,14 +53,23 @@
 //! submission (above), and the shared dma-bufs serve only a chunk of exactly the same pages. With
 //! windows on, a stretch of a request that one run of a file's pages covers, from a granule
 //! boundary of the request, is answered as an offset into a dma-buf of the whole aligned window of
-//! that file it lies in ([`windowed`]): a window of udmabuf's size limit (64 MiB by default),
-//! cut at multiples of that size from the file's start, clipped to the file's end. Every buffer
+//! that file it lies in ([`windowed`]): a window of 64 MiB, or udmabuf's size limit where that is
+//! lower ([`WINDOW_SPAN`]), cut at multiples of that size from the file's start, clipped to the
+//! file's end. Every buffer
 //! over pages of one window then shares one import of it (metal2vulkan's chunks at offsets,
 //! `DmaBufRequest::offset_alignment`), so an 8 GiB guest's RAM is at most 128 imports, whatever
 //! the guest holds. The cost: udmabuf pins every page of a window, allocating those the guest
-//! never touched, for as long as any buffer over the window lives. A stretch whose offset in its
+//! never touched, for as long as any buffer over the window lives, and each window's import takes
+//! its whole span of the GPU's memory for system pages (GTT). So the windows held span at most a
+//! budget together, 4 GiB unless `REIMS_VGPU_DMA_BUF_WINDOW_BUDGET_MB` names another
+//! ([`within_budget`]); past it, stretches are cut into pieces as without windows. Without the
+//! cap, Linux 7.3's unbounded `size_limit_mb` made one window of a 12 GiB guest's whole RAM, and
+//! with an RX 7600's 15 GiB of GTT every submission then failed for memory (`Not enough memory
+//! for command submission`, 2026-10-15) and the device was lost. A stretch whose offset in its
 //! window misses the request's offset alignment, or a request that takes no offsets (a
-//! texture's), is cut and made as before. The setting is read once, at the first request.
+//! texture's), is cut and made as before. Windows answer only a request one window holds whole,
+//! as one chunk ([`one_window`]): one that windows and pieces would answer together goes as pieces
+//! alone, as without windows. The setting is read once, at the first request.
 //!
 //! **Concurrent misses.** `REIMS_VGPU_DMA_BUF_RACE_FIX` defaults to on. With `0`, `false`, `no`
 //! or `off` (case and surrounding spaces ignored), a creator that finds another creator's
@@ -89,6 +98,37 @@ const CREATE_LIST: u64 = (1 << 30) | (8 << 16) | ((b'u' as u64) << 8) | 0x43;
 /// udmabuf's defaults, taken where the system shows no parameters.
 const DEFAULT_LIST_LIMIT: u64 = 1024;
 const DEFAULT_SIZE_LIMIT_MB: u64 = 64;
+
+/// The most bytes a window spans (module docs), udmabuf's default size limit, whatever limit the
+/// host's module has: a kernel whose limit is unbounded (`size_limit_mb` 2147483647, as on Linux
+/// 7.3's Ubuntu build, measured 2026-10-15) would otherwise make one window of a whole file.
+const WINDOW_SPAN: u64 = DEFAULT_SIZE_LIMIT_MB << 20;
+
+/// The most bytes the windows some source holds may span together (module docs), unless
+/// `REIMS_VGPU_DMA_BUF_WINDOW_BUDGET_MB` says otherwise.
+const DEFAULT_WINDOW_BUDGET_MB: u64 = 4096;
+
+/// [`DEFAULT_WINDOW_BUDGET_MB`], or the MiB `REIMS_VGPU_DMA_BUF_WINDOW_BUDGET_MB` names, in
+/// bytes, read once per process.
+fn window_budget() -> u64 {
+    static BUDGET: OnceLock<u64> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        window_budget_value(
+            std::env::var("REIMS_VGPU_DMA_BUF_WINDOW_BUDGET_MB")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The budget a value of `REIMS_VGPU_DMA_BUF_WINDOW_BUDGET_MB` sets: a number of MiB (surrounding
+/// spaces ignored), else the default.
+fn window_budget_value(value: Option<&str>) -> u64 {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_WINDOW_BUDGET_MB)
+        .saturating_mul(1 << 20)
+}
 
 /// Whether concurrent creators join the cache's winner, read once per process.
 fn race_fix() -> bool {
@@ -219,7 +259,12 @@ struct Made {
     _files: Vec<Arc<OwnedFd>>,
     /// The sources holding it.
     holders: usize,
+    /// Whether it is a window's, counted in [`WINDOW_BYTES`] then.
+    window: bool,
 }
+
+/// The bytes the windows in [`MADE`] span together, which [`window_budget`] bounds.
+static WINDOW_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Every dma-buf some source holds, by the pages it is of (module docs).
 static MADE: Mutex<BTreeMap<Pages, Made>> = Mutex::new(BTreeMap::new());
@@ -240,6 +285,10 @@ impl Drop for Leases {
             };
             entry.holders -= 1;
             if entry.holders == 0 {
+                if entry.window {
+                    let bytes = pages.iter().map(|&(_, _, length)| length).sum();
+                    WINDOW_BYTES.fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+                }
                 retired.push(made.remove(&pages));
             }
         }
@@ -467,7 +516,16 @@ fn windowed<F: Clone>(
     Some(planned)
 }
 
+/// Whether `plan` is one window's chunk: the only plan windows answer (module docs). A request
+/// that windows and pieces answer together is several chunks, which the runtime binds to a sparse
+/// buffer; on RADV (Mesa 26.2.4, an RX 7600) a macOS 26 guest's display froze within a minute of
+/// login whenever windows planned such requests (2026-10-15), and with pieces alone it ran.
+fn one_window<F>(plan: &[Planned<F>]) -> bool {
+    matches!(plan, [Planned::Window { .. }])
+}
+
 /// [`windowed`] of `runs`, padded as [`padded`] pads them where it plans several chunks.
+#[cfg(test)]
 fn windowed_padded<F: Clone>(
     runs: &mut Vec<Run<F>>,
     granule: u64,
@@ -576,13 +634,27 @@ pub(crate) fn of_pages(
         offset: 0,
         length: pad,
     };
-    let plan = if windows() && offset_alignment != 0 {
-        let window_of =
-            |file: &Arc<OwnedFd>, offset| window_in(offset, file_size(file)?, limits.bytes, page);
-        windowed_padded(&mut runs, granule, offset_alignment, limits, window_of, pad)
-    } else {
-        padded(&mut runs, granule, limits, pad)
-            .map(|cut| cut.into_iter().map(Planned::Pieces).collect())
+    let span = limits.bytes.min(WINDOW_SPAN);
+    let window_of = |file: &Arc<OwnedFd>, offset| {
+        let (start, length) = window_in(offset, file_size(file)?, span, page)?;
+        within_budget(file, start, length, window_budget()).then_some((start, length))
+    };
+    let whole = (windows() && offset_alignment != 0)
+        .then(|| {
+            windowed(
+                &runs,
+                length.next_multiple_of(granule),
+                offset_alignment,
+                limits,
+                window_of,
+            )
+        })
+        .flatten()
+        .filter(|plan| one_window(plan));
+    let plan = match whole {
+        Some(plan) => Some(plan),
+        None => padded(&mut runs, granule, limits, pad)
+            .map(|cut| cut.into_iter().map(Planned::Pieces).collect()),
     };
     let plan = plan.ok_or_else(|| refused(&runs))?;
     let mut answered = Leases::default();
@@ -594,16 +666,42 @@ pub(crate) fn of_pages(
                 offset: 0,
                 length,
             }),
-            Planned::Window { window, offset, .. } => Ok(DmaBufChunk {
-                fd: held(device, std::slice::from_ref(window), &mut answered)?,
-                offset: *offset,
-                length,
-            }),
+            Planned::Window { window, offset, .. } => {
+                let fd = held(device, std::slice::from_ref(window), &mut answered)?;
+                count_window(window);
+                Ok(DmaBufChunk {
+                    fd,
+                    offset: *offset,
+                    length,
+                })
+            }
         }
     });
     let made = made.collect::<Result<Vec<_>, Refusal>>()?;
     leases.extend(answered);
     Ok(made)
+}
+
+/// Whether a window of `length` bytes of `file` from `start` may be answered: a dma-buf of it is
+/// already held, or the windows held, with it, span no more than `budget` bytes. Past the budget a
+/// request's stretch is cut into pieces as without windows, so the pages windows pin (and the GPU
+/// memory their imports take) stay bounded. Creators racing for new windows can each pass the
+/// check before either is counted, past the budget by at most a window each.
+fn within_budget(file: &Arc<OwnedFd>, start: u64, length: u64, budget: u64) -> bool {
+    let pages = vec![(Arc::as_ptr(file).addr(), start, length)];
+    MADE.lock().contains_key(&pages)
+        || WINDOW_BYTES.load(std::sync::atomic::Ordering::Relaxed) + length <= budget
+}
+
+/// Count the dma-buf of `window` that [`MADE`] holds in [`WINDOW_BYTES`], once.
+fn count_window(window: &Run<Arc<OwnedFd>>) {
+    let mut made = MADE.lock();
+    if let Some(entry) = made.get_mut(&pages_of(std::slice::from_ref(window)))
+        && !entry.window
+    {
+        entry.window = true;
+        WINDOW_BYTES.fetch_add(window.length, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// A descriptor of a dma-buf of `runs`: of the one some source holds for those pages ([`MADE`]),
@@ -663,6 +761,7 @@ fn held_with(
                     fd: kept,
                     _files: runs.iter().map(|r| Arc::clone(&r.file)).collect(),
                     holders: 1,
+                    window: false,
                 },
             );
         }
@@ -727,6 +826,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_window_budget_is_4_gib_unless_a_number_of_mib_says_otherwise() {
+        for default in [None, Some(""), Some("lots"), Some("-1")] {
+            assert_eq!(window_budget_value(default), 4 << 30, "{default:?}");
+        }
+        assert_eq!(window_budget_value(Some(" 512 ")), 512 << 20);
+        assert_eq!(window_budget_value(Some("0")), 0);
+    }
+
+    /// A new window is answered only while the windows held span no more than the budget with
+    /// it; one already held is answered whatever the budget. Its bytes leave the count with its
+    /// last holder.
+    #[test]
+    fn windows_past_the_budget_are_refused_and_their_bytes_freed_with_them() {
+        let file = vm::memfd(4 * vm::page_size());
+        let page = vm::page_size();
+        let held: Pages = vec![(Arc::as_ptr(&file).addr(), 0, 2 * page)];
+        MADE.lock().insert(
+            held.clone(),
+            Made {
+                fd: file.as_fd().try_clone_to_owned().unwrap(),
+                _files: vec![Arc::clone(&file)],
+                holders: 1,
+                window: false,
+            },
+        );
+        let window = Run {
+            file: Arc::clone(&file),
+            offset: 0,
+            length: 2 * page,
+        };
+        count_window(&window);
+        count_window(&window);
+        let counted = WINDOW_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(counted >= 2 * page);
+        // Held: answered with no room left.
+        assert!(within_budget(&file, 0, 2 * page, 0));
+        // New: answered only where the budget has room for it beside what is counted.
+        assert!(!within_budget(&file, 2 * page, 2 * page, counted + page));
+        assert!(within_budget(&file, 2 * page, 2 * page, counted + 2 * page));
+        drop(Leases(vec![held]));
+        assert!(WINDOW_BYTES.load(std::sync::atomic::Ordering::Relaxed) <= counted - 2 * page);
+    }
+
     /// A window is the multiple of the span at or below the byte, clipped to the file's whole
     /// pages; none past the file's end.
     #[test]
@@ -772,6 +915,24 @@ mod tests {
     /// Windows of 16 pages in every file but file 9.
     fn sixteen(file: &u32, offset: u64) -> Option<(u64, u64)> {
         (*file != 9).then(|| window_in(offset, 1 << 40, 16 * PAGE, PAGE))?
+    }
+
+    /// Planned with the whole request as its granule, a request one window holds is that window's
+    /// one chunk; one that crosses a window, or has a run windows do not take, is no one window.
+    #[test]
+    fn only_a_request_one_window_holds_is_answered_by_it() {
+        let whole = |of: &[(u32, u64, u64)]| {
+            let runs = runs(of);
+            let total: u64 = runs.iter().map(|r| r.length).sum();
+            windowed(&runs, total, PAGE, LIMITS, sixteen).unwrap()
+        };
+        assert!(one_window(&whole(&[(1, 2, 5)])));
+        // Across the window boundary at page 16.
+        assert!(!one_window(&whole(&[(1, 12, 8)])));
+        // Two runs of one window: windows and pieces.
+        assert!(!one_window(&whole(&[(1, 0, 2), (1, 4, 2)])));
+        // File 9 takes no windows.
+        assert!(!one_window(&whole(&[(9, 0, 4)])));
     }
 
     fn lengths(plan: &[Planned<u32>]) -> Vec<u64> {
@@ -1196,6 +1357,7 @@ mod tests {
                     fd: file.as_fd().try_clone_to_owned().unwrap(),
                     _files: vec![Arc::clone(&file)],
                     holders: 0,
+                    window: false,
                 },
             );
         }
