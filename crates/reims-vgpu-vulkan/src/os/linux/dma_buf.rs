@@ -232,6 +232,7 @@ pub(crate) struct Leases(Vec<Pages>);
 
 impl Drop for Leases {
     fn drop(&mut self) {
+        let mut retired = Vec::new();
         let mut made = MADE.lock();
         for pages in self.0.drain(..) {
             let Some(entry) = made.get_mut(&pages) else {
@@ -239,9 +240,12 @@ impl Drop for Leases {
             };
             entry.holders -= 1;
             if entry.holders == 0 {
-                made.remove(&pages);
+                retired.push(made.remove(&pages));
             }
         }
+        // Closing a dma-buf can unpin its pages. Keep that work outside the shared table lock.
+        drop(made);
+        drop(retired);
     }
 }
 
