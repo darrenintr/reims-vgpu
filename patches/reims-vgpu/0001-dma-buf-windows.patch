@@ -1,0 +1,541 @@
+From 8c007dcdafde326e38806479c28cae06cc17db02 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 15 Oct 2026 02:43:25 +0000
+Subject: [PATCH] :racehorse: Answer dma-buf requests from windows of guest
+ RAM's files
+
+RADV passes every imported buffer object with each submission, about
+0.55 us each, and a busy macOS guest holds a thousand imports, 1.7 ms a
+submission. With REIMS_VGPU_DMA_BUF_WINDOWS=1, a stretch of a request that
+one run of a file covers, from a granule boundary, is an offset into a
+dma-buf of the aligned window of that file it lies in (udmabuf's size
+limit, 64 MiB by default), so every buffer over one window shares one
+import: an 8 GiB guest is at most 128 imports. udmabuf pins a window's
+pages whole, so the setting is off by default. It needs metal2vulkan's
+chunks at offsets (DmaBufChunk::offset, DmaBufRequest::offset_alignment).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GxoqC8ZLTGrUjAekESTLXh
+---
+ .../reims-vgpu-vulkan/src/os/linux/dma_buf.rs | 417 +++++++++++++++++-
+ .../reims-vgpu-vulkan/src/os/linux/import.rs  |   3 +-
+ 2 files changed, 406 insertions(+), 14 deletions(-)
+
+diff --git a/crates/reims-vgpu-vulkan/src/os/linux/dma_buf.rs b/crates/reims-vgpu-vulkan/src/os/linux/dma_buf.rs
+index 17ab865..7ee0389 100644
+--- a/crates/reims-vgpu-vulkan/src/os/linux/dma_buf.rs
++++ b/crates/reims-vgpu-vulkan/src/os/linux/dma_buf.rs
+@@ -49,6 +49,19 @@
+ //! holder to go lets the dma-buf go. The pages are the same either way: a file page a dma-buf
+ //! pins stays what both show, as no file of the library's has pages dropped while it is mapped.
+ //!
++//! **Windows** (`REIMS_VGPU_DMA_BUF_WINDOWS`, off by default). Each import adds its cost to every
++//! submission (above), and the shared dma-bufs serve only a chunk of exactly the same pages. With
++//! windows on, a stretch of a request that one run of a file's pages covers, from a granule
++//! boundary of the request, is answered as an offset into a dma-buf of the whole aligned window of
++//! that file it lies in ([`windowed`]): a window of udmabuf's size limit (64 MiB by default),
++//! cut at multiples of that size from the file's start, clipped to the file's end. Every buffer
++//! over pages of one window then shares one import of it (metal2vulkan's chunks at offsets,
++//! `DmaBufRequest::offset_alignment`), so an 8 GiB guest's RAM is at most 128 imports, whatever
++//! the guest holds. The cost: udmabuf pins every page of a window, allocating those the guest
++//! never touched, for as long as any buffer over the window lives. A stretch whose offset in its
++//! window misses the request's offset alignment, or a request that takes no offsets (a
++//! texture's), is cut and made as before. The setting is read once, at the first request.
++//!
+ //! **Concurrent misses.** `REIMS_VGPU_DMA_BUF_RACE_FIX` defaults to on. With `0`, `false`, `no`
+ //! or `off` (case and surrounding spaces ignored), a creator that finds another creator's
+ //! winning entry after its kernel call keeps its own dma-buf, as before the race fix. Ordinary
+@@ -85,6 +98,22 @@ fn race_fix() -> bool {
+     })
+ }
+ 
++/// Whether requests are answered from windows of their files (module docs), read once per
++/// process: off unless `REIMS_VGPU_DMA_BUF_WINDOWS` is `1`, `true`, `yes` or `on`.
++fn windows() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED
++        .get_or_init(|| windows_value(std::env::var("REIMS_VGPU_DMA_BUF_WINDOWS").ok().as_deref()))
++}
++
++/// The default-off switch of [`windows`] (case and surrounding spaces ignored).
++fn windows_value(value: Option<&str>) -> bool {
++    matches!(
++        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
++        Some("1" | "true" | "yes" | "on")
++    )
++}
++
+ /// The default-on switch, using the same false values as `REIMS_VGPU_RDNA3`.
+ fn race_fix_value(value: Option<&str>) -> bool {
+     !matches!(
+@@ -313,15 +342,184 @@ fn padded<F: Clone>(
+     chunks(runs, granule, limits)
+ }
+ 
++/// One chunk of a request as [`windowed`] plans it.
++#[derive(Clone, Debug, PartialEq, Eq)]
++enum Planned<F> {
++    /// The runs of a dma-buf of their own, in order, as [`chunks`] cuts them.
++    Pieces(Vec<Run<F>>),
++    /// `length` bytes `offset` bytes into a dma-buf of the whole of `window`.
++    Window {
++        window: Run<F>,
++        offset: u64,
++        length: u64,
++    },
++}
++
++impl<F> Planned<F> {
++    fn length(&self) -> u64 {
++        match self {
++            Planned::Pieces(runs) => runs.iter().map(|r| r.length).sum(),
++            Planned::Window { length, .. } => *length,
++        }
++    }
++}
++
++/// `runs`, the request's pages in order, planned as chunks at multiples of `granule` from its
++/// start, as [`chunks`] cuts them, but where a stretch from a granule boundary lies in one run
++/// and in the window `window_of` gives for its first file byte, at an offset into the window that
++/// is a multiple of `alignment`: that stretch is a [`Planned::Window`] chunk, as long as the run
++/// and the window allow, cut to a multiple of `granule` unless it ends the request. The rest goes
++/// through [`chunks`], granule by granule between windows. `None` where [`chunks`] refuses a
++/// stretch.
++///
++/// `window_of(file, offset)` answers the window of `file` that holds byte `offset`, as its start
++/// and length in the file, or `None` where the file takes none.
++fn windowed<F: Clone>(
++    runs: &[Run<F>],
++    granule: u64,
++    alignment: u64,
++    limits: Limits,
++    window_of: impl Fn(&F, u64) -> Option<(u64, u64)>,
++) -> Option<Vec<Planned<F>>> {
++    let total: u64 = runs.iter().map(|r| r.length).sum();
++    let mut planned = Vec::new();
++    let mut pending: Vec<Run<F>> = Vec::new();
++    // The run the last pending piece came from: the next bytes of the same run join it.
++    let mut pending_from = None;
++    let flush = |pending: &mut Vec<Run<F>>, planned: &mut Vec<Planned<F>>| -> Option<()> {
++        if pending.is_empty() {
++            return Some(());
++        }
++        let cut = chunks(pending, granule, limits)?;
++        planned.extend(cut.into_iter().map(Planned::Pieces));
++        pending.clear();
++        Some(())
++    };
++    // The next byte to place, as a run and an offset into it, and its offset in the request.
++    let (mut r, mut i, mut at) = (0, 0, 0);
++    while at < total {
++        let run = &runs[r];
++        let from = run.offset + i;
++        if alignment != 0 && at.is_multiple_of(granule) {
++            let window = window_of(&run.file, from).filter(|&(start, length)| {
++                start <= from && from < start + length && (from - start).is_multiple_of(alignment)
++            });
++            if let Some((start, length)) = window {
++                let reach = (run.length - i).min(start + length - from);
++                let take = if at + reach == total {
++                    reach
++                } else {
++                    reach - reach % granule
++                };
++                if take > 0 {
++                    flush(&mut pending, &mut planned)?;
++                    planned.push(Planned::Window {
++                        window: Run {
++                            file: run.file.clone(),
++                            offset: start,
++                            length,
++                        },
++                        offset: from - start,
++                        length: take,
++                    });
++                    at += take;
++                    (r, i) = if i + take == run.length {
++                        (r + 1, 0)
++                    } else {
++                        (r, i + take)
++                    };
++                    continue;
++                }
++            }
++        }
++        // Up to the next granule boundary (or the request's end) goes with the pieces.
++        let mut step = (granule - at % granule).min(total - at);
++        while step > 0 {
++            let run = &runs[r];
++            let take = (run.length - i).min(step);
++            match pending.last_mut() {
++                Some(last)
++                    if pending_from == Some(r) && last.offset + last.length == run.offset + i =>
++                {
++                    last.length += take;
++                }
++                _ => pending.push(Run {
++                    file: run.file.clone(),
++                    offset: run.offset + i,
++                    length: take,
++                }),
++            }
++            pending_from = Some(r);
++            step -= take;
++            at += take;
++            (r, i) = if i + take == run.length {
++                (r + 1, 0)
++            } else {
++                (r, i + take)
++            };
++        }
++    }
++    flush(&mut pending, &mut planned)?;
++    Some(planned)
++}
++
++/// [`windowed`] of `runs`, padded as [`padded`] pads them where it plans several chunks.
++fn windowed_padded<F: Clone>(
++    runs: &mut Vec<Run<F>>,
++    granule: u64,
++    alignment: u64,
++    limits: Limits,
++    window_of: impl Fn(&F, u64) -> Option<(u64, u64)>,
++    pad: impl FnOnce(u64) -> Run<F>,
++) -> Option<Vec<Planned<F>>> {
++    let plan = windowed(runs, granule, alignment, limits, &window_of)?;
++    let length: u64 = runs.iter().map(|r| r.length).sum();
++    let past = length.next_multiple_of(granule) - length;
++    if plan.len() == 1 || past == 0 {
++        return Some(plan);
++    }
++    runs.push(pad(past));
++    windowed(runs, granule, alignment, limits, &window_of)
++}
++
++/// The window of a file of `size` bytes that holds byte `offset` (module docs): from the multiple
++/// of `span` at or below it, `span` bytes or to the file's end, whole pages of `page` bytes.
++/// `None` past the file's end.
++fn window_in(offset: u64, size: u64, span: u64, page: u64) -> Option<(u64, u64)> {
++    let span = span - span % page;
++    if span == 0 || offset >= size {
++        return None;
++    }
++    let start = offset - offset % span;
++    let end = (start + span).min(size - size % page);
++    (end > offset).then(|| (start, end - start))
++}
++
++/// The bytes of the file `fd`, where it answers.
++fn file_size(fd: &OwnedFd) -> Option<u64> {
++    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
++    // SAFETY: the descriptor is open for the call, and `fstat` writes the structure.
++    if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
++        return None;
++    }
++    // SAFETY: the call succeeded, so it wrote the structure.
++    let stat = unsafe { stat.assume_init() };
++    u64::try_from(stat.st_size).ok()
++}
++
+ /// Dma-bufs of the `length` bytes from `first`, whole pages, each resolved through the backing
+ /// table, which in order are those bytes: one piece for each run of a file's pages that follow on,
+ /// the block of zeros' pieces from a file of zeros of the import's own, cut into chunks within
+ /// udmabuf's limits at multiples of `granule` from `first` (module docs). A chunk of the same pages
+ /// as a dma-buf some source holds is that dma-buf again; `leases` holds each one answered.
++///
++/// With windows on ([`windows`]) and an `offset_alignment` other than 0, a stretch one run of a
++/// file covers is an offset into a dma-buf of its window instead ([`windowed`]).
+ pub(crate) fn of_pages(
+     first: u64,
+     length: u64,
+     granule: u64,
++    offset_alignment: u64,
+     leases: &mut Leases,
+ ) -> Result<Vec<DmaBufChunk>, Refusal> {
+     let page = vm::page_size();
+@@ -374,14 +572,30 @@ pub(crate) fn of_pages(
+         offset: 0,
+         length: pad,
+     };
+-    let cut = padded(&mut runs, granule, limits, pad).ok_or_else(|| refused(&runs))?;
++    let plan = if windows() && offset_alignment != 0 {
++        let window_of =
++            |file: &Arc<OwnedFd>, offset| window_in(offset, file_size(file)?, limits.bytes, page);
++        windowed_padded(&mut runs, granule, offset_alignment, limits, window_of, pad)
++    } else {
++        padded(&mut runs, granule, limits, pad)
++            .map(|cut| cut.into_iter().map(Planned::Pieces).collect())
++    };
++    let plan = plan.ok_or_else(|| refused(&runs))?;
+     let mut answered = Leases::default();
+-    let made = cut.iter().map(|chunk| {
+-        let fd = held(device, chunk, &mut answered)?;
+-        Ok(DmaBufChunk {
+-            fd,
+-            length: chunk.iter().map(|r| r.length).sum(),
+-        })
++    let made = plan.iter().map(|chunk| {
++        let length = chunk.length();
++        match chunk {
++            Planned::Pieces(runs) => Ok(DmaBufChunk {
++                fd: held(device, runs, &mut answered)?,
++                offset: 0,
++                length,
++            }),
++            Planned::Window { window, offset, .. } => Ok(DmaBufChunk {
++                fd: held(device, std::slice::from_ref(window), &mut answered)?,
++                offset: *offset,
++                length,
++            }),
++        }
+     });
+     let made = made.collect::<Result<Vec<_>, Refusal>>()?;
+     leases.extend(answered);
+@@ -492,6 +706,182 @@ mod tests {
+         (metadata.dev(), metadata.ino())
+     }
+ 
++    #[test]
++    fn windows_are_default_off_and_take_the_documented_true_values() {
++        for off in [
++            None,
++            Some(""),
++            Some("0"),
++            Some("off"),
++            Some("auto"),
++            Some("2"),
++        ] {
++            assert!(!windows_value(off), "{off:?}");
++        }
++        for on in ["1", "true", "yes", "on", " ON ", "True"] {
++            assert!(windows_value(Some(on)), "{on:?}");
++        }
++    }
++
++    /// A window is the multiple of the span at or below the byte, clipped to the file's whole
++    /// pages; none past the file's end.
++    #[test]
++    fn a_window_is_the_aligned_span_holding_the_byte() {
++        const SPAN: u64 = 64 << 20;
++        assert_eq!(window_in(0, 8 << 30, SPAN, PAGE), Some((0, SPAN)));
++        assert_eq!(
++            window_in(SPAN + 5 * PAGE, 8 << 30, SPAN, PAGE),
++            Some((SPAN, SPAN))
++        );
++        // The last window of a file whose size is no multiple of the span.
++        assert_eq!(
++            window_in(SPAN + PAGE, SPAN + 3 * PAGE, SPAN, PAGE),
++            Some((SPAN, 3 * PAGE))
++        );
++        assert_eq!(
++            window_in(SPAN + 3 * PAGE, SPAN + 3 * PAGE, SPAN, PAGE),
++            None
++        );
++        // A span that is no multiple of the page is cut to one.
++        assert_eq!(
++            window_in(0, 4 * PAGE, 2 * PAGE + 1, PAGE),
++            Some((0, 2 * PAGE))
++        );
++    }
++
++    /// Runs of files named by numbers, `(file, offset, length)` in pages.
++    fn runs(of: &[(u32, u64, u64)]) -> Vec<Run<u32>> {
++        (of.iter())
++            .map(|&(file, offset, length)| Run {
++                file,
++                offset: offset * PAGE,
++                length: length * PAGE,
++            })
++            .collect()
++    }
++
++    const LIMITS: Limits = Limits {
++        pieces: 1024,
++        bytes: 64 << 20,
++    };
++
++    /// Windows of 16 pages in every file but file 9.
++    fn sixteen(file: &u32, offset: u64) -> Option<(u64, u64)> {
++        (*file != 9).then(|| window_in(offset, 1 << 40, 16 * PAGE, PAGE))?
++    }
++
++    fn lengths(plan: &[Planned<u32>]) -> Vec<u64> {
++        plan.iter().map(|c| c.length() / PAGE).collect()
++    }
++
++    /// One run in one window is one chunk at its offset into the window, whatever the granule.
++    #[test]
++    fn a_run_in_one_window_is_an_offset_into_it() {
++        let plan = windowed(&runs(&[(1, 20, 3)]), 3 * PAGE, PAGE, LIMITS, sixteen).unwrap();
++        assert_eq!(
++            plan,
++            vec![Planned::Window {
++                window: Run {
++                    file: 1,
++                    offset: 16 * PAGE,
++                    length: 16 * PAGE
++                },
++                offset: 4 * PAGE,
++                length: 3 * PAGE,
++            }]
++        );
++    }
++
++    /// Without windows (an alignment of 0, or no file taking one) the plan is `chunks`', piece
++    /// for piece.
++    #[test]
++    fn without_windows_the_plan_is_the_pieces_cut() {
++        let of = runs(&[(1, 0, 3), (2, 7, 2), (1, 40, 5)]);
++        let cut = chunks(&of, 2 * PAGE, LIMITS).unwrap();
++        let pieces: Vec<Planned<u32>> = cut.into_iter().map(Planned::Pieces).collect();
++        assert_eq!(windowed(&of, 2 * PAGE, 0, LIMITS, sixteen).unwrap(), pieces);
++        let none = |_: &u32, _| None;
++        assert_eq!(windowed(&of, 2 * PAGE, PAGE, LIMITS, none).unwrap(), pieces);
++        let small = Limits {
++            pieces: 2,
++            bytes: 4 * PAGE,
++        };
++        let cut = chunks(&of, 2 * PAGE, small).unwrap();
++        let pieces: Vec<Planned<u32>> = cut.into_iter().map(Planned::Pieces).collect();
++        assert_eq!(windowed(&of, 2 * PAGE, PAGE, small, none).unwrap(), pieces);
++    }
++
++    /// Every cut lies a multiple of the granule from the request's start, a window's chunk ends
++    /// at the run's or the window's end cut back to the granule, and what no window takes goes
++    /// in pieces of its own.
++    #[test]
++    fn windows_and_pieces_meet_at_granules() {
++        // 2 pages of file 9 (no window), 5 of file 1 from page 14 (crossing a window at 16),
++        // then 3 of file 2.
++        let of = runs(&[(9, 0, 2), (1, 14, 5), (2, 3, 3)]);
++        let plan = windowed(&of, 2 * PAGE, PAGE, LIMITS, sixteen).unwrap();
++        assert_eq!(lengths(&plan), vec![2, 2, 2, 2, 2]);
++        let mut at = 0;
++        for chunk in &plan[..plan.len() - 1] {
++            at += chunk.length();
++            assert!(at.is_multiple_of(2 * PAGE));
++        }
++        assert!(matches!(plan[0], Planned::Pieces(_)));
++        assert_eq!(
++            plan[1],
++            Planned::Window {
++                window: Run {
++                    file: 1,
++                    offset: 0,
++                    length: 16 * PAGE
++                },
++                offset: 14 * PAGE,
++                length: 2 * PAGE,
++            }
++        );
++        assert_eq!(
++            plan[2],
++            Planned::Window {
++                window: Run {
++                    file: 1,
++                    offset: 16 * PAGE,
++                    length: 16 * PAGE
++                },
++                offset: 0,
++                length: 2 * PAGE,
++            }
++        );
++        // File 1's page 18 lies past a granule boundary only one page before its run ends: it
++        // and file 2's first page go in pieces, and file 2's last two pages in its window.
++        assert!(matches!(plan[3], Planned::Pieces(_)));
++        assert!(matches!(plan[4], Planned::Window { offset, .. } if offset == 4 * PAGE));
++        // With an alignment of 4 pages, only offsets into a window at multiples of it are taken.
++        let plan = windowed(&of, 2 * PAGE, 4 * PAGE, LIMITS, sixteen).unwrap();
++        assert!(plan.iter().all(|c| match c {
++            Planned::Window { offset, .. } => offset.is_multiple_of(4 * PAGE),
++            Planned::Pieces(_) => true,
++        }));
++        let total: u64 = plan.iter().map(Planned::length).sum();
++        assert_eq!(total, 10 * PAGE);
++    }
++
++    /// Several chunks are padded to the granule, the pad in the last chunk's pieces.
++    #[test]
++    fn several_windowed_chunks_are_padded() {
++        let mut of = runs(&[(1, 0, 4), (9, 0, 1)]);
++        let plan = windowed_padded(&mut of, 2 * PAGE, PAGE, LIMITS, sixteen, |past| Run {
++            file: 7,
++            offset: 0,
++            length: past,
++        })
++        .unwrap();
++        assert_eq!(lengths(&plan), vec![4, 2]);
++        let Planned::Pieces(last) = &plan[1] else {
++            panic!("{plan:?}");
++        };
++        assert_eq!(last.last().unwrap().file, 7);
++    }
++
+     #[test]
+     fn race_fix_is_default_on_and_accepts_the_documented_false_values() {
+         for on in [
+@@ -769,7 +1159,7 @@ mod tests {
+                     .write_volatile(0x10 + i as u8)
+             };
+         }
+-        let chunks = of_pages(at + page, 2 * page, page, &mut Leases::default()).unwrap();
++        let chunks = of_pages(at + page, 2 * page, page, 0, &mut Leases::default()).unwrap();
+         assert_eq!(chunks.len(), 1);
+         assert_eq!(chunks[0].length, 2 * page);
+         assert_eq!(read_through(&chunks[0], 0), 0x11);
+@@ -783,7 +1173,7 @@ mod tests {
+         );
+         let private = vm::anonymous(None, page, "a test's private page").unwrap();
+         assert!(matches!(
+-            of_pages(private, page, page, &mut Leases::default()),
++            of_pages(private, page, page, 0, &mut Leases::default()),
+             Err(Refusal::Unresolved)
+         ));
+     }
+@@ -843,15 +1233,15 @@ mod tests {
+         let page = vm::page_size();
+         let at = vm::allocate_aliasable(2 * page).unwrap().addr().to_u64();
+         let mut first = Leases::default();
+-        let a = of_pages(at, 2 * page, 2 * page, &mut first).unwrap();
++        let a = of_pages(at, 2 * page, 2 * page, 0, &mut first).unwrap();
+         let mut second = Leases::default();
+-        let b = of_pages(at, 2 * page, 2 * page, &mut second).unwrap();
++        let b = of_pages(at, 2 * page, 2 * page, 0, &mut second).unwrap();
+         assert_eq!(identity(&a[0]), identity(&b[0]));
+         let mut third = Leases::default();
+-        let part = of_pages(at, page, page, &mut third).unwrap();
++        let part = of_pages(at, page, page, 0, &mut third).unwrap();
+         assert_ne!(identity(&a[0]), identity(&part[0]), "other pages");
+         drop((first, second, third));
+-        let c = of_pages(at, 2 * page, 2 * page, &mut Leases::default()).unwrap();
++        let c = of_pages(at, 2 * page, 2 * page, 0, &mut Leases::default()).unwrap();
+         assert_ne!(identity(&a[0]), identity(&c[0]));
+     }
+ 
+@@ -884,6 +1274,7 @@ mod tests {
+             view.addr().to_u64(),
+             count * page,
+             page,
++            0,
+             &mut Leases::default(),
+         )
+         .unwrap();
+diff --git a/crates/reims-vgpu-vulkan/src/os/linux/import.rs b/crates/reims-vgpu-vulkan/src/os/linux/import.rs
+index 0938d37..1c90e88 100644
+--- a/crates/reims-vgpu-vulkan/src/os/linux/import.rs
++++ b/crates/reims-vgpu-vulkan/src/os/linux/import.rs
+@@ -151,9 +151,10 @@ pub(crate) unsafe fn host_memory(at: NonNull<u8>) -> rt::HostMemory {
+     let source: rt::DmaBufSource = Arc::new(move |request: rt::DmaBufRequest| {
+         let first = shown_at(request.start).as_ptr().addr().to_u64();
+         let (length, granule) = (request.length, request.granule);
++        let alignment = request.offset_alignment;
+         let mut answered = super::dma_buf::Leases::default();
+         let chunks = crate::gpu::timing::resources::call("dma-buf source", length, || {
+-            super::dma_buf::of_pages(first, length, granule, &mut answered)
++            super::dma_buf::of_pages(first, length, granule, alignment, &mut answered)
+         });
+         match chunks {
+             Ok(chunks) => {
+-- 
+2.43.0
+
