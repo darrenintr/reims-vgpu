@@ -11,6 +11,23 @@ use std::marker::PhantomData;
 
 use crate::platform::os::Threads;
 
+/// What a FIFO thread runs before it blocks ([`set_before_block`]).
+static BEFORE_BLOCK: std::sync::OnceLock<fn() -> bool> = std::sync::OnceLock::new();
+
+/// Sets what a FIFO thread runs each time before it blocks: for ring bytes, for room among its
+/// stamps, or for other channels' stamps (its barriers). A platform that holds back the GPU
+/// work a FIFO thread commits submits it there, so nothing the thread waits for waits on it,
+/// and answers whether it submitted any: the thread then checks again for what it would wait
+/// for before it waits. The first setting stays.
+pub fn set_before_block(f: fn() -> bool) {
+    let _ = BEFORE_BLOCK.set(f);
+}
+
+/// Runs what [`set_before_block`] set, if anything: whether it submitted held-back work.
+pub(crate) fn before_block() -> bool {
+    BEFORE_BLOCK.get().is_some_and(|f| f())
+}
+
 /// The FIFO thread's stack: 512 KiB.
 pub const FIFO_THREAD_STACK: usize = 512 * 1024;
 

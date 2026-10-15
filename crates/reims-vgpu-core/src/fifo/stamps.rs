@@ -212,6 +212,12 @@ impl StampQueue {
     /// Pushes a pending stamp, waiting while 128 are pending. A quiesced queue still takes it.
     pub fn push_stamp(&self, stamp_value: u32, command_id: u32) {
         let mut st = imp::lock(&self.state);
+        if st.pending_count() == STAMP_QUEUE_CAPACITY {
+            // Room comes as work completes: what the thread held back goes first, unlocked.
+            drop(st);
+            let _ = crate::rt::thread::before_block();
+            st = imp::lock(&self.state);
+        }
         while st.pending_count() == STAMP_QUEUE_CAPACITY {
             st = imp::wait(&self.room, st);
         }

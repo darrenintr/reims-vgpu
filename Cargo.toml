@@ -29,9 +29,9 @@ reims-vgpu-vulkan = { path = "crates/reims-vgpu-vulkan" }
 # The Vulkan platform's proof of concept (architecture D1): a Metal-shaped API on Vulkan, from
 # metal2vulkan's public repository at the commit both name: darrenintr's fork, which carries the
 # RDNA3 stand-in and shared dma-buf imports (docs/qemu.md, the RX 7600).
-metal2vulkan-runtime = { git = "https://github.com/darrenintr/metal2vulkan", rev = "94bf8d9c3ff4757f49228d5d46522206befb9538" }
+metal2vulkan-runtime = { git = "https://github.com/darrenintr/metal2vulkan", rev = "0107e9424a7c8605ebc389daf54b5e311fcbb67d" }
 # Its translator, for the Metal enums and descriptor values the runtime's calls take.
-metal2vulkan = { git = "https://github.com/darrenintr/metal2vulkan", rev = "94bf8d9c3ff4757f49228d5d46522206befb9538" }
+metal2vulkan = { git = "https://github.com/darrenintr/metal2vulkan", rev = "0107e9424a7c8605ebc389daf54b5e311fcbb67d" }
 # The hashes of the Vulkan platform's metallib sources (reims-vgpu-vulkan/build.rs).
 sha2 = "0.10.9"
 # A display window's swapchain on Linux (reims-vgpu-vulkan/src/swapchain.rs), at the runtime's

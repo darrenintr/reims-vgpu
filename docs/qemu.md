@@ -537,6 +537,16 @@ reims-ctl set mac --gpu "AMD Radeon RX 7600"   # a name or number from reims-ctl
   take every core. A list such as `2-5,8-11` names the CPUs itself, one per
   vCPU. QEMU's log says what was pinned, or why nothing was. A VM started from
   a script that `reims-ctl command` printed is not pinned.
+  The library's own threads are not pinned with them. A thread takes its
+  creator's affinity, and the FIFO threads, the display's thread and the
+  runtime's threads are made on a vCPU's thread inside an MMIO access, so
+  they were all bound to that vCPU's one CPU; each now starts with the
+  process's main thread's affinity
+  (`crates/reims-vgpu-vulkan/src/os/linux/threads.rs`). Measured on the 3600
+  with the tahoe guest at 8 pinned vCPUs in use (2026-10-14): unbinding them in
+  the running VM took the 90th percentile of the gaps between frames from 87
+  ms to 41 ms, and the 95th from 130 ms to 51 ms, with the GPU 17% busy at the
+  median.
 - **`--refresh 120`** offers the guest 120 Hz modes (`REIMS_VGPU_WINDOW_REFRESH`).
   The guest's frames complete when the GPU does, not at the host screen's
   vsync (`crates/reims-vgpu-vulkan/src/swapchain.rs`). So the guest runs at
