@@ -11,8 +11,10 @@
 #      (Homebrew on macOS; apt or pacman on Linux, through sudo), and Rust
 #      through rustup.rs, whose installer asks its own questions;
 #   2. fetches vendor/qemu, QEMU's source, without QEMU's own submodules (its
-#      build fetches what it needs); cargo fetches metal2vulkan itself, at the
-#      commit the library's Cargo.toml names;
+#      build fetches what it needs), and metal2vulkan from darrenintr's fork
+#      (github.com/darrenintr/metal2vulkan, which carries the RDNA3 path) at
+#      the commit the library's Cargo.toml names, checking that it names that
+#      fork;
 #   3. builds the library (cargo xtask dist) and QEMU on it, in
 #      ~/.cache/reims-ctl, and installs QEMU into
 #      ~/.local/share/reims-ctl/qemu/<build>, linking qemu/current to it. A
@@ -234,7 +236,31 @@ COMMIT="$(git -C "$ROOT" rev-parse --short HEAD)"
 TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
 if [[ $OS == Darwin ]]; then DIST="$TARGET/dist"; else DIST="$TARGET/dist-vulkan"; fi
 
+# metal2vulkan: the library takes the runtime and the translator from this fork,
+# at the commit Cargo.toml pins (docs/qemu.md, the RX 7600 and other RDNA3 GPUs).
+M2V_REPO=https://github.com/darrenintr/metal2vulkan
+# The repository and commit Cargo.toml names for one of metal2vulkan's crates.
+m2v_pin() {
+  sed -n "s|^$1 = { git = \"\([^\"]*\)\", rev = \"\([0-9a-f]*\)\" }.*|\1 \2|p" "$ROOT/Cargo.toml"
+}
+fetch_metal2vulkan() {
+  local crate pin rev=''
+  for crate in metal2vulkan metal2vulkan-runtime; do
+    pin="$(m2v_pin "$crate")"
+    [[ -n $pin ]] || die "Cargo.toml names no git source for $crate"
+    [[ ${pin% *} == "$M2V_REPO" ]] ||
+      die "Cargo.toml takes $crate from ${pin% *}, not the fork $M2V_REPO: point both metal2vulkan crates at the fork"
+    [[ -z $rev || $rev == "${pin#* }" ]] ||
+      die "Cargo.toml pins metal2vulkan and metal2vulkan-runtime at different commits: pin both at one"
+    rev="${pin#* }"
+  done
+  say "Fetching metal2vulkan from $M2V_REPO at ${rev:0:10}"
+  (cd "$ROOT" && cargo fetch --locked) ||
+    die "cargo could not fetch metal2vulkan's commit $rev from $M2V_REPO: check that you can reach that repository and that the commit was pushed to it"
+}
+
 if [[ $SKIP_QEMU == 0 ]]; then
+  fetch_metal2vulkan
   say "Building the library (cargo xtask dist)"
   (cd "$ROOT" && CARGO_TARGET_DIR="$TARGET" cargo xtask dist)
   [[ -f "$DIST/lib/pkgconfig/reims-vgpu.pc" ]] || die "cargo xtask dist wrote no $DIST/lib/pkgconfig/reims-vgpu.pc"

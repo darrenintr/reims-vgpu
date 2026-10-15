@@ -316,9 +316,27 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
                 rt::ShaderCacheOptions::in_directory(PathBuf::from(home).join(SHADER_CACHE));
         }
         options.shader_cache.capacity = SHADER_CACHE_CAPACITY;
+        options.rdna3_stand_in = rdna3_stand_in(std::env::var("REIMS_VGPU_RDNA3").ok().as_deref());
         options
     });
     &OPTIONS
+}
+
+/// Whether an AMD discrete RDNA3 GPU (the Radeon RX 7600 and the other Navi 31, 32 and 33 GPUs) on
+/// RADV from Mesa 26.2.4 reads its driver facts as the Radeon 780M at Mesa 26.2.4, the measured
+/// GPU of the same driver and generation (the runtime's `DeviceOptions::rdna3_stand_in`): on, but
+/// where `value`, `REIMS_VGPU_RDNA3`, is `0`, `false`, `no` or `off`. Such a GPU is otherwise an
+/// identity the runtime has not measured, which takes the exact path in place of every answer
+/// RADV is measured to give: BC1 to BC3 textures kept beside a decoded twin, decoded on the CPU
+/// after the guest's CPU writes, an indexed indirect draw drawn through the index bounds pass (a
+/// compute pre-pass and two draws), and generated commands preprocessed apart. With the stand-in
+/// it takes RADV's measured answers instead, and the runtime says so once per device
+/// (`metal2vulkan-facts-stand-in`). Every other device ignores it.
+fn rdna3_stand_in(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0" | "false" | "no" | "off")
+    )
 }
 
 /// The fields of the runtime's device policy (`metal2vulkan::device::DevicePolicy`) whose exact
@@ -606,6 +624,26 @@ pub(crate) mod tests {
 
     pub(crate) fn platform() -> VulkanPlatform {
         VulkanPlatform::new(Box::new(NoLauncher))
+    }
+
+    /// `REIMS_VGPU_RDNA3` keeps the RDNA3 stand-in on unless it says off, in any case and with
+    /// spaces around it
+    #[test]
+    fn reims_vgpu_rdna3_turns_the_stand_in_off_alone() {
+        for on in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("on"),
+            Some("yes"),
+            Some("auto"),
+        ] {
+            assert!(rdna3_stand_in(on), "{on:?}");
+        }
+        for off in ["0", "false", "no", "off", " OFF ", "False"] {
+            assert!(!rdna3_stand_in(Some(off)), "{off:?}");
+        }
+        assert!(device_options().rdna3_stand_in || std::env::var_os("REIMS_VGPU_RDNA3").is_some());
     }
 
     /// Without `REIMS_VGPU_EXACT` the device policy is the runtime's default, its native forms;

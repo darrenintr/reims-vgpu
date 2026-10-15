@@ -23,7 +23,10 @@
 //! Every import also carries a dma-buf source ([`host_memory`]): a device that refuses the pages
 //! as host memory, as RADV refuses any page with a file behind it, imports a dma-buf of the same
 //! pages instead (`super::dma_buf`). The runtime asks for it only where it would refuse the
-//! import otherwise, so every device that imports host memory imports as it did.
+//! import otherwise, so every device that imports host memory imports as it did. The source holds
+//! the dma-bufs it answered with until the runtime drops it, so another import of the same pages
+//! meanwhile is answered with the same dma-buf, which the runtime imports once
+//! (`super::dma_buf`'s `Leases`).
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -142,11 +145,16 @@ impl ImportView {
 pub(crate) unsafe fn host_memory(at: NonNull<u8>) -> rt::HostMemory {
     // An earlier import's refusal is not this one's.
     REFUSAL.with_borrow_mut(|kept| *kept = None);
-    let source: rt::DmaBufSource = Arc::new(|request: rt::DmaBufRequest| {
+    // The dma-bufs the source answered with, held while the runtime keeps the source: as long as
+    // any import of its lives (`super::dma_buf`, one dma-buf for the same pages).
+    let leases = Mutex::new(super::dma_buf::Leases::default());
+    let source: rt::DmaBufSource = Arc::new(move |request: rt::DmaBufRequest| {
         let first = shown_at(request.start).as_ptr().addr().to_u64();
         let (length, granule) = (request.length, request.granule);
-        match super::dma_buf::of_pages(first, length, granule) {
+        let mut answered = super::dma_buf::Leases::default();
+        match super::dma_buf::of_pages(first, length, granule, &mut answered) {
             Ok(chunks) => {
+                leases.lock().extend(answered);
                 log::debug!(
                     "{length:#x} bytes at {first:#x} as {} dma-bufs at a granule of {granule:#x}",
                     chunks.len()

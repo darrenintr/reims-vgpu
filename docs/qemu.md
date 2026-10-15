@@ -585,6 +585,58 @@ presents fewer than 120 frames a second while the window's GPU time stays
 small is waiting on the CPU. `top -H -p <QEMU's pid>` shows which threads hold
 it: the vCPUs (`CPU n/KVM`), or the library's (`reims-vgpu.*`).
 
+### Linux hosts: the Radeon RX 7600 and other RDNA3 GPUs
+
+The library gives an AMD discrete RDNA3 GPU (the Radeon RX 7600 and every other Navi 31, 32 and
+33 GPU) on RADV a path of its own, in two parts. Neither is measured on an RX 7600 yet (see
+"Measuring it" below).
+
+- **The GPU takes RADV's measured answers** (`REIMS_VGPU_RDNA3`, on by default; [api.md](api.md),
+  "The Vulkan platform on an RDNA3 GPU"). metal2vulkan trusts a driver's answer only on the exact
+  GPU and Mesa release a lane measured, which for RADV is the Radeon 780M at Mesa 26.2.4. It
+  treats every other RADV GPU as unmeasured, and an unmeasured GPU takes the slower exact path in
+  place of each answer. The 780M is an RDNA3 (GFX11) GPU too, so from Mesa 26.2.4 an RDNA3
+  dGPU now reads its facts as the 780M's (the runtime's `DeviceOptions::rdna3_stand_in`). That
+  moves work off the host's CPU and spares GPU passes:
+  - BC1 to BC3 textures are sampled from their blocks by the GPU's texture units, with no decoded
+    twin beside them. Such a twin takes 4 to 8 times the blocks' memory, needs a decode pass
+    after every write, and is decoded on the CPU after each of the guest's CPU writes
+    (`cpu-block-decode`).
+  - An indexed indirect draw is one draw bounded by the device's range, not the index bounds
+    pass (a compute pre-pass and two draws).
+  - A mipmap chain reads its first level in place, with no copy into scratch first.
+  - RADV preprocesses generated commands itself (an indirect command buffer's kernel-written
+    commands, which run on the GPU alone), not each execution apart behind barriers. Mesa fixed
+    the bug that needed that in 26.2.0.
+
+  QEMU's log says it once per device: `metal2vulkan-facts-stand-in`. On Mesa older than 26.2.4,
+  or with `REIMS_VGPU_RDNA3=0` (`reims-ctl set mac --env REIMS_VGPU_RDNA3=0`), the GPU keeps its
+  own identity and the exact paths.
+- **Fewer buffer objects on every submission.** RADV passes every imported buffer object with
+  each submit, about 0.55 µs each ("Linux hosts: AMD GPUs and udmabuf"). The library now hands out
+  one dma-buf for the same guest pages while any import of them lives
+  (`crates/reims-vgpu-vulkan/src/os/linux/dma_buf.rs`), and metal2vulkan imports such a dma-buf
+  once for every buffer over it (its shared imports). Each repeat window of pages is then one
+  object fewer in every submission's list. How often the guest repeats a window is not
+  measured: metal2vulkan's `WorkCounts::dma_buf_shared_imports` against `dma_buf_imports` says so
+  for a run.
+
+What does not change: RADV still picks wave32 or wave64 for each compute shader itself
+(`radv_shader_choose_subgroup_size`), and metal2vulkan pins 32 lanes wherever Metal's simdgroups
+need them, so there is no wave-size setting to add. Memory placement already takes resizable BAR
+on a discrete GPU (the upload arena and write-combined buffers in device-local, host-visible
+memory). The GPU-side translation, a guest command buffer turned into Vulkan work on the host's
+CPU, is the same on every GPU.
+
+**Measuring it.** On the Ryzen 5 3600 and RX 7600 host, compare the parent and the changed builds
+with the same QEMU, VM settings ("Linux hosts: a CPU-bound host at 120 Hz"), resolution and
+guest-disk copies, alternating the build order. With `REIMS_VGPU_STATS=1`, record the presents a
+second, the longest gap and the window's GPU time, idle and under the 12-job build, cold and warm
+caches apart; `REIMS_VGPU_RDNA3=0` on the changed build separates the stand-in from the shared
+imports. To make the RX 7600 a measured identity of its own, run metal2vulkan's runtime lanes on
+it (docs/VALIDATION.md there) and add its `deviceID` and release to `MEASURED_DEVICES` and the
+clean defect lists; the stand-in is then no longer taken for it.
+
 ### Linux hosts: what a command buffer costs on RADV
 
 Measured with the macOS 26.7.1 guest on the Ryzen 5 3600 and RX 7600 host
