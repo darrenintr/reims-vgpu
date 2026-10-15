@@ -152,7 +152,10 @@ pub(crate) unsafe fn host_memory(at: NonNull<u8>) -> rt::HostMemory {
         let first = shown_at(request.start).as_ptr().addr().to_u64();
         let (length, granule) = (request.length, request.granule);
         let mut answered = super::dma_buf::Leases::default();
-        match super::dma_buf::of_pages(first, length, granule, &mut answered) {
+        let chunks = crate::gpu::timing::resources::call("dma-buf source", length, || {
+            super::dma_buf::of_pages(first, length, granule, &mut answered)
+        });
+        match chunks {
             Ok(chunks) => {
                 leases.lock().extend(answered);
                 log::debug!(

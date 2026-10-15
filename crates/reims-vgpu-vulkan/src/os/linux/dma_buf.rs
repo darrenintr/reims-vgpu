@@ -373,6 +373,17 @@ fn held(
     runs: &[Run<Arc<OwnedFd>>],
     leases: &mut Leases,
 ) -> Result<OwnedFd, Refusal> {
+    held_with(runs, leases, || create(device, runs))
+}
+
+/// [`held`], with the kernel call supplied separately so its concurrent miss can be tested
+/// without a udmabuf device. A racing creator joins the winner and drops its redundant dma-buf
+/// outside the table lock: pinning and unpinning pages must not block unrelated lookups.
+fn held_with(
+    runs: &[Run<Arc<OwnedFd>>],
+    leases: &mut Leases,
+    create: impl FnOnce() -> Result<OwnedFd, Refusal>,
+) -> Result<OwnedFd, Refusal> {
     let pages = pages_of(runs);
     let mut made = MADE.lock();
     if let Some(entry) = made.get_mut(&pages) {
@@ -383,16 +394,24 @@ fn held(
         leases.0.push(pages);
         return Ok(fd);
     }
-    // udmabuf pins the pages inside the call, which other threads' chunks wait behind; a chunk of
-    // other pages made meanwhile is a dma-buf of its own either way.
+    // udmabuf pins pages inside the call. Let unrelated lookups continue while it runs, then
+    // recheck for another creator of these pages before publishing the result.
     drop(made);
-    let fd = create(device, runs)?;
+    let fd = create()?;
     let kept = fd.as_fd().try_clone_to_owned().map_err(Refusal::Kernel)?;
     let mut made = MADE.lock();
     match made.get_mut(&pages) {
-        // Another thread made one of the same pages meanwhile: both stay, this one held by its
-        // own source alone.
-        Some(_) => return Ok(fd),
+        // Another thread made one of the same pages meanwhile: share its dma-buf too, so the
+        // runtime sees one identity and imports it once even during concurrent creation.
+        Some(entry) => {
+            let shared = (entry.fd.as_fd())
+                .try_clone_to_owned()
+                .map_err(Refusal::Kernel)?;
+            entry.holders += 1;
+            leases.0.push(pages);
+            drop(made);
+            return Ok(shared);
+        }
         None => {
             made.insert(
                 pages.clone(),
@@ -431,10 +450,94 @@ fn create(device: &OwnedFd, runs: &[Run<Arc<OwnedFd>>]) -> Result<OwnedFd, Refus
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::sync::Barrier;
+
     use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
     use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm as _};
 
     use super::*;
+
+    const PAGE: u64 = 0x1000;
+
+    fn identity(fd: &OwnedFd) -> (u64, u64) {
+        let file = std::fs::File::from(fd.as_fd().try_clone_to_owned().unwrap());
+        let metadata = file.metadata().unwrap();
+        (metadata.dev(), metadata.ino())
+    }
+
+    /// Both creators miss before either can publish. Even then their sources must receive one
+    /// identity, retained until the last lease goes. Memfds stand in for the kernel's dma-bufs;
+    /// this exercises the cache and lifetime rules without skipping on hosts with no udmabuf.
+    #[test]
+    fn concurrent_creators_share_the_winning_dma_buf() {
+        let runs = [Run {
+            file: vm::memfd(PAGE),
+            offset: 0,
+            length: PAGE,
+        }];
+        let pages = pages_of(&runs);
+        let barrier = Barrier::new(2);
+        let ((a, a_lease), (b, b_lease)) = std::thread::scope(|scope| {
+            let make = || {
+                let mut lease = Leases::default();
+                let fd = held_with(&runs, &mut lease, || {
+                    let fd = vm::memfd(PAGE).as_fd().try_clone_to_owned().unwrap();
+                    barrier.wait();
+                    Ok(fd)
+                })
+                .unwrap();
+                (fd, lease)
+            };
+            let (a, b) = (scope.spawn(make), scope.spawn(make));
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert_eq!(identity(&a), identity(&b));
+        assert_eq!(MADE.lock().get(&pages).unwrap().holders, 2);
+        drop(a);
+        drop(a_lease);
+        assert_eq!(MADE.lock().get(&pages).unwrap().holders, 1);
+        let mut c_lease = Leases::default();
+        let c = held_with(&runs, &mut c_lease, || {
+            panic!("a live lease must be reused")
+        })
+        .unwrap();
+        assert_eq!(identity(&b), identity(&c));
+        drop(b);
+        drop(b_lease);
+        assert_eq!(MADE.lock().get(&pages).unwrap().holders, 1);
+        drop(c);
+        drop(c_lease);
+        assert!(!MADE.lock().contains_key(&pages));
+    }
+
+    #[test]
+    fn refused_creation_holds_no_lease_and_can_be_retried() {
+        let runs = [Run {
+            file: vm::memfd(PAGE),
+            offset: 0,
+            length: PAGE,
+        }];
+        let pages = pages_of(&runs);
+        let mut lease = Leases::default();
+        let refused = held_with(&runs, &mut lease, || {
+            Err(Refusal::Kernel(io::Error::from_raw_os_error(libc::ENOMEM)))
+        });
+        assert!(matches!(refused, Err(Refusal::Kernel(_))));
+        assert!(lease.0.is_empty());
+        assert!(!MADE.lock().contains_key(&pages));
+        let fd = held_with(&runs, &mut lease, || {
+            vm::memfd(PAGE)
+                .as_fd()
+                .try_clone_to_owned()
+                .map_err(Refusal::Kernel)
+        })
+        .unwrap();
+        assert_eq!(MADE.lock().get(&pages).unwrap().holders, 1);
+        drop(fd);
+        drop(lease);
+        assert!(!MADE.lock().contains_key(&pages));
+    }
 
     /// Whether this host has a udmabuf device this process opens: where it has none, the tests
     /// say so and check nothing.
