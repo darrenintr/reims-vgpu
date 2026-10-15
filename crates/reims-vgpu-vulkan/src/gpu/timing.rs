@@ -3,6 +3,9 @@
 //! line changes what the guest or the host sees, and with the target's debug lines off nothing
 //! here reads a clock or adds a handler.
 //!
+//! [`resources`] also counts memory-import and CPU-upload calls, including bursts of short
+//! calls, under this same target. It reports requested ranges and calling-thread wall time.
+//!
 //! Where the runtime (metal2vulkan-runtime) pays for a pipeline state, as its sources say:
 //! - **At the creation**, synchronously on the calling thread: each stage's translation into
 //!   SPIR-V, unless the runtime's memo, the creation's binary archives or its shader cache on disk
@@ -40,6 +43,8 @@
 //! wrote, 27 ms and 3 ms; a second state of the same descriptor in the same process, 8 ms and
 //! 0.3 ms. Every later draw took 0.1 ms, and the commits under 1 ms.
 
+pub(crate) mod resources;
+
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -67,6 +72,9 @@ static COMMITS: AtomicU64 = AtomicU64::new(0);
 
 /// The command buffers completed since the summary's first, of each queue.
 static SUMMARY: Mutex<Summary> = Mutex::new(Summary::new());
+
+/// The timing target, also used by the resource summaries in the child module.
+const TARGET: &str = module_path!();
 
 /// Whether this module's debug lines are written.
 pub fn on() -> bool {

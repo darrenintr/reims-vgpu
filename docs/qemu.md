@@ -808,6 +808,58 @@ Laptop GPU host on 2026-10-11 (macOS 26.6.1, one library build):
   and `interplay_lifetime_held_pipeline_function_retyped`). Seen once, in
   the RTX 3050 beta tester's log of a boot before the key was set.
 
+### Slow icon generation after login
+
+Icons that appear gradually while the desktop is slow need timings from that
+boot; their appearance alone does not identify a texture-upload bottleneck.
+Keep the error-mode key above set, and enable the host's existing timing target
+alongside display statistics before starting the VM (replace `mac` with its name):
+
+```sh
+reims-ctl set mac --env REIMS_VGPU_STATS=1
+reims-ctl set mac --env REIMS_VGPU_LOG=warn,reims_vgpu_vulkan::gpu::timing=debug
+```
+
+The QEMU log then records pipeline creation, slow encoder calls (uploads and
+mipmap generation included), and command-buffer submission/completion times.
+`resource summary` lines add the number of calls, requested bytes and total/max
+calling-thread wall time for import views, no-copy buffer creation, DMA-BUF
+sources and CPU texture uploads. They include calls shorter than the 5 ms
+slow-call threshold, so a burst of small imports is visible too. A summary is
+emitted by the next completed resource call after a second; an idle final
+partial interval is not flushed. These operations can nest and run on several
+threads: their totals overlap, are not CPU time, and must not be added together
+or treated as measured memory traffic. With the timing target off, these
+counters and clocks do not run.
+
+On Linux, concurrent DMA-BUF requests for identical file pages share the winning
+cache entry even if both requests initially miss. The redundant descriptor is
+closed before it reaches the runtime, preventing that race from leaving another
+live Vulkan import on RADV's submission list. The default-on
+`REIMS_VGPU_DMA_BUF_RACE_FIX` property controls this fix. Set it to `0`, `false`,
+`no` or `off` (case and surrounding spaces ignored) to keep separate DMA-BUFs
+when concurrent requests both miss; ordinary cache hits still share. The value
+is read at the first DMA-BUF request, so stop and start the VM process after
+changing it. With `mac` replaced by the VM's name:
+
+```sh
+reims-ctl set mac --env REIMS_VGPU_DMA_BUF_RACE_FIX=0  # old concurrent-miss path
+reims-ctl set mac --env REIMS_VGPU_DMA_BUF_RACE_FIX=1  # fixed path (the default)
+```
+
+Use one setting per boot. This property changes only DMA-BUF concurrent-miss
+sharing; resource timing remains controlled by `REIMS_VGPU_LOG`. It neither
+changes the RDNA3 policy nor replaces the guest's `METAL_ERROR_MODE=5` setting.
+The cache/lifetime regression exercises both property values without a GPU or
+`/dev/udmabuf`; it does not measure icon-generation latency.
+
+Compare the parent and changed release builds using copies of the same guest
+disk and the same icon-cache state. Preserve the cold-cache disk for both runs
+rather than letting the first run populate the second's icons. Record the time
+until icons finish, the longest presentation gap and the timings above. This
+environment has no GPU, KVM device or guest disk, so guest improvement is not yet
+measured.
+
 ### x86-64 macOS guests: thumbnail extensions
 
 On an x86-64 macOS 26 guest, Quick Look's image and video thumbnail

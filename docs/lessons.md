@@ -1,5 +1,13 @@
 # Lessons
 
+- A cache miss created outside its lock must join a winner found when it takes
+  the lock again. The DMA-BUF cache returned the loser's new descriptor on that
+  second lookup, leaving a duplicate Vulkan import alive for its source's life.
+  Check both the returned identity and the last holder's removal in a test that
+  forces two misses before either creator can publish; a sequential cache-hit
+  test cannot reach the race. Release the redundant descriptor outside the cache
+  lock, since unpinning its pages can block unrelated lookups.
+
 Each lesson is a trap that decides what the guest or the host sees, or what a check reports,
 found by the suite, a review or a VM boot: what went wrong, why, and how to recognise the next
 one. A new trap found the same way goes here.
