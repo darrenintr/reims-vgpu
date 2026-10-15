@@ -19,6 +19,19 @@
 //!
 //! A VM started from a script `reims-ctl command` printed is not pinned.
 //!
+//! **`confine = "llc"`** (`[cpu] confine` in `vm.toml`, off by default) keeps the whole QEMU
+//! process within the last-level caches its vCPUs use. With `pin = "auto"` the vCPUs are first
+//! chosen from one L3 domain alone (an AMD CCX), the last that holds them and still leaves one of
+//! its cores free, as `auto` leaves one of the host's; then every other thread of QEMU (the main
+//! loop, the library's FIFO, display, window and runtime threads, the driver's) is given the
+//! CPUs of the domains the vCPUs use. The library starts its threads with the main thread's
+//! affinity, so threads made later stay there too. Measured on the Ryzen 5 3600 with a 12-job
+//! build on the host (docs/qemu.md, 2026-10-13): QEMU alone on one CCX held 74 to 78 presents a
+//! second, where pinned vCPUs with QEMU's other threads anywhere held 27 to 39; the build's
+//! sharing of cores and caches cost the guest, not CPU time. It confines QEMU, not the rest of
+//! the host: work the host runs on the same domain still shares it. Where the vCPUs span every
+//! domain, nothing changes, and the log says so.
+//!
 //! **`auto` is the default on Linux** (`vm::DEFAULT_PIN`). Measured on a Ryzen 5 3600 with an
 //! RX 7600 (RADV, Linux 7.3) and an 8-vCPU macOS 26 guest at 100 Hz, while a 12-job release
 //! build ran on the host, the vCPUs alternately unpinned and pinned in one boot, two rounds each
@@ -82,6 +95,98 @@ pub fn parse_list(s: &str) -> Result<Vec<u32>> {
         bail!("no CPUs");
     }
     Ok(out)
+}
+
+/// The `confine` setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Confine {
+    Off,
+    /// QEMU's threads within the L3 domains of its vCPUs (module doc).
+    Llc,
+}
+
+impl Confine {
+    pub fn parse(s: &str) -> Result<Confine> {
+        match s.trim() {
+            "" | "off" => Ok(Confine::Off),
+            "llc" => Ok(Confine::Llc),
+            other => bail!("confine: off or llc, not {other:?}"),
+        }
+    }
+}
+
+/// The host's last-level cache domains: the CPUs sharing each L3, from sysfs, in the order of
+/// their first CPU; empty where the host shows none.
+pub fn llc_domains() -> Vec<Vec<u32>> {
+    llc_domains_in(Path::new("/sys/devices/system/cpu"))
+}
+
+fn llc_domains_in(root: &Path) -> Vec<Vec<u32>> {
+    let mut domains: Vec<Vec<u32>> = Vec::new();
+    let cpus = std::fs::read_dir(root).into_iter().flatten().flatten();
+    for e in cpus {
+        let Some(name) = e.file_name().into_string().ok() else {
+            continue;
+        };
+        if name
+            .strip_prefix("cpu")
+            .and_then(|n| n.parse::<u32>().ok())
+            .is_none()
+        {
+            continue;
+        }
+        let caches = std::fs::read_dir(e.path().join("cache"))
+            .into_iter()
+            .flatten()
+            .flatten();
+        for c in caches {
+            let level = std::fs::read_to_string(c.path().join("level")).ok();
+            if level.as_deref().map(str::trim) != Some("3") {
+                continue;
+            }
+            let Some(list) = std::fs::read_to_string(c.path().join("shared_cpu_list")).ok() else {
+                continue;
+            };
+            let Ok(mut shared) = parse_list(&list) else {
+                continue;
+            };
+            shared.sort_unstable();
+            if !domains.contains(&shared) {
+                domains.push(shared);
+            }
+        }
+    }
+    domains.sort_by_key(|d| d[0]);
+    domains
+}
+
+/// The vCPUs' CPUs as `auto` chooses them within one of `domains`: the last domain that holds
+/// `vcpus` and still leaves one of its cores free. `None` where none does.
+fn auto_within_llc(
+    topology: &[HostCpu],
+    domains: &[Vec<u32>],
+    vcpus: u32,
+    threads_per_core: u32,
+) -> Option<Vec<u32>> {
+    domains.iter().rev().find_map(|domain| {
+        let mine: Vec<HostCpu> = (topology.iter())
+            .filter(|h| domain.contains(&h.cpu))
+            .copied()
+            .collect();
+        choose(&Pin::Auto, &mine, vcpus, threads_per_core).ok()
+    })
+}
+
+/// The CPUs of every domain that holds one of `chosen`, in order; empty where no domain does.
+fn confined(chosen: &[u32], domains: &[Vec<u32>]) -> Vec<u32> {
+    let mut out: Vec<u32> = (domains.iter())
+        .filter(|d| chosen.iter().any(|c| d.contains(c)))
+        .flatten()
+        .copied()
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// One online host CPU, and the core it is a thread of.
@@ -214,9 +319,10 @@ pub fn choose(
     }
 }
 
-/// Pins the running VM's vCPU threads as `cpu` says, over its QMP socket: what was done, for
-/// QEMU's log.
-pub fn apply(socket: &Path, cpu: &crate::vm::Cpu, vcpus: u32) -> Result<String> {
+/// Pins the running VM's vCPU threads as `cpu` says, over its QMP socket, and with `confine =
+/// "llc"` QEMU's other threads (those of process `pid`) to the vCPUs' L3 domains: what was done,
+/// for QEMU's log.
+pub fn apply(socket: &Path, cpu: &crate::vm::Cpu, vcpus: u32, pid: Option<i32>) -> Result<String> {
     let pin = Pin::parse(&cpu.pin)?;
     if pin == Pin::Off {
         return Ok("vCPUs not pinned".into());
@@ -224,7 +330,22 @@ pub fn apply(socket: &Path, cpu: &crate::vm::Cpu, vcpus: u32) -> Result<String> 
     if !cfg!(target_os = "linux") {
         bail!("vCPU pinning is for Linux hosts");
     }
-    let chosen = choose(&pin, &host_topology(), vcpus, cpu.threads_per_core)?;
+    let confine = Confine::parse(&cpu.confine)?;
+    let topology = host_topology();
+    let domains = match confine {
+        Confine::Llc => llc_domains(),
+        Confine::Off => Vec::new(),
+    };
+    let within = match (&pin, confine) {
+        (Pin::Auto, Confine::Llc) => {
+            auto_within_llc(&topology, &domains, vcpus, cpu.threads_per_core)
+        }
+        _ => None,
+    };
+    let chosen = match within {
+        Some(chosen) => chosen,
+        None => choose(&pin, &topology, vcpus, cpu.threads_per_core)?,
+    };
     let threads = qmp::run(socket, "query-cpus-fast", None)?;
     let threads = threads
         .as_array()
@@ -233,27 +354,72 @@ pub fn apply(socket: &Path, cpu: &crate::vm::Cpu, vcpus: u32) -> Result<String> 
         .filter_map(|c| Some((c.get("cpu-index")?.as_u64()?, c.get("thread-id")?.as_i64()?)))
         .collect::<Vec<_>>();
     let mut done = Vec::new();
+    let mut vcpu_tids = Vec::new();
     for (index, tid) in threads {
         let Some(&host) = chosen.get(index as usize) else {
             continue;
         };
-        set_affinity(tid as i32, host)
+        set_affinity(tid as i32, &[host])
             .with_context(|| format!("pin vCPU {index} (thread {tid}) to CPU {host}"))?;
+        vcpu_tids.push(tid);
         done.push(format!("{index}->{host}"));
     }
-    Ok(format!("vCPUs pinned to host CPUs: {}", done.join(" ")))
+    let mut line = format!("vCPUs pinned to host CPUs: {}", done.join(" "));
+    if confine == Confine::Llc {
+        line.push_str(&confine_others(
+            pid, &vcpu_tids, &chosen, &domains, &topology,
+        ));
+    }
+    Ok(line)
+}
+
+/// Gives every thread of QEMU's process `pid` but its vCPUs the CPUs of the vCPUs' L3 domains
+/// (module doc): what was done, for the log line.
+fn confine_others(
+    pid: Option<i32>,
+    vcpu_tids: &[i64],
+    chosen: &[u32],
+    domains: &[Vec<u32>],
+    topology: &[HostCpu],
+) -> String {
+    let Some(pid) = pid else {
+        return "; QEMU's other threads not confined: no pid".into();
+    };
+    let set = confined(chosen, domains);
+    if set.is_empty() {
+        return "; QEMU's other threads not confined: the host shows no L3 domains".into();
+    }
+    if set.len() >= topology.len() {
+        return "; QEMU's other threads not confined: the vCPUs use every L3 domain".into();
+    }
+    let tasks = std::fs::read_dir(format!("/proc/{pid}/task"));
+    let tids = tasks.into_iter().flatten().flatten().filter_map(|e| {
+        let tid: i64 = e.file_name().into_string().ok()?.parse().ok()?;
+        (!vcpu_tids.contains(&tid)).then_some(tid)
+    });
+    let (mut moved, mut failed) = (0, 0);
+    for tid in tids {
+        match set_affinity(tid as i32, &set) {
+            Ok(()) => moved += 1,
+            Err(_) => failed += 1,
+        }
+    }
+    let list = set.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    format!("; {moved} other threads confined to CPUs {list} ({failed} not)")
 }
 
 #[cfg(target_os = "linux")]
-fn set_affinity(tid: i32, cpu: u32) -> Result<()> {
+fn set_affinity(tid: i32, cpus: &[u32]) -> Result<()> {
     // SAFETY: a zeroed cpu_set_t is the empty set; CPU_SET writes within it for any CPU below
     // CPU_SETSIZE, which the check keeps to; sched_setaffinity only reads it.
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
-        if cpu as usize >= libc::CPU_SETSIZE as usize {
-            bail!("CPU {cpu} is past CPU_SETSIZE");
+        for &cpu in cpus {
+            if cpu as usize >= libc::CPU_SETSIZE as usize {
+                bail!("CPU {cpu} is past CPU_SETSIZE");
+            }
+            libc::CPU_SET(cpu as usize, &mut set);
         }
-        libc::CPU_SET(cpu as usize, &mut set);
         if libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -262,7 +428,7 @@ fn set_affinity(tid: i32, cpu: u32) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn set_affinity(_tid: i32, _cpu: u32) -> Result<()> {
+fn set_affinity(_tid: i32, _cpus: &[u32]) -> Result<()> {
     bail!("vCPU pinning is for Linux hosts")
 }
 
@@ -351,14 +517,8 @@ mod tests {
             choose(&Pin::Auto, &topology, 4, 1).unwrap(),
             vec![2, 3, 4, 5]
         );
-        let no_smt: Vec<HostCpu> = ryzen_3600()
-            .into_iter()
-            .filter(|c| c.cpu < 6)
-            .collect();
-        assert_eq!(
-            choose(&Pin::Auto, &no_smt, 4, 1).unwrap(),
-            vec![2, 3, 4, 5]
-        );
+        let no_smt: Vec<HostCpu> = ryzen_3600().into_iter().filter(|c| c.cpu < 6).collect();
+        assert_eq!(choose(&Pin::Auto, &no_smt, 4, 1).unwrap(), vec![2, 3, 4, 5]);
         assert!(choose(&Pin::Auto, &no_smt, 6, 1).is_err());
     }
 
@@ -367,6 +527,54 @@ mod tests {
         assert!(choose(&Pin::Auto, &ryzen_3600(), 11, 1).is_err());
         assert_eq!(choose(&Pin::Auto, &ryzen_3600(), 10, 2).unwrap().len(), 10);
         assert!(choose(&Pin::Auto, &[], 2, 1).is_err());
+    }
+
+    /// The 3600's two CCXs: cores 0 to 2 and their threads, then cores 3 to 5 and theirs.
+    fn ccxs() -> Vec<Vec<u32>> {
+        vec![vec![0, 1, 2, 6, 7, 8], vec![3, 4, 5, 9, 10, 11]]
+    }
+
+    #[test]
+    fn parses_confine() {
+        assert_eq!(Confine::parse("").unwrap(), Confine::Off);
+        assert_eq!(Confine::parse(" llc ").unwrap(), Confine::Llc);
+        assert!(Confine::parse("ccx").is_err());
+    }
+
+    /// `auto` within an L3 takes the last CCX that holds the vCPUs and leaves one of its cores
+    #[test]
+    fn auto_within_llc_keeps_the_vcpus_in_one_ccx() {
+        let t = ryzen_3600();
+        assert_eq!(auto_within_llc(&t, &ccxs(), 4, 2), Some(vec![4, 10, 5, 11]));
+        assert_eq!(auto_within_llc(&t, &ccxs(), 2, 1), Some(vec![4, 5]));
+        // Six vCPUs would take a whole CCX: none fits.
+        assert_eq!(auto_within_llc(&t, &ccxs(), 6, 2), None);
+        assert_eq!(auto_within_llc(&t, &[], 2, 1), None);
+    }
+
+    #[test]
+    fn confining_takes_every_domain_the_vcpus_touch() {
+        assert_eq!(confined(&[4, 10], &ccxs()), vec![3, 4, 5, 9, 10, 11]);
+        assert_eq!(confined(&[2, 3], &ccxs()).len(), 12);
+        assert!(confined(&[2], &[]).is_empty());
+    }
+
+    #[test]
+    fn reads_sysfs_llc_domains() {
+        let dir = std::env::temp_dir().join(format!("reims-ctl-llc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (cpu, l3) in [(0, "0-1"), (1, "0-1"), (2, "2-3"), (3, "2-3")] {
+            for (index, level, list) in [(0, "1", format!("{cpu}")), (3, "3", l3.to_owned())] {
+                let c = dir.join(format!("cpu{cpu}/cache/index{index}"));
+                std::fs::create_dir_all(&c).unwrap();
+                std::fs::write(c.join("level"), format!("{level}\n")).unwrap();
+                std::fs::write(c.join("shared_cpu_list"), format!("{list}\n")).unwrap();
+            }
+        }
+        std::fs::create_dir_all(dir.join("cpufreq")).unwrap();
+        let got = llc_domains_in(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(got, vec![vec![0, 1], vec![2, 3]]);
     }
 
     #[test]
@@ -398,7 +606,7 @@ mod tests {
             let allowed = (0..libc::CPU_SETSIZE as usize)
                 .find(|c| unsafe { libc::CPU_ISSET(*c, &set) })
                 .unwrap();
-            set_affinity(tid, allowed as u32).unwrap();
+            set_affinity(tid, &[allowed as u32]).unwrap();
             assert_eq!(unsafe { libc::sched_getaffinity(tid, size, &mut set) }, 0);
             assert_eq!(unsafe { libc::CPU_COUNT(&set) }, 1);
             assert!(unsafe { libc::CPU_ISSET(allowed, &set) });

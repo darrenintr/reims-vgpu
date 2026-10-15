@@ -97,6 +97,9 @@ pub struct Cpu {
     /// host CPUs such as `2-5,8-11`, one per vCPU (crate::pin). [`DEFAULT_PIN`] where `vm.toml`
     /// names none.
     pub pin: String,
+    /// With pinned vCPUs on a Linux host: `off`, or `llc` to keep QEMU's other threads within
+    /// the L3 domains of its vCPUs, and `auto`'s vCPUs within one where they fit (crate::pin).
+    pub confine: String,
 }
 
 /// The pin of a VM whose `vm.toml` names none: `auto` on Linux, where unpinned vCPUs freeze the
@@ -112,6 +115,7 @@ impl Default for Cpu {
         Cpu {
             threads_per_core: 1,
             pin: DEFAULT_PIN.into(),
+            confine: "off".into(),
         }
     }
 }
@@ -143,6 +147,9 @@ impl Cpu {
             );
         }
         crate::pin::Pin::parse(&self.pin)?;
+        if crate::pin::Confine::parse(&self.confine)? != crate::pin::Confine::Off && !self.pins() {
+            bail!("confine needs pinned vCPUs (pin auto or a CPU list)");
+        }
         Ok(())
     }
 }
@@ -747,6 +754,7 @@ mod tests {
             cpu: Cpu {
                 threads_per_core: 2,
                 pin: "auto".into(),
+                confine: "off".into(),
             },
             disk: "disk.qcow2".into(),
             disk_format: ImageFormat::Qcow2,
