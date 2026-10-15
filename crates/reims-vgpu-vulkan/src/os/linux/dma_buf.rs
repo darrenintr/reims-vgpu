@@ -67,7 +67,9 @@
 //! with an RX 7600's 15 GiB of GTT every submission then failed for memory (`Not enough memory
 //! for command submission`, 2026-10-15) and the device was lost. A stretch whose offset in its
 //! window misses the request's offset alignment, or a request that takes no offsets (a
-//! texture's), is cut and made as before. The setting is read once, at the first request.
+//! texture's), is cut and made as before. Windows answer only a request one window holds whole,
+//! as one chunk ([`one_window`]): one that windows and pieces would answer together goes as pieces
+//! alone, as without windows. The setting is read once, at the first request.
 //!
 //! **Concurrent misses.** `REIMS_VGPU_DMA_BUF_RACE_FIX` defaults to on. With `0`, `false`, `no`
 //! or `off` (case and surrounding spaces ignored), a creator that finds another creator's
@@ -514,7 +516,16 @@ fn windowed<F: Clone>(
     Some(planned)
 }
 
+/// Whether `plan` is one window's chunk: the only plan windows answer (module docs). A request
+/// that windows and pieces answer together is several chunks, which the runtime binds to a sparse
+/// buffer; on RADV (Mesa 26.2.4, an RX 7600) a macOS 26 guest's display froze within a minute of
+/// login whenever windows planned such requests (2026-10-15), and with pieces alone it ran.
+fn one_window<F>(plan: &[Planned<F>]) -> bool {
+    matches!(plan, [Planned::Window { .. }])
+}
+
 /// [`windowed`] of `runs`, padded as [`padded`] pads them where it plans several chunks.
+#[cfg(test)]
 fn windowed_padded<F: Clone>(
     runs: &mut Vec<Run<F>>,
     granule: u64,
@@ -623,16 +634,27 @@ pub(crate) fn of_pages(
         offset: 0,
         length: pad,
     };
-    let plan = if windows() && offset_alignment != 0 {
-        let span = limits.bytes.min(WINDOW_SPAN);
-        let window_of = |file: &Arc<OwnedFd>, offset| {
-            let (start, length) = window_in(offset, file_size(file)?, span, page)?;
-            within_budget(file, start, length, window_budget()).then_some((start, length))
-        };
-        windowed_padded(&mut runs, granule, offset_alignment, limits, window_of, pad)
-    } else {
-        padded(&mut runs, granule, limits, pad)
-            .map(|cut| cut.into_iter().map(Planned::Pieces).collect())
+    let span = limits.bytes.min(WINDOW_SPAN);
+    let window_of = |file: &Arc<OwnedFd>, offset| {
+        let (start, length) = window_in(offset, file_size(file)?, span, page)?;
+        within_budget(file, start, length, window_budget()).then_some((start, length))
+    };
+    let whole = (windows() && offset_alignment != 0)
+        .then(|| {
+            windowed(
+                &runs,
+                length.next_multiple_of(granule),
+                offset_alignment,
+                limits,
+                window_of,
+            )
+        })
+        .flatten()
+        .filter(|plan| one_window(plan));
+    let plan = match whole {
+        Some(plan) => Some(plan),
+        None => padded(&mut runs, granule, limits, pad)
+            .map(|cut| cut.into_iter().map(Planned::Pieces).collect()),
     };
     let plan = plan.ok_or_else(|| refused(&runs))?;
     let mut answered = Leases::default();
@@ -893,6 +915,24 @@ mod tests {
     /// Windows of 16 pages in every file but file 9.
     fn sixteen(file: &u32, offset: u64) -> Option<(u64, u64)> {
         (*file != 9).then(|| window_in(offset, 1 << 40, 16 * PAGE, PAGE))?
+    }
+
+    /// Planned with the whole request as its granule, a request one window holds is that window's
+    /// one chunk; one that crosses a window, or has a run windows do not take, is no one window.
+    #[test]
+    fn only_a_request_one_window_holds_is_answered_by_it() {
+        let whole = |of: &[(u32, u64, u64)]| {
+            let runs = runs(of);
+            let total: u64 = runs.iter().map(|r| r.length).sum();
+            windowed(&runs, total, PAGE, LIMITS, sixteen).unwrap()
+        };
+        assert!(one_window(&whole(&[(1, 2, 5)])));
+        // Across the window boundary at page 16.
+        assert!(!one_window(&whole(&[(1, 12, 8)])));
+        // Two runs of one window: windows and pieces.
+        assert!(!one_window(&whole(&[(1, 0, 2), (1, 4, 2)])));
+        // File 9 takes no windows.
+        assert!(!one_window(&whole(&[(9, 0, 4)])));
     }
 
     fn lengths(plan: &[Planned<u32>]) -> Vec<u64> {
