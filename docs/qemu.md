@@ -547,6 +547,16 @@ reims-ctl set mac --gpu "AMD Radeon RX 7600"   # a name or number from reims-ctl
   the running VM took the 90th percentile of the gaps between frames from 87
   ms to 41 ms, and the 95th from 130 ms to 51 ms, with the GPU 17% busy at the
   median.
+- **`--confine llc`** (off by default; `[cpu] confine` in `vm.toml`) keeps
+  the whole QEMU process within the L3 caches its vCPUs use: with `--pin
+  auto` the vCPUs go to one CCX where they fit and leave one of its cores free
+  (4 vCPUs as 2 cores of 2 threads take CPUs 4, 10, 5 and 11 on the 3600),
+  and every other thread of QEMU, the library's included, gets that CCX's
+  CPUs. It answers the measurement below, where QEMU alone on one CCX held 74
+  to 78 presents a second under a host build and the vCPUs pinned with the
+  rest anywhere held 27 to 39; the setting itself is not measured yet. 8
+  vCPUs on the 3600 use both CCXs, so nothing is confined there, and the log
+  says so. It does not move the host's other work off the CCX.
 - **`--refresh 120`** offers the guest 120 Hz modes (`REIMS_VGPU_WINDOW_REFRESH`).
   The guest's frames complete when the GPU does, not at the host screen's
   vsync (`crates/reims-vgpu-vulkan/src/swapchain.rs`). So the guest runs at

@@ -304,6 +304,10 @@ pub struct SetArgs {
     /// 2-5,8-11
     #[arg(long)]
     pub pin: Option<String>,
+    /// Linux, with pinned vCPUs: off (the default), or llc to keep QEMU's other threads in the
+    /// vCPUs' L3 caches (an AMD CCX) and auto's vCPUs in one where they fit
+    #[arg(long)]
+    pub confine: Option<String>,
     #[arg(long)]
     pub displays: Option<u32>,
     /// WIDTHxHEIGHT, or host
@@ -736,6 +740,9 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
     }
     if c.cpu.pins() {
         cpus.push_str(&format!(", pinned {}", c.cpu.pin));
+        if c.cpu.confine.trim() == "llc" {
+            cpus.push_str(", QEMU kept in their L3");
+        }
     }
     add("cpus", cpus);
     add("memory", format_mib(c.memory_mib));
@@ -928,6 +935,9 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
     }
     if let Some(p) = &a.pin {
         c.cpu.pin = p.trim().to_owned();
+    }
+    if let Some(v) = &a.confine {
+        c.cpu.confine = v.trim().to_owned();
     }
     if let Some(n) = a.displays {
         c.display.count = n;
