@@ -835,8 +835,23 @@ counters and clocks do not run.
 On Linux, concurrent DMA-BUF requests for identical file pages share the winning
 cache entry even if both requests initially miss. The redundant descriptor is
 closed before it reaches the runtime, preventing that race from leaving another
-live Vulkan import on RADV's submission list. The cache/lifetime regression runs
-without a GPU or `/dev/udmabuf`; it does not measure icon-generation latency.
+live Vulkan import on RADV's submission list. The default-on
+`REIMS_VGPU_DMA_BUF_RACE_FIX` property controls this fix. Set it to `0`, `false`,
+`no` or `off` (case and surrounding spaces ignored) to keep separate DMA-BUFs
+when concurrent requests both miss; ordinary cache hits still share. The value
+is read at the first DMA-BUF request, so stop and start the VM process after
+changing it. With `mac` replaced by the VM's name:
+
+```sh
+reims-ctl set mac --env REIMS_VGPU_DMA_BUF_RACE_FIX=0  # old concurrent-miss path
+reims-ctl set mac --env REIMS_VGPU_DMA_BUF_RACE_FIX=1  # fixed path (the default)
+```
+
+Use one setting per boot. This property changes only DMA-BUF concurrent-miss
+sharing; resource timing remains controlled by `REIMS_VGPU_LOG`. It neither
+changes the RDNA3 policy nor replaces the guest's `METAL_ERROR_MODE=5` setting.
+The cache/lifetime regression exercises both property values without a GPU or
+`/dev/udmabuf`; it does not measure icon-generation latency.
 
 Compare the parent and changed release builds using copies of the same guest
 disk and the same icon-cache state. Preserve the cold-cache disk for both runs

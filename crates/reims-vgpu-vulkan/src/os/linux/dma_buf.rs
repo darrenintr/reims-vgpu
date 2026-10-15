@@ -48,6 +48,12 @@
 //! the runtime drops the source, which it does once every import of the source's went; the last
 //! holder to go lets the dma-buf go. The pages are the same either way: a file page a dma-buf
 //! pins stays what both show, as no file of the library's has pages dropped while it is mapped.
+//!
+//! **Concurrent misses.** `REIMS_VGPU_DMA_BUF_RACE_FIX` defaults to on. With `0`, `false`, `no`
+//! or `off` (case and surrounding spaces ignored), a creator that finds another creator's
+//! winning entry after its kernel call keeps its own dma-buf, as before the race fix. Ordinary
+//! cache hits still share. The setting is read once, at the first request, and requires a VM
+//! process restart to change.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -70,6 +76,22 @@ const CREATE_LIST: u64 = (1 << 30) | (8 << 16) | ((b'u' as u64) << 8) | 0x43;
 /// udmabuf's defaults, taken where the system shows no parameters.
 const DEFAULT_LIST_LIMIT: u64 = 1024;
 const DEFAULT_SIZE_LIMIT_MB: u64 = 64;
+
+/// Whether concurrent creators join the cache's winner, read once per process.
+fn race_fix() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        race_fix_value(std::env::var("REIMS_VGPU_DMA_BUF_RACE_FIX").ok().as_deref())
+    })
+}
+
+/// The default-on switch, using the same false values as `REIMS_VGPU_RDNA3`.
+fn race_fix_value(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0" | "false" | "no" | "off")
+    )
+}
 
 /// Why no dma-bufs were made of a range.
 #[derive(Debug)]
@@ -373,15 +395,17 @@ fn held(
     runs: &[Run<Arc<OwnedFd>>],
     leases: &mut Leases,
 ) -> Result<OwnedFd, Refusal> {
-    held_with(runs, leases, || create(device, runs))
+    held_with(runs, leases, race_fix(), || create(device, runs))
 }
 
 /// [`held`], with the kernel call supplied separately so its concurrent miss can be tested
-/// without a udmabuf device. A racing creator joins the winner and drops its redundant dma-buf
-/// outside the table lock: pinning and unpinning pages must not block unrelated lookups.
+/// without a udmabuf device. With `join_races`, a racing creator joins the winner and drops its
+/// redundant dma-buf outside the table lock: pinning and unpinning pages must not block
+/// unrelated lookups.
 fn held_with(
     runs: &[Run<Arc<OwnedFd>>],
     leases: &mut Leases,
+    join_races: bool,
     create: impl FnOnce() -> Result<OwnedFd, Refusal>,
 ) -> Result<OwnedFd, Refusal> {
     let pages = pages_of(runs);
@@ -403,7 +427,7 @@ fn held_with(
     match made.get_mut(&pages) {
         // Another thread made one of the same pages meanwhile: share its dma-buf too, so the
         // runtime sees one identity and imports it once even during concurrent creation.
-        Some(entry) => {
+        Some(entry) if join_races => {
             let shared = (entry.fd.as_fd())
                 .try_clone_to_owned()
                 .map_err(Refusal::Kernel)?;
@@ -412,6 +436,8 @@ fn held_with(
             drop(made);
             return Ok(shared);
         }
+        // Explicit comparison mode: retain the old behavior for concurrent cache misses.
+        Some(_) => return Ok(fd),
         None => {
             made.insert(
                 pages.clone(),
@@ -466,49 +492,75 @@ mod tests {
         (metadata.dev(), metadata.ino())
     }
 
-    /// Both creators miss before either can publish. Even then their sources must receive one
-    /// identity, retained until the last lease goes. Memfds stand in for the kernel's dma-bufs;
-    /// this exercises the cache and lifetime rules without skipping on hosts with no udmabuf.
     #[test]
-    fn concurrent_creators_share_the_winning_dma_buf() {
-        let runs = [Run {
-            file: vm::memfd(PAGE),
-            offset: 0,
-            length: PAGE,
-        }];
-        let pages = pages_of(&runs);
-        let barrier = Barrier::new(2);
-        let ((a, a_lease), (b, b_lease)) = std::thread::scope(|scope| {
-            let make = || {
-                let mut lease = Leases::default();
-                let fd = held_with(&runs, &mut lease, || {
-                    let fd = vm::memfd(PAGE).as_fd().try_clone_to_owned().unwrap();
-                    barrier.wait();
-                    Ok(fd)
-                })
-                .unwrap();
-                (fd, lease)
+    fn race_fix_is_default_on_and_accepts_the_documented_false_values() {
+        for on in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("true"),
+            Some("on"),
+            Some("auto"),
+        ] {
+            assert!(race_fix_value(on), "{on:?}");
+        }
+        for off in ["0", "false", "no", "off", " OFF ", "False", " No "] {
+            assert!(!race_fix_value(Some(off)), "{off:?}");
+        }
+    }
+
+    /// Both creators miss before either can publish. The switch chooses one identity or the
+    /// old separate identities, while ordinary cache hits and lease lifetimes stay shared.
+    /// Memfds stand in for the kernel's dma-bufs, without requiring a udmabuf device.
+    #[test]
+    fn concurrent_creators_obey_the_race_fix_switch() {
+        for join_races in [false, true] {
+            let runs = [Run {
+                file: vm::memfd(PAGE),
+                offset: 0,
+                length: PAGE,
+            }];
+            let pages = pages_of(&runs);
+            let barrier = Barrier::new(2);
+            let ((a, a_lease), (b, b_lease)) = std::thread::scope(|scope| {
+                let make = || {
+                    let mut lease = Leases::default();
+                    let fd = held_with(&runs, &mut lease, join_races, || {
+                        let fd = vm::memfd(PAGE).as_fd().try_clone_to_owned().unwrap();
+                        barrier.wait();
+                        Ok(fd)
+                    })
+                    .unwrap();
+                    (fd, lease)
+                };
+                let (a, b) = (scope.spawn(make), scope.spawn(make));
+                (a.join().unwrap(), b.join().unwrap())
+            });
+            assert_eq!(identity(&a) == identity(&b), join_races);
+            let holders = if join_races { 2 } else { 1 };
+            assert_eq!(MADE.lock().get(&pages).unwrap().holders, holders);
+            let winning_identity = identity(&MADE.lock().get(&pages).unwrap().fd);
+            let mut c_lease = Leases::default();
+            let c = held_with(&runs, &mut c_lease, join_races, || {
+                panic!("a live lease must be reused even with the race fix disabled")
+            })
+            .unwrap();
+            assert_eq!(winning_identity, identity(&c));
+            let remaining = if join_races || !b_lease.0.is_empty() {
+                2
+            } else {
+                1
             };
-            let (a, b) = (scope.spawn(make), scope.spawn(make));
-            (a.join().unwrap(), b.join().unwrap())
-        });
-        assert_eq!(identity(&a), identity(&b));
-        assert_eq!(MADE.lock().get(&pages).unwrap().holders, 2);
-        drop(a);
-        drop(a_lease);
-        assert_eq!(MADE.lock().get(&pages).unwrap().holders, 1);
-        let mut c_lease = Leases::default();
-        let c = held_with(&runs, &mut c_lease, || {
-            panic!("a live lease must be reused")
-        })
-        .unwrap();
-        assert_eq!(identity(&b), identity(&c));
-        drop(b);
-        drop(b_lease);
-        assert_eq!(MADE.lock().get(&pages).unwrap().holders, 1);
-        drop(c);
-        drop(c_lease);
-        assert!(!MADE.lock().contains_key(&pages));
+            drop(a);
+            drop(a_lease);
+            assert_eq!(MADE.lock().get(&pages).unwrap().holders, remaining);
+            drop(b);
+            drop(b_lease);
+            assert_eq!(MADE.lock().get(&pages).unwrap().holders, 1);
+            drop(c);
+            drop(c_lease);
+            assert!(!MADE.lock().contains_key(&pages));
+        }
     }
 
     #[test]
@@ -520,13 +572,13 @@ mod tests {
         }];
         let pages = pages_of(&runs);
         let mut lease = Leases::default();
-        let refused = held_with(&runs, &mut lease, || {
+        let refused = held_with(&runs, &mut lease, true, || {
             Err(Refusal::Kernel(io::Error::from_raw_os_error(libc::ENOMEM)))
         });
         assert!(matches!(refused, Err(Refusal::Kernel(_))));
         assert!(lease.0.is_empty());
         assert!(!MADE.lock().contains_key(&pages));
-        let fd = held_with(&runs, &mut lease, || {
+        let fd = held_with(&runs, &mut lease, true, || {
             vm::memfd(PAGE)
                 .as_fd()
                 .try_clone_to_owned()
