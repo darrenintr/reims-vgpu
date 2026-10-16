@@ -470,6 +470,7 @@ pub fn main(cli: Cli) -> Result<i32> {
         } => return crate::vz::install_main(&ipsw, &dir, disk_mib, cpus, memory_mib),
         Cmd::VzLatest => return crate::vz::latest_main(),
         Cmd::RecordInstall { repo, qemu, commit } => {
+            crate::reims_util::install(&repo)?;
             install::Install {
                 repo,
                 commit,
@@ -1054,6 +1055,18 @@ fn doctor(host: Host) -> Result<i32> {
         }
         println!("{} {what}: {detail}", if ok { "ok  " } else { "FAIL" });
     };
+    match crate::reims_util::binary() {
+        Ok(bin) => line(
+            true,
+            "reims-util",
+            format!(
+                "{} ({})",
+                bin.display(),
+                crate::reims_util::version(&bin).unwrap_or_default()
+            ),
+        ),
+        Err(e) => line(false, "reims-util", format!("{e:#}")),
+    }
     let profile = host.default_profile();
     line(
         profile.is_some(),

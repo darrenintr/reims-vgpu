@@ -13,6 +13,7 @@ mod paths;
 mod pin;
 mod qemu;
 mod qmp;
+mod reims_util;
 mod runtime;
 mod tui;
 mod update;

@@ -336,11 +336,23 @@ fn make_q35(spec: &Spec, _host: Host, dir: &Path, progress: &mut dyn FnMut(&str)
         None => bail!("give the VM a disk: a new one's size, or an existing image"),
     };
 
-    // OpenCore.
-    let opencore_src = spec.opencore.clone().or(s.opencore.clone()).context(
-        "an x86-64 VM boots through an OpenCore image (OpenCore.qcow2, from OSX-KVM or ULTMOS): give its path",
-    )?;
-    progress("copying the OpenCore image");
+    let mut c = base_config(spec, Profile::Q35X86_64, disk, disk_format);
+    if spec.mac.is_none()
+        && let Some(m) = &s.mac
+    {
+        c.network.mac = m.clone();
+    }
+    // Without an image supplied by the user, reims-util makes OpenCore and OVMF together.
+    let supplied_opencore = spec.opencore.clone().or(s.opencore.clone());
+    let generated = supplied_opencore.is_none();
+    let opencore_src = match supplied_opencore {
+        Some(path) => path,
+        None => {
+            let path = dir.join("opencore.qcow2");
+            crate::reims_util::opencore(&path, &c.network.mac, None, progress)?;
+            path
+        }
+    };
     let oc_format = ImageFormat::detect(&opencore_src)?;
     let oc_name = format!(
         "opencore.{}",
@@ -350,35 +362,40 @@ fn make_q35(spec: &Spec, _host: Host, dir: &Path, progress: &mut dyn FnMut(&str)
             "img"
         }
     );
-    copy_file(&opencore_src, &dir.join(&oc_name))?;
+    if !generated {
+        progress("copying the OpenCore image");
+        copy_file(&opencore_src, &dir.join(&oc_name))?;
+    }
 
-    // Firmware.
-    let (code, vars) = match (
-        spec.firmware_code.clone().or(s.firmware_code.clone()),
-        spec.firmware_vars.clone().or(s.firmware_vars.clone()),
-    ) {
-        (Some(c), Some(v)) => (c, v),
-        (c, v) => {
-            let (fc, fv) = find_firmware(&opencore_src).context(
-                "no OVMF firmware found beside the OpenCore image, in QEMU's install or in the \
-                 system's OVMF package: install it (Ubuntu's ovmf, Arch's edk2-ovmf), or give \
-                 --firmware-code and --firmware-vars",
-            )?;
-            (c.unwrap_or(fc), v.unwrap_or(fv))
-        }
-    };
-    progress("copying the firmware");
-    copy_file(&code, &dir.join("OVMF_CODE.fd"))?;
-    copy_file(&vars, &dir.join("OVMF_VARS.fd"))?;
-    // A read-only source's copy is read-only too; the variables are written.
-    let _ = make_writable(&dir.join("OVMF_VARS.fd"));
+    // A generated image already has its firmware beside it. Supplied images retain the
+    // existing firmware overrides and lookup rules.
+    if !generated {
+        let (code, vars) = match (
+            spec.firmware_code.clone().or(s.firmware_code.clone()),
+            spec.firmware_vars.clone().or(s.firmware_vars.clone()),
+        ) {
+            (Some(c), Some(v)) => (c, v),
+            (c, v) => {
+                let (fc, fv) = find_firmware(&opencore_src).context(
+                    "no OVMF firmware found beside the OpenCore image, in QEMU's install or in the \
+                     system's OVMF package: install it (Ubuntu's ovmf, Arch's edk2-ovmf), or give \
+                     --firmware-code and --firmware-vars",
+                )?;
+                (c.unwrap_or(fc), v.unwrap_or(fv))
+            }
+        };
+        progress("copying the firmware");
+        copy_file(&code, &dir.join("OVMF_CODE.fd"))?;
+        copy_file(&vars, &dir.join("OVMF_VARS.fd"))?;
+        // A read-only source's copy is read-only too; the variables are written.
+        let _ = make_writable(&dir.join("OVMF_VARS.fd"));
+    }
 
     let installer = match spec.installer.clone().or(s.installer.clone()) {
         Some(i) if !i.exists() => bail!("the installer {} does not exist", i.display()),
         Some(i) => Some(installer_media(&i, dir, progress)?),
         None => None,
     };
-    let mut c = base_config(spec, Profile::Q35X86_64, disk, disk_format);
     if spec.cpus.is_none()
         && let Some(n) = s.cpus
     {

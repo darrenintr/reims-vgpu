@@ -38,6 +38,11 @@ pub fn data_dir() -> PathBuf {
     }
 }
 
+/// The build cache used while installing reims-util.
+pub fn cache_dir() -> PathBuf {
+    xdg("XDG_CACHE_HOME", ".cache").join("reims-ctl")
+}
+
 pub fn default_vms_dir() -> PathBuf {
     data_dir().join("vms")
 }
