@@ -320,7 +320,12 @@ fn no_copy_release(
     let (run, twin) = view.release(start, run);
     let hold = crate::remap::UnmapHold::new(start, length);
     let traced = backing::ImportTrace::new(site, start, length, imported);
-    (imported, run, backing::keep_alive((twin, hold, traced)), kept)
+    (
+        imported,
+        run,
+        backing::keep_alive((twin, hold, traced)),
+        kept,
+    )
 }
 
 /// What Metal answers where the runtime refuses a buffer or heap made at `placing`'s address:

@@ -231,7 +231,7 @@ pub struct CreateArgs {
     /// How an existing disk is used: copy (a reflink or clone where it can), overlay, in-place
     #[arg(long, default_value = "copy")]
     pub disk_mode: String,
-    /// x86-64: the OpenCore image to copy (OpenCore.qcow2, from OSX-KVM or ULTMOS)
+    /// x86-64: an OpenCore image to copy (default: reims-util makes one with ReimsVgpu.kext)
     #[arg(long)]
     pub opencore: Option<PathBuf>,
     /// x86-64: the installer image (an .iso goes in a CD drive; BaseSystem.img as a disk, and

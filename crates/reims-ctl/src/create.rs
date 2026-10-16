@@ -391,6 +391,18 @@ fn make_q35(spec: &Spec, _host: Host, dir: &Path, progress: &mut dyn FnMut(&str)
         let _ = make_writable(&dir.join("OVMF_VARS.fd"));
     }
 
+    if generated {
+        for (source, name) in [
+            (spec.firmware_code.as_ref(), "OVMF_CODE.fd"),
+            (spec.firmware_vars.as_ref(), "OVMF_VARS.fd"),
+        ] {
+            if let Some(source) = source {
+                copy_file(source, &dir.join(name))?;
+            }
+        }
+        make_writable(&dir.join("OVMF_VARS.fd"))?;
+    }
+
     let installer = match spec.installer.clone().or(s.installer.clone()) {
         Some(i) if !i.exists() => bail!("the installer {} does not exist", i.display()),
         Some(i) => Some(installer_media(&i, dir, progress)?),
@@ -405,11 +417,6 @@ fn make_q35(spec: &Spec, _host: Host, dir: &Path, progress: &mut dyn FnMut(&str)
         && let Some(m) = s.memory_mib
     {
         c.memory_mib = m;
-    }
-    if spec.mac.is_none()
-        && let Some(m) = &s.mac
-    {
-        c.network.mac = m.clone();
     }
     c.q35 = Some(Q35 {
         opencore: oc_name.into(),
@@ -1052,6 +1059,74 @@ pub fn base64_decode(s: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_opencore_uses_the_vms_mac_and_keeps_custom_settings() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "REIMS_TEST_GENERATED_OPENCORE";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let mut spec = Spec::new("generated");
+            spec.disk = Some(DiskSource::Existing {
+                path: root.join("disk.img"),
+                mode: ImportMode::InPlace,
+            });
+            spec.cpu_model = Some("custom-model".into());
+            spec.cpu_flags = Some("custom-flags".into());
+            spec.firmware_vars = Some(root.join("custom-vars.fd"));
+            let vm = make_q35(&spec, Host::current(), &root.join("vm"), &mut |_| {}).unwrap();
+            let args = std::fs::read_to_string(root.join("args")).unwrap();
+            let args: Vec<_> = args.lines().collect();
+            let rom = args.iter().position(|a| *a == "--rom").unwrap();
+            assert_eq!(args[rom + 1], vm.config.network.mac);
+            assert_eq!(
+                vm.config.disk,
+                std::fs::canonicalize(root.join("disk.img")).unwrap()
+            );
+            let q = vm.config.q35.unwrap();
+            assert_eq!(q.opencore_format, ImageFormat::Qcow2);
+            assert_eq!(q.cpu_model, "custom-model");
+            assert_eq!(q.cpu_flags, "custom-flags");
+            assert_eq!(
+                std::fs::read(root.join("vm/OVMF_VARS.fd")).unwrap(),
+                b"custom variables"
+            );
+            return;
+        }
+        // A child gets its own environment so this test cannot change another test's helper.
+        let root = std::env::temp_dir().join(format!("reims-ctl-generated-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("vm")).unwrap();
+        std::fs::write(root.join("disk.img"), b"disk").unwrap();
+        std::fs::write(root.join("custom-vars.fd"), b"custom variables").unwrap();
+        let helper = root.join("reims-util");
+        std::fs::write(
+            &helper,
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$@" > "$REIMS_TEST_GENERATED_OPENCORE/args"
+while [ "$1" != '-o' ]; do shift; done
+shift
+printf 'QFI\373' > "$1"
+printf 'code' > "$(dirname "$1")/OVMF_CODE.fd"
+printf 'vars' > "$(dirname "$1")/OVMF_VARS.fd"
+echo '{"event":"done","result":{}}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "create::tests::generated_opencore_uses_the_vms_mac_and_keeps_custom_settings",
+                "--nocapture",
+            ])
+            .env(CHILD, &root)
+            .env("REIMS_CTL_UTIL", helper)
+            .status()
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(status.success());
+    }
 
     #[test]
     fn relocated_finds_a_moved_bundles_files() {

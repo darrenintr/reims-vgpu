@@ -973,7 +973,7 @@ impl App {
                     Field::path("disk_path", "Disk image", "", "A qcow2 or raw image (Tab completes).").show_if("disk_kind", &["existing"]),
                     Field::choice("disk_mode", "Use the disk by", opts(&[("copy", "Copying it (instant where the file system reflinks)"), ("overlay", "An overlay over it (it must stay)"), ("in-place", "Using it in place")]), "copy", "A copy leaves the image as it was; an overlay records only the changes; in place, the VM writes the image itself.")
                         .show_if("disk_kind", &["existing", "script"]),
-                    Field::path("opencore", "OpenCore image", "", "The OpenCore image to copy (OpenCore.qcow2 from OSX-KVM or ULTMOS, with its config.plist). Empty to take the launch script's.")
+                    Field::path("opencore", "OpenCore image", "", "An OpenCore image to copy. Empty to take the launch script's image, or have reims-util make one with ReimsVgpu.kext.")
                         .placeholder("required unless the launch script names one"),
                     Field::path("installer", "Installer image", "", "Optional: an installer to boot (an .iso goes in a CD drive; BaseSystem.img as a disk, and BaseSystem.dmg too, converted to a raw image in the VM's directory). Eject it once macOS is installed (e).")
                         .placeholder("optional"),
@@ -1267,9 +1267,6 @@ impl App {
                     }
                 };
                 s.opencore = opt_path("opencore");
-                if s.opencore.is_none() && s.from_script.is_none() {
-                    bail!("give the OpenCore image, or a launch script that names one");
-                }
                 s.installer = opt_path("installer");
             }
             Some(Profile::VmappleArm64) => {
