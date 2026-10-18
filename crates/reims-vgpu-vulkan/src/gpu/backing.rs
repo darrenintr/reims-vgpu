@@ -846,7 +846,8 @@ unsafe impl Sync for Alias {}
 
 impl Alias {
     /// The first byte the runtime imports, and the runtime's keep-alive of the alias, which lets
-    /// go of it as it drops: once the runtime freed its import, or at once where the call was
+    /// go of it as it drops: once the runtime freed its import, at the buffer's release where
+    /// it lies in a live buffer's import ([`keep_alive`]), or at once where the call was
     /// refused. The alias is freed once nothing else holds it.
     ///
     /// The runtime imports the alias's pages, or, where the host's runtime cannot import them as
@@ -883,7 +884,7 @@ impl Drop for Alias {
     }
 }
 
-/// Where an import of host memory was made, as the trace names it ([`ImportTrace`]).
+/// Where host memory was handed to the runtime, as the trace names it ([`ImportTrace`]).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ImportSite {
     /// A no-copy buffer over host memory core gives (`newBufferWithBytesNoCopy`: task pages, the
@@ -897,7 +898,7 @@ pub(crate) enum ImportSite {
     Heap,
     /// A buffer's replaced backing.
     Replace,
-    /// A buffer over a surface, imported at its base address.
+    /// A buffer over a surface, at its base address.
     SurfaceBase,
 }
 
@@ -915,11 +916,14 @@ impl ImportSite {
     }
 }
 
-/// The trace of one import of host memory by the runtime, with `REIMS_VGPU_TRACE` set
-/// ([`reims_vgpu_core::trace`]): `imp` as it is made (the site, the first byte given, its
-/// length, the first byte imported), and `impfree` as its keep-alive goes, once the runtime
-/// freed the import (the first byte imported). A diagnostic: it holds nothing and reads nothing
-/// with an effect, and the keep-alive drops it last.
+/// The trace of the host memory this platform hands the runtime for one no-copy buffer, heap or
+/// rebind, with `REIMS_VGPU_TRACE` set ([`reims_vgpu_core::trace`]): `imp` as its keep-alive is
+/// made (the site, the first byte given, its length, the first byte handed over), and `impfree`
+/// as the keep-alive goes ([`keep_alive`]). It marks each buffer, not each import: a buffer
+/// made over exactly the bytes a live no-copy buffer was made over lies in that one's import
+/// (the runtime's `host_aliases.rs`), and its keep-alive goes at its release; the runtime's
+/// `WorkCounts` count those (`host_keep_alives_covered`). A diagnostic: it holds nothing and
+/// reads nothing with an effect, and the keep-alive drops it last.
 pub(crate) struct ImportTrace(u64);
 
 impl ImportTrace {
@@ -945,8 +949,10 @@ impl Drop for ImportTrace {
 /// The runtime's keep-alive of `kept`, what keeps the memory of a no-copy buffer's or heap's
 /// import mapped (an [`Alias`], a twin, an [`UnmapHold`](crate::remap::UnmapHold)): the runtime
 /// drops it once it freed the device's import of the memory, after the deallocator ran, on
-/// the thread that frees the import, which may be one of the runtime's. Its drop runs
-/// marked ours, so a panic there aborts.
+/// the thread that frees the import, which may be one of the runtime's; or, for a buffer whose
+/// import keeps another buffer's keep-alive already (one that lies in a live buffer's import),
+/// at the buffer's release, after its deallocator (the runtime's `host_memory.rs`, "A
+/// keep-alive"). Its drop runs marked ours, so a panic there aborts.
 pub(crate) fn keep_alive(kept: impl Send + 'static) -> rt::KeepAlive {
     /// `kept`, dropped marked ours.
     struct Kept<T>(Option<T>);
