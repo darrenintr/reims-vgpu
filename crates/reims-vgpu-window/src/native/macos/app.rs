@@ -109,7 +109,7 @@ define_class!(
     pub(crate) struct AppDelegate;
 
     impl AppDelegate {
-        /// Window ▸ Release Input: the key window's input lets the keyboard go.
+        /// Window ▸ Release Input: the key window's input lets the keyboard and the pointer go.
         #[unsafe(method(releaseInput:))]
         fn release_input(&self, _sender: Option<&AnyObject>) {
             let _env = BlockEnv::foreign();

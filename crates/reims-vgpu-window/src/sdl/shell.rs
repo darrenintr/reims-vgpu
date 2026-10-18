@@ -30,6 +30,13 @@
 //! see. On Wayland a covered window is one the compositor suspends, whose FIFO present would wait
 //! for a frame callback that never comes, on the queue the guest's frames use too.
 //!
+//! **Capture.** While the input is captured, SDL holds the pointer over the image, SDL's mouse
+//! rect ([`mouse_rect`]), set again whenever the layout changes, and frees it when capture ends.
+//! SDL keeps the rect on Wayland with the compositor's pointer constraints, on X11 with XFixes
+//! pointer barriers, and on macOS with the window's `mouseConfinementRect`, each only while the
+//! window has the keyboard (read from SDL 3.4.18's code). Where SDL has no mouse rect (an X11
+//! build without XFixes), its mouse grab holds the pointer in the whole window.
+//!
 //! **The end.** At the display's end the window lets its input go and hides; SDL's window is
 //! destroyed once the OS lets it go ([`os::close`]): on Linux once its render thread has let its
 //! swapchain and Vulkan surface go too ([`released`]), whichever of the two comes last.
@@ -42,7 +49,7 @@ use sdl3_sys::everything::*;
 use super::cursor::CursorCache;
 use super::os::{self, Input};
 use super::{c_string, sdl_error};
-use crate::geometry::{self, Layout};
+use crate::geometry::{self, Layout, Rect};
 use crate::handle::Window;
 
 /// The guest's mode a window is sized for before the guest sets one or the display offers one.
@@ -381,12 +388,34 @@ impl Shell {
         self.input.flush(&self.window);
     }
 
-    /// The keyboard was captured or released: the OS grabs it or lets it go, and the title and
-    /// the cursor follow.
+    /// The input was captured or released: the OS grabs the keyboard or lets it go, SDL holds
+    /// the pointer over the image or frees it, and the title and the cursor follow.
     pub(crate) fn capture_changed(&mut self) {
         os::grab_keyboard(self, self.input.is_captured());
+        self.confine_pointer();
         self.refresh_title();
         self.refresh_cursor();
+    }
+
+    /// Holds the pointer over the image while captured, and frees it when not (the module doc):
+    /// SDL's mouse rect, else its mouse grab of the whole window where SDL refuses the rect.
+    fn confine_pointer(&self) {
+        let rect = self
+            .input
+            .pointer_confinement(self.layout.image)
+            .map(mouse_rect);
+        let rect_ptr = rect.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
+        // SAFETY: the window is SDL's, on this thread; SDL copies the rect.
+        let ruled = unsafe { SDL_SetWindowMouseRect(self.sdl, rect_ptr) };
+        let grab = rect.is_some() && !ruled;
+        if grab {
+            refused(
+                "no mouse rect, so the pointer is held in the whole window",
+                self.window.title(),
+            );
+        }
+        // SAFETY: as above.
+        unsafe { SDL_SetWindowMouseGrab(self.sdl, grab) };
     }
 
     /// Sets the title: the window's, then what capture adds.
@@ -417,6 +446,9 @@ impl Shell {
             self.layout = layout;
             self.density = density;
             self.refresh_cursor();
+            if self.input.is_captured() {
+                self.confine_pointer();
+            }
         }
         self.window.surface().set_layout(layout);
     }
@@ -454,6 +486,21 @@ impl Shell {
             SDL_SetCursor(ours.unwrap_or_else(|| SDL_GetDefaultCursor()));
             SDL_ShowCursor();
         }
+    }
+}
+
+/// `image`, a rectangle in the window's points, as SDL's mouse rect: in whole points, rounded out,
+/// so that the image's last row and column stay in reach of the pointer held inside it, which
+/// holds at the image's edge over the sliver of the bars it may reach.
+fn mouse_rect(image: Rect) -> SDL_Rect {
+    let (left, top) = (image.x.floor(), image.y.floor());
+    let right = (image.x + image.width).ceil();
+    let bottom = (image.y + image.height).ceil();
+    SDL_Rect {
+        x: left as i32,
+        y: top as i32,
+        w: (right - left) as i32,
+        h: (bottom - top) as i32,
     }
 }
 
@@ -543,6 +590,24 @@ fn close_asked(c: &mut impl Closing) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pointer is held over the image in whole points, rounded out; an image on whole points
+    /// is the rect itself
+    #[test]
+    fn the_pointer_is_held_over_the_image_in_whole_points() {
+        let held = |x, y, width, height| {
+            let r = mouse_rect(Rect {
+                x,
+                y,
+                width,
+                height,
+            });
+            (r.x, r.y, r.w, r.h)
+        };
+        assert_eq!(held(80.5, 0.0, 959.0, 600.25), (80, 0, 960, 601));
+        assert_eq!(held(0.0, 0.0, 1920.0, 1200.0), (0, 0, 1920, 1200));
+        assert_eq!(held(10.4, 20.6, 0.2, 0.2), (10, 20, 1, 1));
+    }
 
     /// A close's steps, recorded, over a capture that letting go ends or not.
     struct Recorded {

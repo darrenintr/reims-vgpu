@@ -37,7 +37,7 @@ use sdl3_sys::everything::*;
 use super::input::{self, At, Wheel};
 use super::keymap;
 use super::render::Target;
-use crate::geometry::{self, Insets};
+use crate::geometry::{self, Insets, Rect};
 use crate::handle::Window;
 use crate::screens;
 use crate::sdl::c_string;
@@ -88,9 +88,14 @@ impl Input {
         self.0.focus_lost().capture_changed
     }
 
-    /// Whether the keyboard is captured.
+    /// Whether input, the keyboard and the pointer, is captured.
     pub(crate) fn is_captured(&self) -> bool {
         self.0.is_captured()
+    }
+
+    /// Where the pointer is held over `image`, in the window's points: the image while captured.
+    pub(crate) fn pointer_confinement(&self, image: Rect) -> Option<Rect> {
+        self.0.pointer_confinement(image)
     }
 
     /// What the title ends with in the current capture state.

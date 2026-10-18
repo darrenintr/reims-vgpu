@@ -144,8 +144,9 @@ Unset or unparsable values give the defaults below.
   it holds at the nearest edge outside the image.
   `test: geometry::the_pointer_maps_to_the_guest_pixel_under_it`,
   `test: geometry::the_pointer_holds_at_the_nearest_edge`
-- Left, right, middle and both side buttons click and drag; a drag keeps
-  going outside the window. `test: geometry::buttons_map_to_the_five_bits`,
+- Left, right, middle and both side buttons click and drag; a drag ends in
+  the guest wherever its button comes up, held at the image's edge outside
+  it. `test: geometry::buttons_map_to_the_five_bits`,
   `test: geometry::the_pointer_holds_at_the_nearest_edge`,
   `test: native::macos::input::a_click_in_the_image_is_sent_with_its_button`,
   `test: native::macos::input::a_drag_keeps_going_outside_the_window`
@@ -177,16 +178,27 @@ Unset or unparsable values give the defaults below.
 
 ## Capture
 
-- A click into the image captures the keyboard: ⌘ shortcuts and system keys
-  (⌘Q, ⌘W, ⌘Tab, ⌘Space) go to the guest.
+- A click into the image captures the keyboard and the pointer together: ⌘
+  shortcuts and system keys (⌘Q, ⌘W, ⌘Tab, ⌘Space) go to the guest, and the
+  pointer stays over the image. Neither is captured without the other.
   `test: capture::a_click_in_the_image_captures`,
   `test: capture::captured_keys_go_to_the_guest`,
   `test: native::macos::input::captured_command_keys_reach_the_guest_not_the_menu`
   (routing), `manual` (system keys)
-- Pressing ⌃⌥⌘ together releases capture.
+- Captured, the host's pointer is held over the image (the window's
+  `mouseConfinementRect`), so every click is the guest's: it cannot leave
+  for the bars, the title bar or the host's other windows, menu bar or Dock,
+  and the guest's own edges and corners (its menu bar, its Dock, its hot
+  corners) are in reach. Released, it goes where the person moves it. In
+  native full screen an image that reaches the screen's top or bottom edge
+  takes the pointer there, where macOS slides its own menu bar or Dock in.
+  `test: capture::captured_input_holds_the_pointer_over_the_image`,
+  `manual` (the hold)
+- Pressing ⌃⌥⌘ together releases capture, of the keyboard and the pointer.
   `test: capture::control_option_command_releases`,
   `test: native::macos::input::the_release_chord_lifts_every_key_and_releases`
-- Losing focus releases capture and gives the host back its system keys.
+- Losing focus releases capture and gives the host back its system keys and
+  its pointer.
   `test: capture::losing_focus_releases`,
   `test: native::macos::input::losing_focus_lifts_every_key_and_releases`,
   `test: native::macos::hotkeys::the_hot_keys_come_back_when_the_last_holder_lets_go`
@@ -332,12 +344,19 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `test: native::linux::input::closing_leaves_nothing_stuck`,
   `test: native::linux::sdl::a_close_the_person_asks_for_lifts_every_key_and_ends_capture`,
   `test: sdl::shell::a_close_sends_the_key_ups_and_ends_capture_before_the_host_hears_of_it`
-- Capture: a click in the image captures, and the window then grabs the
-  keyboard, so the compositor's own shortcuts (Super, Alt+Tab) reach the
-  guest; Ctrl+Alt+Super releases; losing the keyboard releases; the title
-  says whether input is captured, as on macOS, with Ctrl+Alt+Super to
-  release. `test: native::linux::input::a_click_in_the_image_captures_and_is_sent`,
-  `test: native::linux::input::ctrl_alt_super_releases_capture`, `manual` (the grab)
+- Capture: a click in the image captures the keyboard and the pointer, and
+  the window then grabs the keyboard, so the compositor's own shortcuts
+  (Super, Alt+Tab) reach the guest, and holds the pointer over the image, as
+  on macOS: SDL's mouse rect, in whole points rounded out, which the
+  compositor's pointer constraints keep on Wayland and XFixes barriers on
+  X11 (where SDL has no mouse rect, its mouse grab holds the pointer in the
+  whole window); Ctrl+Alt+Super releases both; losing the keyboard releases;
+  the title says whether input is captured, as on macOS, with
+  Ctrl+Alt+Super to release.
+  `test: native::linux::input::a_click_in_the_image_captures_and_is_sent`,
+  `test: native::linux::input::ctrl_alt_super_releases_capture`,
+  `test: sdl::shell::the_pointer_is_held_over_the_image_in_whole_points`,
+  `manual` (the grab and the hold)
 - Scrolling: the wheel's notches, or, where the host takes smooth
   scrolling, its lines at 10 points each, in no gesture (SDL gives no
   phases); the guest gets the device's own direction.
@@ -366,7 +385,9 @@ Metal view, opens and follows the guest's mode in the frames AppKit's window
 takes, is borderless as AppKit's window is (the camera housing's room
 included), and gives AppKit's events to AppKit's window's input, so keys,
 capture, the system's hot keys and scrolling's phases and momentum are the
-same. The cursor is SDL's, with an image at the screen's scale. `manual`
+same. The cursor is SDL's, with an image at the screen's scale, and the
+pointer's hold while captured is SDL's mouse rect, which SDL keeps with the
+same `mouseConfinementRect`. `manual`
 
 ## Not provided
 

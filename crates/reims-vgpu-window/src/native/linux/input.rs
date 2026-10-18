@@ -11,11 +11,11 @@
 //! What the guest gets:
 //! - **The pointer** once the guest has a mode, at the guest pixel under the host's pointer, held
 //!   at the image's nearest edge outside it; a move is sent where that pixel changes. A click in
-//!   the image captures the keyboard; the click that focuses the window (one that comes within
-//!   [`FOCUS_CLICK_NS`] of the window gaining the keyboard) is not sent. A click outside the
-//!   image is not sent and starts nothing. A button's release is sent wherever it happens, so a
-//!   drag that leaves the window ends in the guest. The left, middle and right buttons and the
-//!   two side buttons each have their bit.
+//!   the image captures the keyboard and the pointer; the click that focuses the window (one that
+//!   comes within [`FOCUS_CLICK_NS`] of the window gaining the keyboard) is not sent. A click
+//!   outside the image is not sent and starts nothing. A button's release is sent wherever it
+//!   happens, so a drag that leaves the image ends in the guest. The left, middle and right
+//!   buttons and the two side buttons each have their bit.
 //! - **The wheel** over the image, once the guest has a mode: SDL's whole notches as wheel
 //!   notches, or, where the host takes smooth scrolling, each event's distance at
 //!   [`crate::scroll::POINTS_PER_LINE`] points a line, with its notches, in no gesture (SDL gives
@@ -31,7 +31,8 @@
 //!   key held; losing the keyboard and closing lift the buttons held too.
 //!
 //! While captured, the window grabs the keyboard (`SDL_SetWindowKeyboardGrab`): on Wayland the
-//! compositor's shortcuts inhibitor, so its own shortcuts reach the guest.
+//! compositor's shortcuts inhibitor, so its own shortcuts reach the guest; and SDL holds the
+//! pointer over the image ([`Input::pointer_confinement`], `crate::sdl::shell`).
 
 use crate::capture::{Capture, UNCAPTURED_SUFFIX};
 use crate::config::{
@@ -63,7 +64,8 @@ pub(crate) struct At {
 /// What the window does after an event.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Reaction {
-    /// The capture state changed: the keyboard grab, the title and the cursor follow it.
+    /// The capture state changed: the keyboard grab, the pointer's hold, the title and the cursor
+    /// follow it.
     pub(crate) capture_changed: bool,
 }
 
@@ -155,9 +157,15 @@ impl Input {
         Input::default()
     }
 
-    /// Whether the keyboard is captured.
+    /// Whether input, the keyboard and the pointer, is captured.
     pub(crate) fn is_captured(&self) -> bool {
         self.capture.is_captured()
+    }
+
+    /// Where the pointer is held over `image`, the image's rectangle in the window's points: the
+    /// image while captured ([`Capture::pointer_confinement`]).
+    pub(crate) fn pointer_confinement(&self, image: Rect) -> Option<Rect> {
+        self.capture.pointer_confinement(image)
     }
 
     /// What the title ends with: the release chord while captured, that a click captures while not.

@@ -147,7 +147,9 @@ cat <<EOF
 The walk of the $IMPL window: three boots of $VM_DIR, about 15 minutes.
 Results go to $RESULTS. Keep the Mac on its built-in screen unless a step
 asks for another. Have the guest's Terminal handy: some steps run a command
-in it.
+in it. While input is captured the pointer stays over the guest's image:
+press ⌃⌥⌘ to release it whenever a step needs it elsewhere (the bars, the
+title bar, an edge to drag, another app), and before you answer here.
 EOF
 wait_for "Close other GPU-heavy apps"
 
@@ -192,17 +194,24 @@ step P7 "Native full screen (green button or ⌃⌘F) keeps the ratio, and leavi
 step P8 "Sharp: one drawable pixel per screen pixel (guest text is crisp at 1:1 when the window is sized to half the mode). With a second screen of another scale, move the window there: still sharp. Otherwise check the built-in screen only."
 
 step I1 "Pointer: absolute, where the host's is over the image, held at the nearest edge outside it (tests: geometry::the_pointer_*)."
-step I2 "Left, right, middle and (if your mouse has them) side buttons click and drag; a drag in a guest window keeps going outside the host window (tests: native::macos::input::a_click_in_the_image_is_sent_with_its_button, a_drag_keeps_going_outside_the_window)."
-step I3 "Click another host app, then click into the guest window: that click only brings the window forward, the guest does not get it (test: native::macos::input::the_click_that_makes_the_window_key_is_not_sent)."
+step I2 "Left, right, middle and (if your mouse has them) side buttons click and drag; a drag in a guest window stops at the image's edge and drops in the guest where its button comes up (tests: native::macos::input::a_click_in_the_image_is_sent_with_its_button, a_drag_keeps_going_outside_the_window)."
+step I3 "Press ⌃⌥⌘, click another host app, then click into the guest window: that click only brings the window forward, the guest does not get it (test: native::macos::input::the_click_that_makes_the_window_key_is_not_sent)."
 step C1 "Click into the image: the title says input is captured and how to release it; ⌘Tab, ⌘Space, ⌘W and ⌘Q now go to the guest (⌘Q quits the guest's frontmost app, not the VM) (tests: capture::*, native::macos::input::captured_command_keys_reach_the_guest_not_the_menu)."
+step C2 "Captured, the pointer stays over the image: push it at each edge and into each corner, fast and slow; it stops at the image, never over the black bars, the title bar, another window, the menu bar or the Dock, and the guest's pointer reaches the guest's own edges (its Apple menu at the top left, its Dock where it shows, a hot corner if one is set) (test: capture::captured_input_holds_the_pointer_over_the_image)."
+step C2e "Captured, click at each edge and into each corner of the image where it meets the window's edge: the guest gets every click, and the window neither resizes nor moves."
+step C2m "With a trackpad, captured: swipe up with three fingers (Mission Control), then back down; the title says input is captured only while the pointer is still held over the image. No trackpad: skip."
+step C2f "Press ⌃⌥⌘, enter native full screen (the green button), click into the image and push the pointer at the screen's top and bottom edges: the hold is as above, but where the image reaches an edge the host's menu bar or Dock may slide in there, as features.md says; press ⌃⌥⌘ and leave full screen."
 step K1 "Captured, in the guest's TextEdit or Terminal: keys arrive by position (the guest's layout applies); left and right Shift, Control, Option and Command are told apart (try right Shift+A)."
 step K2 "On an ISO keyboard, the key left of 1 and the key right of left Shift arrive as on a real ISO keyboard. Not ISO: skip (test: keymap::iso_swaps_section_and_grave)."
 step K3 "Caps Lock toggles as on a Mac keyboard (one press on, one off)."
 step K4 "A held key repeats at the guest's rate, with no doubled characters from the host's repeat (tests: keys::host_repeats_are_dropped, native::macos::input::host_repeats_are_dropped_at_the_view)."
 step K5 "Key-ups under Command reach the guest: hold ⌘, tap A then release: the guest selects all once and no key stays down (test: native::macos::input::key_ups_under_command_reach_the_guest)."
-step C2 "Press ⌃⌥⌘ together: capture is released, the title says \"click to capture input\" again, and no key stays down in the guest (tests: capture::control_option_command_releases, native::macos::input::the_release_chord_lifts_every_key_and_releases)."
-step C3 "Capture again, then hold a letter key and click another host app's window: capture is released, the host's ⌘Tab and Spotlight work again, and the letter stops repeating in the guest (tests: native::macos::input::losing_focus_*, native::macos::hotkeys::the_hot_keys_come_back_when_the_last_holder_lets_go)."
-step C4 "Uncaptured, ⌘ shortcuts drive the host's menu (⌘H hides the VM), and other keys go to the guest (tests: capture::uncaptured_command_goes_to_the_host)."
+step C3 "Press ⌃⌥⌘ together: capture is released, the title says \"click to capture input\" again, the pointer leaves the window freely, and no key stays down in the guest (tests: capture::control_option_command_releases, native::macos::input::the_release_chord_lifts_every_key_and_releases)."
+wait_for "Read this first: 10 s after Enter, Finder comes forward by itself. Press Enter, then click into the guest's TextEdit until the title says input is captured, and hold a letter key until Finder comes"
+sleep 10
+open -a Finder
+step C4 "Finder came forward while you held the key: capture was released, the pointer moves freely again, the host's ⌘Tab and Spotlight work again, and the letter stopped repeating in the guest (tests: native::macos::input::losing_focus_*, native::macos::hotkeys::the_hot_keys_come_back_when_the_last_holder_lets_go)."
+step C5 "Uncaptured, ⌘ shortcuts drive the host's menu (⌘H hides the VM), and other keys go to the guest (tests: capture::uncaptured_command_goes_to_the_host)."
 
 step S1 "Trackpad or Magic Mouse in a long guest page (Safari or System Settings): the guest scrolls as far as the host and coasts with momentum, as on the host (tests: native::macos::input::smooth_scrolling_sends_the_gesture_to_its_end, appkit_phases_are_the_guests)."
 step S2 "Horizontal scrolling reaches the guest (a wide page or Finder's column view)."
@@ -230,7 +239,7 @@ ended windowed
 boot borderless REIMS_VGPU_WINDOW_BORDERLESS=1 RESOLUTION=host || exit 1
 step B1 "Borderless: the window covers the whole screen, with no title bar; on a screen with a camera housing the image fits below it (test: geometry::the_image_fits_below_a_camera_housing)."
 step B2 "The menu bar and the Dock hide while the VM is frontmost, and come back when another app is (⌘Tab away and back)."
-step B3 "The window takes keys and clicks as a titled one does: click to capture, type in the guest, ⌃⌥⌘ releases."
+step B3 "The window takes keys and clicks as a titled one does: click to capture, type in the guest, the pointer stays on the image (below a camera housing too), ⌃⌥⌘ releases."
 step M2 "resolution=host: the guest's Displays offers modes that fill the screen, the largest 16:10, 16:9 and 4:3 first (16:10 first of all), then smaller standard sizes, at $(refresh_hz) Hz; on the built-in Retina screen, a HiDPI (2x) desktop (tests: policy::offered_modes_*)."
 step B4 "Change the host's screen: System Settings > Displays, pick another \"Larger Text\"/\"More Space\" size: the window re-fills its screen. (With a second screen, unplugging it moves its window to the main screen.) Set it back afterwards."
 wait_for "Uncaptured, press ⌘Q"
@@ -240,7 +249,7 @@ ended borderless
 # ---------------------------------------------------------------- boot 3
 boot chosen RESOLUTION=2560x1600@200 || exit 1
 step M3 "resolution=2560x1600@200: the guest runs a HiDPI desktop that looks like 1280x800, and the windowed window on this Retina screen shows it one guest pixel per screen pixel where half the mode fits (tests: policy::a_chosen_mode_at_a_chosen_ppi, a_chosen_density_tells_the_scale_the_guest_runs)."
-step M4 "In the guest's Displays, switch to another offered mode: the window, never resized by you, follows it, top left corner kept, inside the visible area (tests: geometry::a_resize_keeps_the_top_left_corner, a_resize_stays_in_the_visible_area)."
+step M4 "In the guest's Displays, switch to another offered mode: the window, never resized by you, follows it, top left corner kept, inside the visible area, and the pointer, still captured, is held over the new image at each edge (tests: geometry::a_resize_keeps_the_top_left_corner, a_resize_stays_in_the_visible_area)."
 step M5 "Modes the host sets with QEMU's display-modes replace the offered ones: vmapple's built-in apple-gfx-mmio takes the property only through -global, whose string form holds no list; skip unless you have run it otherwise."
 wait_for "Close the window"
 ended chosen
