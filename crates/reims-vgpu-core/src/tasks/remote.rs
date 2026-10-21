@@ -177,6 +177,10 @@ impl<P: Platform> ForwardReply<P> {
 /// An exec's reply: stores the backings the service reports, and completes the GPU wait with the
 /// service's status.
 struct ExecReply<P: Platform> {
+    /// The guest's task id, for the exec timeline.
+    task_id: u32,
+    /// The FIFO whose stamp this exec advances.
+    stamp_index: u32,
     /// The FIFO thread's wait: dropped first.
     gpu_token: Arc<Token>,
     /// The completion token, whose id crossed the wire: held for its release, after the GPU
@@ -199,6 +203,16 @@ impl<P: Platform> ExecReply<P> {
                 b.data.extend_from_slice(&data);
             }
         }
+        // exec-reply: task, FIFO, service completion token, reply status.
+        crate::trace::event(
+            "exec-reply",
+            &[
+                u64::from(self.task_id),
+                u64::from(self.stamp_index),
+                self._token.id(),
+                u64::from(status),
+            ],
+        );
         self.endpoint
             .completions()
             .complete(&self.gpu_token, ExecStatus(status));
@@ -398,6 +412,8 @@ impl<P: Platform> RemoteTask<P> {
         let token = self.endpoint.completions().issue_with(completing(done));
         let reply = {
             let reply = ExecReply {
+                task_id: self.task_id,
+                stamp_index,
                 gpu_token: gpu_token.clone(),
                 _token: token.clone(),
                 backings: backings.clone(),
@@ -406,13 +422,26 @@ impl<P: Platform> RemoteTask<P> {
             };
             Reply::new(move |v: (u32, Option<Vec<u8>>, u32)| reply.invoke(v))
         };
+        let fifo_event_value_in = fifo_event_value.load(Ordering::Relaxed);
+        // exec-send: task, FIFO, service completion token, event value, resources, buffers.
+        crate::trace::event(
+            "exec-send",
+            &[
+                u64::from(self.task_id),
+                u64::from(stamp_index),
+                token.id(),
+                fifo_event_value_in,
+                u64::from(resource_count),
+                u64::from(cmd_buffer_count),
+            ],
+        );
         self.link.send(ToService::ExecIndirect3 {
             data: command_data,
             cmd_buffer_count,
             resource_count,
             stamp_index,
             // Read at the send.
-            fifo_event_value_in: fifo_event_value.load(Ordering::Relaxed),
+            fifo_event_value_in,
             gpu_completion: token.id(),
             reply,
         });
