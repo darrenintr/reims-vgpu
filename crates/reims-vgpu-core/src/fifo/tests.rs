@@ -45,7 +45,9 @@ fn ring_in_the_gap() -> bool {
     let name = std::thread::current().name().map(str::to_owned);
     let doorbell = {
         let mut doorbells = DOORBELLS.lock();
-        let at = doorbells.iter().position(|(n, _)| Some(*n) == name.as_deref());
+        let at = doorbells
+            .iter()
+            .position(|(n, _)| Some(*n) == name.as_deref());
         at.map(|at| doorbells.remove(at).1)
     };
     if let Some(ring) = doorbell {
@@ -501,7 +503,11 @@ mod root_read_bytes {
         let read = read_past_a_doorbell_in_the_gap(&f, "root gap", 2, move || {
             g.set_root_written(2);
         });
-        assert_eq!(read, Some(vec![7, 8]), "the thread slept through the doorbell");
+        assert_eq!(
+            read,
+            Some(vec![7, 8]),
+            "the thread slept through the doorbell"
+        );
     }
 
     /// A NULL ring dies at the copy
@@ -564,7 +570,11 @@ mod child_read_bytes {
             node.write_u32(0, 4);
             g.poke();
         });
-        assert_eq!(read, Some(vec![1, 2, 3, 4]), "the thread slept through the doorbell");
+        assert_eq!(
+            read,
+            Some(vec![1, 2, 3, 4]),
+            "the thread slept through the doorbell"
+        );
     }
 
     /// `written` is reloaded only when the cache is short; a lowered `written` wraps and the
