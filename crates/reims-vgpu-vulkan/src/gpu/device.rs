@@ -418,6 +418,18 @@ fn descriptor_options(initial: u64, options: &[OptionSet]) -> u64 {
 }
 
 impl VulkanDevice {
+    /// A command queue for a window's frame output, made on a queue the runtime reserves apart
+    /// from guest command queues where the device has one to spare. A device with no spare queue
+    /// to reserve uses the general command-queue pool, and the runtime announces
+    /// `shared-present-queue`.
+    pub fn new_frame_output_queue(&self) -> VulkanCommandQueue {
+        let raw = get("newCommandQueueForPresenting", || {
+            self.raw.new_command_queue_for_presenting()
+        });
+        metal_space::first_use(metal_space::FirstUse::Queue);
+        Obj::new(QueueObject::new(raw, self.clone_ref()))
+    }
+
     /// The runtime's answer to `heapTextureSizeAndAlignWithDescriptor:` for `desc`, asked inside
     /// `sel`; `None` where it refuses it. What [`metal_space::own_heap_size`] and
     /// [`metal_space::metal_size_and_align`] make Metal's answer of.
