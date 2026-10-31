@@ -324,6 +324,129 @@ def show_releases(offline=False, as_json=False, curated=False, diagnostics=False
             print(f"{item['tag']:47} {item['test_label']}{installed}{selected}{historical}")
     return 0 if rows else 1
 
+
+def qemu_running():
+    """Do not delete any cached build while *any* QEMU system VM is running."""
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return True  # No dependable process probe: fail closed.
+    try:
+        processes = list(proc.iterdir())
+    except OSError:
+        return True
+    for process in processes:
+        if not process.name.isdigit():
+            continue
+        try:
+            comm = (process / "comm").read_text().strip()
+        except (OSError, UnicodeError):
+            continue  # A process exiting while inspected is normal.
+        if comm.startswith("qemu-system") or comm == "qemu-kvm":
+            return True
+    return False
+
+
+def install_disk_size(folder):
+    """Approximate apparent size; never follow symlinks or traverse elsewhere."""
+    total = 0
+    for base, _dirs, files in os.walk(folder, followlinks=False):
+        for name in files:
+            try:
+                file = Path(base) / name
+                if not file.is_symlink():
+                    total += file.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def cleanup_plan():
+    """Preview only verified, obsolete GitHub Release installations.
+
+    Stable bundles, selected bundle, new experiments and latest profiler
+    remain untouched. Deletion must be explicitly confirmed separately.
+    """
+    if ROOT.is_symlink():
+        raise RuntimeError("qemu root is a symlink; refusing cleanup")
+    if not ROOT.is_dir():
+        return {"candidates": [], "total_bytes": 0, "plan_id": "empty"}
+    released = [record(r, assets, read_state()) for r, assets in selectable_releases()]
+    keep = {r["tag"] for r in curated_releases(released)}
+    keep.update(r["tag"] for r in diagnostic_releases(released))
+    selected = ROOT / "current"
+    selected_path = selected.resolve() if selected.is_symlink() else None
+    if selected.exists() and not selected.is_symlink():
+        raise RuntimeError("qemu/current is not a symlink; refusing cleanup")
+    candidates = []
+    for row in released:
+        tag = row["tag"]
+        path = ROOT / tag
+        if not row["installed"] or tag in keep or row["channel"] == "stable":
+            continue
+        if path.is_symlink() or not path.is_dir() or not valid_install(tag):
+            continue
+        if path.resolve() == selected_path:
+            continue
+        # Cannot delete arbitrary directories that merely look like a tag.
+        # The tag must be found in an actual, published GitHub Release.
+        stat = path.stat(follow_symlinks=False)
+        candidates.append({
+            "tag": tag,
+            "bytes": install_disk_size(path),
+            "dev": stat.st_dev,
+            "inode": stat.st_ino,
+            "reason": "已合并或过时的测试构建；仍可从 GitHub 重新下载",
+        })
+    candidates.sort(key=lambda item: item["tag"])
+    identity = [[i["tag"], i["bytes"], i["dev"], i["inode"]]
+                for i in candidates]
+    plan_id = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+    return {
+        "candidates": candidates,
+        "total_bytes": sum(i["bytes"] for i in candidates),
+        "plan_id": plan_id,
+    }
+
+
+def apply_cleanup(expected_plan_id):
+    """Remove only the previously previewed obsolete installations."""
+    if not expected_plan_id or not re.fullmatch(r"[0-9a-f]{64}", expected_plan_id):
+        raise RuntimeError("Missing valid cleanup preview ID")
+    if qemu_running():
+        raise RuntimeError("A QEMU VM is running; shut it down before cleanup")
+    plan = cleanup_plan()
+    if plan["plan_id"] != expected_plan_id:
+        raise RuntimeError("Cleanup list changed since preview; review it again")
+    removed = []
+    for item in plan["candidates"]:
+        if qemu_running():
+            raise RuntimeError("QEMU started during cleanup; stopping")
+        tag = safe_tag(item["tag"])
+        folder = ROOT / tag
+        if folder.is_symlink() or not folder.is_dir() or not valid_install(tag):
+            raise RuntimeError(f"Candidate changed or is no longer installed: {tag}")
+        current = ROOT / "current"
+        if current.is_symlink() and current.resolve() == folder.resolve():
+            raise RuntimeError(f"Refusing to delete selected build: {tag}")
+        stat = folder.stat(follow_symlinks=False)
+        if (stat.st_dev, stat.st_ino) != (item["dev"], item["inode"]):
+            raise RuntimeError(f"Candidate replaced since preview: {tag}")
+        if folder.resolve().parent != ROOT.resolve():
+            raise RuntimeError("Candidate escapes qemu root; refusing cleanup")
+        shutil.rmtree(folder)
+        removed.append(tag)
+    if removed:
+        state = read_state()
+        for key in ("stable", "testing", "current_tag"):
+            if state.get(key) in removed:
+                state.pop(key, None)
+        if state.get("current_channel") in ("stable", "testing"):
+            if state["current_channel"] not in state:
+                state["current_channel"] = "stable"
+        save_state(state)
+    return {"removed": removed, "removed_bytes": sum(i["bytes"] for i in plan["candidates"])}
+
+
 def fetch_releases(channel=None, tag=None):
     matches = selectable_releases()
     for release, assets in matches:
@@ -447,6 +570,15 @@ def main():
     parser.add_argument("--json", action="store_true", help="Machine-readable --list output")
     parser.add_argument("--offline", action="store_true", help="Use only installed builds with --list")
     parser.add_argument("--no-check", action="store_true", help="Use a downloaded build without a network query")
+    maintenance = parser.add_mutually_exclusive_group()
+    maintenance.add_argument("--cleanup-preview", action="store_true",
+                             help="Preview obsolete downloaded builds; never deletes")
+    maintenance.add_argument("--cleanup-apply", action="store_true",
+                             help="Delete only previewed obsolete builds, with --confirm and --plan-id")
+    parser.add_argument("--confirm", action="store_true",
+                        help="Required explicit confirmation for --cleanup-apply")
+    parser.add_argument("--plan-id",
+                        help="Exact cleanup plan_id returned by --cleanup-preview")
     parser.add_argument("--install-only", action="store_true", help="Do not launch reims-ctl")
     parser.add_argument("ctl_args", nargs=argparse.REMAINDER,
                         help="Arguments for reims-ctl after --")
@@ -457,6 +589,27 @@ def main():
         return show_releases(offline=args.offline or args.no_check,
                              as_json=args.json, curated=args.curated,
                              diagnostics=args.diagnostics)
+    if args.cleanup_preview:
+        plan = cleanup_plan()
+        if args.json:
+            print(json.dumps(plan, ensure_ascii=False))
+        else:
+            print("过期下载版本（只读预览，不影响 GitHub Releases）：")
+            for item in plan["candidates"]:
+                print(f"  {item['tag']} - {item['bytes'] / (1024 ** 2):.1f} MiB")
+            print(f"Total: {plan['total_bytes'] / (1024 ** 2):.1f} MiB")
+            print(f"Plan ID: {plan['plan_id']}")
+        return 0
+    if args.cleanup_apply:
+        if not args.confirm or not args.plan_id:
+            parser.error("--cleanup-apply requires both --confirm and --plan-id")
+        result = apply_cleanup(args.plan_id)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            print(f"Removed {len(result['removed'])} obsolete builds; "
+                  f"about {result['removed_bytes'] / (1024 ** 2):.1f} MiB.")
+        return 0
 
     state = read_state()
     channel = args.channel
