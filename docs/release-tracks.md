@@ -21,6 +21,13 @@
 - The QEMU patch source lives in `darrenintr/qemu-reims-vgpu` branch `perf/file-backed-thp-align`.
 - Neither `testing` nor experimental branches may move the stable tag, modify stable assets, or automatically promote to stable.
 
+## Future performance experiments inherit v0.1.1
+
+- For an apples-to-apples QEMU/Metal2Vulkan A/B run on the Ryzen 5 3600, compile Rust and its dependencies with `RUSTFLAGS=-C target-cpu=x86-64-v3`, Thin LTO, 16 codegen units; keep host, RAM, CPU pinning, resolution, GPU driver, disk state, and test scene fixed.
+- The earlier `exp-fat-lto-3-e4a42df79f14` bundle used default Rust target flags (not Native-v3). It is an independent experiment, **not** a Fat-LTO patch applied on top of v0.1.1. Build a combined Native-v3 + Fat-LTO bundle if that incremental optimization is desired.
+- The QEMU THP experimental branch is source-only until a new built bundle is published. Build that candidate with the same Native-v3 flags before comparing to the new Stable baseline.
+- Never infer a renderer improvement from compiler flags or a GitHub Actions success alone; compare matched runtime frame intervals and check correctness.
+
 ## Promotion gate
 
 For each candidate: build pinned QEMU and Reims on Linux; verify QEMU's `apple-gfx-pci`, USB, KVM, SMC, OpenCore and Tahoe boot; confirm desktop, audio, network, Safari/WindowServer and VM shutdown. Benchmark against the exact stable binary under the same CPU pinning, guest state, resolution, display settings, driver and workload. Report median and p95/p99 frame intervals, max stalls, guest/window FPS, CPU host and vCPU use, and GPU submission/present timings; verify graphics correctness.
