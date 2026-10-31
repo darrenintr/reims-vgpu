@@ -70,6 +70,9 @@ objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std"] }
 mach2 = "0.7"
 libc = "0.2.180"
+# The library's allocator on the targets that ship (reims-vgpu-c's global allocator): jemalloc,
+# built from the crate's bundled source, with its symbols prefixed.
+tikv-jemallocator = "0.7.0"
 # dev and tooling
 proptest = "1.7"
 loom = "0.7"

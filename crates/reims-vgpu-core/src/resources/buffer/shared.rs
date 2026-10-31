@@ -70,6 +70,9 @@ impl<P: Platform> SharedBufferResource<P> {
         if self.buffer.lock().is_some() {
             return Ok(());
         }
+        // Trace `tobj`: the guest object whose pages the next `tbuf` imports (1, a shared buffer),
+        // its page and its length.
+        crate::trace::event("tobj", &[1, u64::from(self.page), self.length]);
         let buffer = match self.task.upgrade() {
             Some(t) => Some(t.new_buffer_for_virtual_page(hold, self.page, self.length)?),
             None => None,

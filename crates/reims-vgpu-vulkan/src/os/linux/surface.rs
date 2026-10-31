@@ -14,6 +14,19 @@
 //!   the CPU where it is read-only for the GPU (`kIOSurfaceClientDirection` 2), as IOSurface maps
 //!   it on macOS. A protected surface (protection options other than 0) has no memory the CPU
 //!   reaches: its base address is NULL.
+//!   The mapping goes with the surface's last object, or later with the last hold on it
+//!   ([`surface_memory_hold`]): a device's import of the pages at the surface's base address
+//!   holds one until the runtime has freed the import, so the pages stay mapped while it lives
+//!   (`VK_EXT_external_memory_host`), though the surface's last reference went at Metal's
+//!   moment. One over a single range maps nothing of its own. Core makes such a surface only
+//!   over one page of the host's own RAM, which a memory map names (core's walk of the guest's
+//!   page table gives each page by the memory map's host address), and which the host maps and
+//!   unmaps, not the library ([`crate::remap`]'s docs, "Not reported"). Its hold is an unmap hold
+//!   on the range ([`crate::remap::UnmapHold`]), which defers an unmap only of pages mapped
+//!   through the platform's VM, so for such a surface it defers nothing. A hold is no
+//!   reference: the retain count stays the objects'. Measured on an Iris Xe (Mesa 26.2.4's ANV,
+//!   i915): ANV puts every live import in each execbuffer, and one whose pages are unmapped
+//!   fails it with `EFAULT`, which ANV answers as the device lost.
 //! - **What it answers** is the spec's: its planes, rows and sizes, its allocation size exactly
 //!   as given. It holds no values (`IOSurfaceCopyValue`): nothing in the process sets one.
 //!   `lock` and `unlock` do nothing.
@@ -41,6 +54,7 @@
 //! byte per element and rows of its width rounded up to 128 bytes (measured on the M3 Max:
 //! widths 16, 17, 32 and 65535).
 
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use reims_vgpu_core::host::{HostPtr, PhysicalMemoryRange};
@@ -98,15 +112,23 @@ struct Data {
     alloc_size: u64,
     /// The base address; 0 for a protected surface.
     base: u64,
-    /// Its own memory, freed with it.
-    own: Option<OwnMemory>,
-    /// The view of the guest's pages it made, its first byte and length, freed with it.
-    view: Option<(u64, u64)>,
+    /// The memory it mapped, freed with the last holder of it.
+    memory: Arc<Memory>,
     /// What it was made over ([`crate::os::surface_memory`] and the helpers beside it).
     made: Mutex<MadeOver>,
 }
 
-impl Drop for Data {
+/// The memory a surface mapped: its own, or its view of the guest's pages; none for one over a
+/// single range of them, or a protected one.
+#[derive(Debug)]
+struct Memory {
+    /// Its own memory.
+    own: Option<OwnMemory>,
+    /// The view of the guest's pages it made, its first byte and length.
+    view: Option<(u64, u64)>,
+}
+
+impl Drop for Memory {
     /// Frees the view the surface made, and its own memory.
     fn drop(&mut self) {
         if let Some((first, length)) = self.view {
@@ -114,6 +136,24 @@ impl Drop for Data {
         }
         drop(self.own.take());
     }
+}
+
+/// A hold on the memory `surface` mapped, which keeps it mapped while it lives, the surface gone
+/// or not, and counts no reference of the surface; for one over a single range of the guest's
+/// pages, which maps nothing, an unmap hold on that range, which defers nothing for a range of
+/// the host's own RAM, the only one core makes such a surface over (module docs).
+pub(crate) fn surface_memory_hold(surface: &LinuxSurface) -> impl Send + 'static {
+    let data = surface.data();
+    let memory = &data.memory;
+    let cores_unmap = (memory.own.is_none() && memory.view.is_none())
+        .then(|| {
+            NonNull::new(std::ptr::with_exposed_provenance_mut::<u8>(
+                data.base.to_usize(),
+            ))
+        })
+        .flatten()
+        .map(|first| crate::remap::UnmapHold::new(first, data.alloc_size));
+    (Arc::clone(memory), cores_unmap)
 }
 
 impl LinuxSurface {
@@ -454,8 +494,10 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
             protection_options: protection,
             alloc_size: spec.alloc_size,
             base: if base == 0 { 0 } else { base + spec.offset },
-            own,
-            view: view_made,
+            memory: Arc::new(Memory {
+                own,
+                view: view_made,
+            }),
             made: Mutex::new(made),
         }))
     }
@@ -497,8 +539,10 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
             protection_options: 0,
             alloc_size,
             base: own.first(),
-            own: Some(own),
-            view: None,
+            memory: Arc::new(Memory {
+                own: Some(own),
+                view: None,
+            }),
             made: Mutex::new(MadeOver::default()),
         }))
     }
@@ -560,11 +604,11 @@ mod tests {
     /// view.
     fn mapped_range(s: &LinuxSurface) -> Option<(u64, u64)> {
         let data = s.data();
-        let own = data.own.as_ref().map(|own| {
+        let own = data.memory.own.as_ref().map(|own| {
             let length = data.alloc_size.next_multiple_of(page_size());
             (own.first(), length)
         });
-        own.or(data.view)
+        own.or(data.memory.view)
     }
 
     fn free(at: u64, length: u64) {
@@ -620,6 +664,31 @@ mod tests {
         assert!(mapped(base));
         drop((t, held));
         assert!(!mapped(base));
+    }
+
+    /// A hold on a surface's memory keeps it mapped past the surface's last object and counts no
+    /// reference of it, its own memory and its view of the guest's pages alike; the memory goes
+    /// with the hold
+    #[test]
+    fn a_hold_keeps_the_memory_past_the_last_reference() {
+        let page = page_size();
+        let (at, ranges) = guest_pages(2);
+        let several = SurfaceSpec {
+            alloc_size: 2 * page,
+            client_address_ranges: Some(ranges),
+            ..host_only()
+        };
+        for spec in [host_only(), several] {
+            let s = LinuxSurfaces::new().create(&spec).unwrap();
+            let base = s.base_address();
+            let hold = surface_memory_hold(&s);
+            assert_eq!(s.retain_count(), 1);
+            drop(s);
+            assert!(mapped(base), "{spec:?}");
+            drop(hold);
+            assert!(!mapped(base), "{spec:?}");
+        }
+        free(at, 2 * page);
     }
 
     /// The layouts IOSurface refuses are refused (module docs), and those at its limits made

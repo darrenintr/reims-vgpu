@@ -2,7 +2,8 @@
 //! ([`InputState`]) by the application before it dispatches them ([`takes`]), as AppKit's view
 //! would receive them, so the guest gets what it gets from AppKit's window: keys by position on
 //! ISO keyboards too, ⌘ shortcuts to the menu uncaptured and to the guest captured, key-ups under
-//! ⌘, scrolling with its phases and momentum, the system's hot keys held off while captured.
+//! ⌘, scrolling with its phases and momentum, the system's hot keys held off while captured. The
+//! pointer is held over the image while captured by SDL's mouse rect (`crate::sdl::shell`).
 //!
 //! Which events, and when:
 //! - **Keys** of the key window, where it is one of SDL's windows: those the input takes before
@@ -26,6 +27,7 @@ use objc2::rc::Retained;
 use objc2_app_kit::{NSEvent, NSEventType, NSWindow};
 use reims_vgpu_metal::msg;
 
+use crate::geometry::Rect;
 use crate::handle::Window;
 use crate::native::macos::input::{InputState, Reaction, ViewContext};
 use crate::native::macos::main_thread::shared_app;
@@ -60,9 +62,14 @@ impl Input {
         self.0.focus_lost().capture_changed
     }
 
-    /// Whether the keyboard is captured.
+    /// Whether input, the keyboard and the pointer, is captured.
     pub(crate) fn is_captured(&self) -> bool {
         self.0.is_captured()
+    }
+
+    /// Where the pointer is held over `image`, in the window's points: the image while captured.
+    pub(crate) fn pointer_confinement(&self, image: Rect) -> Option<Rect> {
+        self.0.pointer_confinement(image)
     }
 
     /// What the title ends with in the current capture state.
@@ -118,7 +125,8 @@ fn over_content(shell: &Shell, point: (f64, f64)) -> bool {
     (0.0..size.width).contains(&point.0) && (0.0..size.height).contains(&point.1)
 }
 
-/// Acts on the input's reaction: a changed capture refreshes the title and the cursor.
+/// Acts on the input's reaction: a changed capture refreshes the title, the cursor and the
+/// pointer's hold.
 fn react(shell: &mut Shell, reaction: Reaction) {
     if reaction.capture_changed {
         shell.capture_changed();
@@ -221,7 +229,7 @@ fn mouse(shell: &mut Shell, event: &NSEvent, kind: NSEventType) {
     }
 }
 
-/// Window ▸ Release Input: the key window's input lets the keyboard go.
+/// Window ▸ Release Input: the key window's input lets the keyboard and the pointer go.
 pub(crate) fn release_key_input(mtm: MainThreadMarker) {
     if let Some(id) = key_shell(mtm) {
         shell::with_shell(id, |shell| {
