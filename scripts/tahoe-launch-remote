@@ -142,8 +142,8 @@ if not items:
 else:
     print("只移除以下本机已下载的旧版，不影响 VM 数据或 GitHub Release：\n")
     for i in items:
-        print(f"• {i["tag"]}: {i["bytes"]/1048576:.1f} MiB")
-    print(f"\n预计释放约 {p["total_bytes"]/1048576:.1f} MiB。")
+        print("{}: {:.1f} MiB".format(i["tag"], i["bytes"]/1048576))
+    print("\n预计释放约 {:.1f} MiB。".format(p["total_bytes"]/1048576))
     print("\nStable、当前选择的版本、最新实验及 Profiler 均不会删除。")
     print("执行前会再次检查是否有 QEMU 运行，以及清理列表是否改变。")
 ') || return 1
