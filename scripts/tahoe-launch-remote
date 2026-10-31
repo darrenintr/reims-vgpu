@@ -47,7 +47,7 @@ dialog_question() {
 
 show_test_guide() {
   local message
-  message=$'推荐顺序：\n1. Stable v0.1.0：记录基准（现有 Testing-14 可先记录原始体验）。\n2. native-v3：只测试 CPU 指令集编译的影响。\n3. fat-lto：只测试链接与代码生成优化的影响。\n4. qemu-thp：发布后验证 QEMU 内存大页优化。\n5. profiler：只为诊断卡顿，不用于性能排名。\n\n每版保持相同 VM 磁盘状态、CPU 绑定和分辨率；先测 Finder 拖窗 30 秒，再测 Safari 滚动 30 秒、Launchpad 动画 10 次。\n启用 FPS 监控，记录 guest/window FPS 与 max gap；空闲时的 0 FPS 不代表卡顿。日志中的 max gap 不等于 p95/p99，需要更细粒度仪器才能统计。'
+  message=$'推荐顺序：\n1. Stable v0.1.1：Native-v3，现行性能基准。\n2. native-v3-fat-lto：在基准上叠加 Fat-LTO，测相同操作的帧率及间隔。\n3. Fat-LTO 单独版：历史比较用，不等同于组合版。\n4. qemu-thp：发布後验证 QEMU 大页内存优化。\n5. profiler：只用来诊断卡顿，不用于性能排名。\n\n每版保持相同 VM 磁盘状态、CPU 绑定和分辨率；先测 Finder 拖窗 30 秒，再测 Safari 滚动 30 秒、Launchpad 动画 10 次。\n启用 FPS 监控，记录 guest/window FPS 与 max gap；空闲时的 0 FPS 不代表卡顿。日志中的 max gap 不等于 p95/p99，需要更细粒度仪器才能统计。'
   if command -v kdialog >/dev/null; then
     kdialog --title 'macOS Tahoe · 测试说明' --msgbox "$message"
   elif command -v zenity >/dev/null; then
@@ -134,6 +134,7 @@ test_goal_for_tag() {
     v*) printf '%s\n' 'Stable：按同样场景测量 Finder / Safari / Launchpad 的帧时间' ;;
     testing-14-*) printf '%s\n' '兼容性对照：与 Stable GPU 核心相同，检查启动器及现有顺畅度' ;;
     testing-*) printf '%s\n' 'Testing：先查 Release 变更，再做相同场景性能及回归测试' ;;
+    exp-native-v3-fat-lto-*) printf '%s\n' '组合候选：Native-v3 + Fat-LTO + 单代码生成单元，直接对照 v0.1.1' ;;
     exp-native-v3-*) printf '%s\n' 'CPU ISA：仅比较 x86-64-v3 代码生成的性能影响' ;;
     exp-fat-lto-*) printf '%s\n' 'LTO：仅比较 Fat LTO 编译优化的性能影响' ;;
     exp-profiler-*) printf '%s\n' 'Profiler：定位卡顿，不用于性能排名' ;;
