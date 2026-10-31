@@ -111,7 +111,7 @@ pub fn invocation(vm: &Vm, ctx: &Ctx) -> Result<Invocation> {
         ("REIMS_CTL_SESSION_LOG", "REIMS_VGPU_LOG"),
     ] {
         if let Ok(value) = std::env::var(request) {
-            if value.len() <= 512 && !value.contains(['\n', '\r', '\0']) {
+            if value.len() <= 512 && !value.chars().any(|ch| matches!(ch, '\n' | '\r' | '\0')) {
                 env.retain(|(ek, _)| ek != key);
                 unset.retain(|u| u != key);
                 env.push((key.into(), value));
