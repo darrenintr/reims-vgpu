@@ -188,8 +188,23 @@ fn start_video() -> bool {
             CStr::from_ptr(name).to_string_lossy().into_owned()
         }
     };
-    log::info!(target: "reims_vgpu_window", "windows open through SDL's {driver} driver");
+    log::info!(
+        target: "reims_vgpu_window",
+        "windows open through SDL's {driver} driver{}",
+        driver_note(&driver, std::env::var_os("WAYLAND_DISPLAY").is_some())
+    );
     true
+}
+
+/// What the log adds to SDL's `driver`: where a Wayland compositor runs (`wayland_session`) and SDL
+/// took X11, that the windows are XWayland's, and why (`super::sdl`'s module doc).
+fn driver_note(driver: &str, wayland_session: bool) -> &'static str {
+    if driver == "x11" && wayland_session {
+        ", through XWayland: SDL takes it where the Wayland compositor has no fifo-v1 \
+         (SDL_VIDEO_DRIVER=wayland asks for Wayland)"
+    } else {
+        ""
+    }
 }
 
 /// The UI thread's body.
@@ -328,4 +343,18 @@ fn host_screen(id: SDL_DisplayID) -> Option<HostScreen> {
         scale,
         max_refresh_hz,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// X11 in a Wayland session is named XWayland, with why SDL took it; otherwise the driver
+    /// stands alone
+    #[test]
+    fn x11_in_a_wayland_session_says_xwayland() {
+        assert!(driver_note("x11", true).starts_with(", through XWayland"));
+        assert_eq!(driver_note("x11", false), "");
+        assert_eq!(driver_note("wayland", true), "");
+    }
 }

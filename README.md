@@ -137,12 +137,13 @@ reims-ctl update --channel development   # switch to the development branch firs
 `reims-ctl help` lists every command; every option takes `--name value` or `--name=value`. A running
 VM keeps the QEMU it started with across an update.
 
-### The window takes your keyboard shortcuts
+### The window takes your keyboard shortcuts and your mouse
 
 Each guest display opens in a window the library owns (`crates/reims-vgpu-window`). **Click into the
-guest's picture to capture the keyboard:** shortcuts and system keys then go to the guest instead
-of the host. Keys reach the guest by position, so the guest's own layout applies, and on Linux the
-Super key is the guest's ⌘.
+guest's picture to capture the keyboard and the mouse:** shortcuts and system keys then go to the
+guest instead of the host, and the pointer stays inside the picture until you release it, so you
+can throw it at the guest's corners and edges without landing on another window. Keys reach the
+guest by position, so the guest's own layout applies, and on Linux the Super key is the guest's ⌘.
 
 | Host | While captured | Release |
 |---|---|---|
@@ -150,9 +151,9 @@ Super key is the guest's ⌘.
 | Linux (SDL3's window, on Wayland or X11) | the whole keyboard, which the window grabs, so the compositor's shortcuts (Super, Alt+Tab) reach the guest | **Ctrl+Alt+Super** together |
 
 The title says when input is captured and how to release it. Losing focus releases capture too,
-and gives the host back its system keys. Uncaptured, ⌘ shortcuts drive the host's menu on a Mac.
-Losing focus, releasing capture or closing the window sends a key-up for every key still down, so
-nothing sticks. Closing a window powers the VM off.
+and gives the host back its system keys and its pointer. Uncaptured, ⌘ shortcuts drive the host's
+menu on a Mac. Losing focus, releasing capture or closing the window sends a key-up for every key
+still down, so nothing sticks. Closing a window powers the VM off.
 
 Fn/Globe does not reach the guest (QEMU's USB keyboard cannot carry it), and there is no HDR output.
 [`crates/reims-vgpu-window/features.md`](crates/reims-vgpu-window/features.md) lists everything the

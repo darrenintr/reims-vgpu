@@ -28,7 +28,7 @@ pub use vm::LinuxVm;
 pub(crate) use import::{
     TWINS_READ_ONLY, allocate_zeros, dma_buf_refusal, host_memory, import_view, shown_at,
 };
-pub(crate) use surface::{plane_at, plane_shape, recorded_mut, ycbcr_matrix};
+pub(crate) use surface::{plane_at, plane_shape, recorded_mut, surface_memory_hold, ycbcr_matrix};
 #[cfg(test)]
 pub(crate) use vm::allocate_aliasable;
 #[cfg(test)]

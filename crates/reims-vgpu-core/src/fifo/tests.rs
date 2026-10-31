@@ -34,6 +34,55 @@ fn shut(f: &Arc<Fifo<P>>) {
     f.drain();
 }
 
+/// The doorbells [`ring_in_the_gap`] rings, each once, on the thread of its name.
+type Doorbells = Vec<(&'static str, Box<dyn FnOnce() + Send>)>;
+static DOORBELLS: crate::sync::Mutex<Doorbells> = crate::sync::Mutex::new(Vec::new());
+
+/// The before-block hook of the gap tests: rings the current thread's doorbell, as the guest's
+/// can come while a FIFO thread submits its held-back work with the ring's lock free, and
+/// submits nothing.
+fn ring_in_the_gap() -> bool {
+    let name = std::thread::current().name().map(str::to_owned);
+    let doorbell = {
+        let mut doorbells = DOORBELLS.lock();
+        let at = doorbells
+            .iter()
+            .position(|(n, _)| Some(*n) == name.as_deref());
+        at.map(|at| doorbells.remove(at).1)
+    };
+    if let Some(ring) = doorbell {
+        ring();
+    }
+    false
+}
+
+/// `n` bytes of `f`'s ring, read on a thread named `name` whose first wait for bytes has
+/// `doorbell` rung in its gap; `None` where the thread still waits once the helper stops
+/// waiting for it.
+fn read_past_a_doorbell_in_the_gap(
+    f: &Arc<Fifo<P>>,
+    name: &'static str,
+    n: usize,
+    doorbell: impl FnOnce() + Send + 'static,
+) -> Option<Vec<u8>> {
+    crate::rt::thread::set_before_block(ring_in_the_gap);
+    DOORBELLS.lock().push((name, Box::new(doorbell)));
+    let g = f.clone();
+    let t = std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            let mut b = vec![0u8; n];
+            g.read_bytes(&mut b).then_some(b)
+        })
+        .unwrap();
+    let finished = wait_for(|| t.is_finished());
+    assert!(
+        !DOORBELLS.lock().iter().any(|(n, _)| *n == name),
+        "the thread never waited"
+    );
+    finished.then(|| t.join().unwrap()).flatten()
+}
+
 mod root_init {
     use super::*;
 
@@ -443,6 +492,24 @@ mod root_read_bytes {
         let _ = t.join();
     }
 
+    /// A `written` set while the thread submits its held-back work, which submits nothing,
+    /// wakes it all the same: the ring is looked at again under the lock before the wait
+    #[test]
+    fn a_doorbell_in_the_before_block_gap_wakes_it() {
+        let kit = Kit::new();
+        let (f, ram) = kit.root(0x500, 0x400);
+        ram.write(0x400, &[7, 8]);
+        let g = f.clone();
+        let read = read_past_a_doorbell_in_the_gap(&f, "root gap", 2, move || {
+            g.set_root_written(2);
+        });
+        assert_eq!(
+            read,
+            Some(vec![7, 8]),
+            "the thread slept through the doorbell"
+        );
+    }
+
     /// A NULL ring dies at the copy
     #[test]
     fn null_ring_dies() {
@@ -488,6 +555,26 @@ mod child_read_bytes {
         assert_eq!(c.cache_written.load(Ordering::Relaxed), 4);
         // Nothing published.
         assert_eq!(m.node.read_u32(4), Some(0));
+    }
+
+    /// A node's `written` and its poke while the thread submits its held-back work, which
+    /// submits nothing, wake it all the same: the node is read again under the lock before the
+    /// wait
+    #[test]
+    fn a_doorbell_in_the_before_block_gap_wakes_it() {
+        let kit = Kit::new();
+        let (f, m) = mapped_child(&kit, 1);
+        m.ring.write(0, &[1, 2, 3, 4]);
+        let (g, node) = (f.clone(), Arc::clone(&m.node));
+        let read = read_past_a_doorbell_in_the_gap(&f, "child gap", 4, move || {
+            node.write_u32(0, 4);
+            g.poke();
+        });
+        assert_eq!(
+            read,
+            Some(vec![1, 2, 3, 4]),
+            "the thread slept through the doorbell"
+        );
     }
 
     /// `written` is reloaded only when the cache is short; a lowered `written` wraps and the

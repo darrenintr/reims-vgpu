@@ -221,7 +221,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "metal2vulkan"
 version = "0.2.0"
-source = "git+https://github.com/darrenintr/metal2vulkan?rev=d9ca53ccaaf378f18e703c63630b1ae6d11432b8#d9ca53ccaaf378f18e703c63630b1ae6d11432b8"
+source = "git+https://github.com/darrenintr/metal2vulkan?rev=6d6f5d92326361562ac5d482eb017f41d80c82d9#6d6f5d92326361562ac5d482eb017f41d80c82d9"
 dependencies = [
  "ash",
  "metal2vulkan-air",
@@ -232,7 +232,7 @@ dependencies = [
 [[package]]
 name = "metal2vulkan-air"
 version = "0.2.0"
-source = "git+https://github.com/darrenintr/metal2vulkan?rev=d9ca53ccaaf378f18e703c63630b1ae6d11432b8#d9ca53ccaaf378f18e703c63630b1ae6d11432b8"
+source = "git+https://github.com/darrenintr/metal2vulkan?rev=6d6f5d92326361562ac5d482eb017f41d80c82d9#6d6f5d92326361562ac5d482eb017f41d80c82d9"
 dependencies = [
  "sha2",
 ]
@@ -240,7 +240,7 @@ dependencies = [
 [[package]]
 name = "metal2vulkan-runtime"
 version = "0.2.0"
-source = "git+https://github.com/darrenintr/metal2vulkan?rev=d9ca53ccaaf378f18e703c63630b1ae6d11432b8#d9ca53ccaaf378f18e703c63630b1ae6d11432b8"
+source = "git+https://github.com/darrenintr/metal2vulkan?rev=6d6f5d92326361562ac5d482eb017f41d80c82d9#6d6f5d92326361562ac5d482eb017f41d80c82d9"
 dependencies = [
  "ash",
  "libc",
@@ -483,6 +483,7 @@ dependencies = [
  "parking_lot",
  "reims-vgpu",
  "reims-vgpu-core",
+ "tikv-jemallocator",
 ]
 
 [[package]]
@@ -692,6 +693,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tikv-jemalloc-sys"
+version = "0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a2825c78386b4ae0314074867860ba9577875de945f05992c38815cbec327f0"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "249f09e49ab1609436f34c776e84231bead18d6a955f119f939bdc1d847561bd"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]

@@ -18,24 +18,39 @@
 //! **Events.** Every mouse, scroll and key event the view receives goes to the window's
 //! [`InputState`] with a [`ViewContext`]: the event's point in the view (a mouse or scroll event),
 //! the image's rectangle, the guest's mode and whether the window is key. A reaction that changed
-//! the capture refreshes the title and the cursor; one that passes the event on sends it to
-//! `super`, down AppKit's responder chain. The click that makes the window key is AppKit's alone
-//! (`acceptsFirstMouse:` is NO). A tracking area gives the view the pointer's moves while its
-//! window is key.
+//! the capture refreshes the title, the cursor and the pointer's hold; one that passes the event on
+//! sends it to `super`, down AppKit's responder chain. The click that makes the window key is
+//! AppKit's alone (`acceptsFirstMouse:` is NO). A tracking area gives the view the pointer's moves
+//! while its window is key.
 //!
 //! **The cursor.** A cursor rectangle over the image shows the guest's cursor
 //! ([`CursorCache`]), sized as the image shows it; the bars and the title bar keep the host's
 //! arrow. The rectangle is set again when the glyph, its visibility, the layout or the capture
 //! changes.
+//!
+//! **The pointer's hold.** While the input is captured, the window holds the host's pointer over
+//! the image ([`InputState::pointer_confinement`]): NSWindow's `mouseConfinementRect`, the image's
+//! rectangle in the window's coordinates, set again whenever the capture or the layout changes,
+//! and freed (`NSZeroRect`) when capture ends and as the window closes. AppKit has had the
+//! property since macOS 10.13.2 and leaves it out of its headers; SDL3 holds its windows' pointers
+//! with it (read from SDL 3.4.18's code), so SDL's window on macOS gets the same hold through
+//! SDL's mouse rect (`crate::sdl::shell`). Where a window does not answer it, the pointer stays
+//! free, and one line says so. Measured on the M3 Max, macOS 27.0.1 (26A434): NSWindow answers
+//! it; a pointer warped (`CGWarpMouseCursorPosition`) or moved by events posted at the HID event
+//! tap lands outside the rectangle, so only a person's own mouse shows the hold (the manual walk,
+//! `scripts/walk_window_macos.sh`).
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::{
+    AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
+};
 use objc2_app_kit::{
-    NSEvent, NSEventType, NSResponder, NSTrackingArea, NSTrackingAreaOptions, NSView,
+    NSEvent, NSEventType, NSResponder, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow,
     NSWindowOcclusionState,
 };
 use objc2_core_foundation::CGFloat;
@@ -47,7 +62,7 @@ use reims_vgpu_metal::msg;
 
 use super::cursor::CursorCache;
 use super::input::{InputState, Reaction, ViewContext};
-use super::main_thread::{ns_text, shared_app};
+use super::main_thread::{ns_text, responds, shared_app};
 use super::render::{LayerRef, configure_layer};
 use crate::geometry::{self, Insets, Layout, Rect};
 use crate::handle::Window;
@@ -392,6 +407,11 @@ impl DisplayView {
             );
             self.invalidate_cursor();
         }
+        // The image's rectangle in the window's coordinates moves with the window's height, which
+        // a layout in the view's flipped points may not show.
+        if self.is_captured() {
+            self.confine_pointer();
+        }
         ivars.window.surface().set_layout(layout);
     }
 
@@ -515,18 +535,38 @@ impl DisplayView {
         self.react(reaction)
     }
 
-    /// Acts on the input's reaction: a changed capture refreshes the title and the cursor. True
-    /// when the event goes on to `super`.
+    /// Acts on the input's reaction: a changed capture refreshes the title, the cursor and the
+    /// pointer's hold. True when the event goes on to `super`.
     fn react(&self, reaction: Reaction) -> bool {
         if reaction.capture_changed {
             self.refresh_title();
             self.invalidate_cursor();
+            self.confine_pointer();
         }
         reaction.pass_on
     }
 
-    /// Runs `f` on the input and refreshes the title and cursor when the capture changed under
-    /// it.
+    /// Holds the host's pointer over the image while the input is captured, and frees it when
+    /// not (module doc).
+    fn confine_pointer(&self) {
+        let Ok(input) = self.ivars().input.try_borrow() else {
+            return;
+        };
+        let held = input.pointer_confinement(self.ivars().layout.get().image);
+        drop(input);
+        let Some(window) = msg::get("window", || self.window()) else {
+            return;
+        };
+        let rect = held.map_or(NSRect::ZERO, |image| {
+            msg::get("convertRect:toView:", || {
+                self.convertRect_toView(ns_rect(image), None)
+            })
+        });
+        set_mouse_confinement(&window, rect);
+    }
+
+    /// Runs `f` on the input and refreshes the title, the cursor and the pointer's hold when the
+    /// capture changed under it.
     fn with_input<R>(&self, f: impl FnOnce(&mut InputState) -> R) -> Option<R> {
         let (result, changed) = {
             let mut input = self.ivars().input.try_borrow_mut().ok()?;
@@ -595,7 +635,7 @@ impl DisplayView {
         self.react(reaction);
     }
 
-    /// Whether the window's input has the keyboard captured.
+    /// Whether the window's input, the keyboard and the pointer, is captured.
     pub(crate) fn is_captured(&self) -> bool {
         self.ivars()
             .input
@@ -603,11 +643,13 @@ impl DisplayView {
             .is_ok_and(|input| input.is_captured())
     }
 
-    /// The window is closing, or about to: every key held goes up, and capture ends.
+    /// The window is closing, or about to: every key held goes up, capture ends, and the pointer
+    /// goes free.
     pub(crate) fn window_closing(&self) {
         if let Ok(mut input) = self.ivars().input.try_borrow_mut() {
             input.window_closing();
         }
+        self.confine_pointer();
     }
 
     /// The person closed the window or chose Quit: the input lets go, and the host is told,
@@ -647,6 +689,28 @@ fn new_layer(
     let layer = msg::get("new", CAMetalLayer::new);
     configure_layer(&layer, device, framebuffer_only);
     layer
+}
+
+/// Whether a window not answering `mouseConfinementRect` was logged: it is said once.
+static NO_HOLD_SAID: AtomicBool = AtomicBool::new(false);
+
+/// Holds the pointer in `rect`, in `window`'s coordinates, or frees it for `NSRect::ZERO`: the
+/// window's `mouseConfinementRect` (module doc). Where the window does not answer it, the pointer
+/// stays free, and one line says so.
+fn set_mouse_confinement(window: &NSWindow, rect: NSRect) {
+    if !responds(window, sel!(setMouseConfinementRect:)) {
+        if rect != NSRect::ZERO && !NO_HOLD_SAID.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "the pointer is not held over the image while input is captured: NSWindow has \
+                 no mouseConfinementRect"
+            );
+        }
+        return;
+    }
+    // SAFETY: `setMouseConfinementRect:` takes an NSRect and returns nothing.
+    msg::get("setMouseConfinementRect:", || unsafe {
+        let _: () = msg_send![window, setMouseConfinementRect: rect];
+    });
 }
 
 /// `rect` as an NSRect in the flipped view's points.

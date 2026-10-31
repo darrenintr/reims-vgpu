@@ -1,14 +1,19 @@
-//! Keyboard capture: whether the guest or the host gets a key.
+//! Input capture: whether the guest or the host gets a key, and where the host's pointer may go.
 //!
-//! A click into the image captures the keyboard: from then on every key goes to the guest, ⌘
-//! shortcuts included (and the host's system keys, which the AppKit side turns off while
-//! captured). Pressing ⌃⌥⌘ together releases it, and so does the window losing the keyboard.
-//! Uncaptured, a key with ⌘ held drives the host's menu and every other key goes to the guest.
+//! A click into the image captures the keyboard and the pointer together: from then on every key
+//! goes to the guest, ⌘ shortcuts included (and the host's system keys, which the AppKit side
+//! turns off while captured), and the host's pointer is held over the image
+//! ([`Capture::pointer_confinement`]): it cannot leave for the title bar or the host's other
+//! windows, and every click is the guest's. The keyboard is never captured without the pointer,
+//! nor the pointer without the keyboard. Pressing ⌃⌥⌘ together releases both, and so does the
+//! window losing the keyboard. Uncaptured, a key with ⌘ held drives the host's menu and every
+//! other key goes to the guest, and the pointer goes where the person moves it.
 //!
 //! The click that makes the window key only brings it forward: the view does not take a first
 //! click (`acceptsFirstMouse:`), so that click neither captures nor reaches the guest. Clicks
 //! after it capture, and are sent to the guest.
 
+use crate::geometry::Rect;
 use crate::keys::Modifiers;
 
 /// What to do with a click into the image.
@@ -27,7 +32,7 @@ pub enum Route {
     Host,
 }
 
-/// Whether the keyboard is captured.
+/// Whether input, the keyboard and the pointer, is captured.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Capture {
     /// Captured.
@@ -38,20 +43,23 @@ pub struct Capture {
 const CAPTURED_SUFFIX: &str =
     " \u{2014} input captured (press \u{2303}\u{2325}\u{2318} to release)";
 
+/// What the title says while not captured, on every OS: that a click captures.
+pub(crate) const UNCAPTURED_SUFFIX: &str = " \u{2014} click to capture input";
+
 impl Capture {
     /// Not captured.
     pub fn new() -> Capture {
         Capture::default()
     }
 
-    /// Whether the keyboard is captured.
+    /// Whether input, the keyboard and the pointer, is captured.
     pub fn is_captured(&self) -> bool {
         self.captured
     }
 
-    /// A click landed in the image: the keyboard is captured. `window_was_key` is whether the
-    /// window already had the keyboard before the click; a click that made it key, where one
-    /// reaches the input, is not forwarded.
+    /// A click landed in the image: the keyboard and the pointer are captured. `window_was_key`
+    /// is whether the window already had the keyboard before the click; a click that made it
+    /// key, where one reaches the input, is not forwarded.
     pub fn click_in_image(&mut self, window_was_key: bool) -> ClickAction {
         self.captured = true;
         ClickAction {
@@ -59,7 +67,7 @@ impl Capture {
         }
     }
 
-    /// Releases the keyboard. Whether it was captured.
+    /// Releases the keyboard and the pointer. Whether they were captured.
     pub fn release(&mut self) -> bool {
         std::mem::replace(&mut self.captured, false)
     }
@@ -68,6 +76,14 @@ impl Capture {
     /// host's system keys are given back.
     pub fn resign_key(&mut self) -> bool {
         self.release()
+    }
+
+    /// Where the host's pointer is held, `image` the image's rectangle in the window's points:
+    /// over the image while captured, where it has an area. `None` while not captured, and over
+    /// an image of no area, which would hold the pointer still: the pointer then goes where the
+    /// person moves it.
+    pub fn pointer_confinement(&self, image: Rect) -> Option<Rect> {
+        (self.captured && image.width > 0.0 && image.height > 0.0).then_some(image)
     }
 
     /// Who a key goes to, `command_held` whether ⌘ is down: the guest while captured; the host
@@ -88,9 +104,13 @@ impl Capture {
     }
 
     /// The text the window's title ends with: what capture is on and how to release it while
-    /// captured, and nothing while not.
+    /// captured, and that a click captures while not.
     pub fn title_suffix(&self) -> &'static str {
-        if self.captured { CAPTURED_SUFFIX } else { "" }
+        if self.captured {
+            CAPTURED_SUFFIX
+        } else {
+            UNCAPTURED_SUFFIX
+        }
     }
 }
 
@@ -184,15 +204,52 @@ mod tests {
         assert!(!capture.resign_key());
     }
 
-    /// The title says so while captured, and how to release
+    /// Captured, the pointer is held over the image; released, by the chord or by losing the
+    /// keyboard, it is free; an image of no area holds nothing
     #[test]
-    fn the_title_says_when_captured() {
+    fn captured_input_holds_the_pointer_over_the_image() {
+        let image = Rect {
+            x: 100.0,
+            y: 50.5,
+            width: 960.0,
+            height: 600.0,
+        };
         let mut capture = Capture::new();
-        assert_eq!(capture.title_suffix(), "");
+        assert_eq!(capture.pointer_confinement(image), None);
+        capture.click_in_image(false);
+        assert_eq!(capture.pointer_confinement(image), Some(image));
+        for empty in [
+            Rect::default(),
+            Rect {
+                width: 0.0,
+                ..image
+            },
+            Rect {
+                height: 0.0,
+                ..image
+            },
+        ] {
+            assert_eq!(capture.pointer_confinement(empty), None, "{empty:?}");
+        }
+        capture.release();
+        assert_eq!(capture.pointer_confinement(image), None);
+        capture.click_in_image(true);
+        capture.resign_key();
+        assert_eq!(capture.pointer_confinement(image), None);
+    }
+
+    /// The title says a click captures while not captured, and how to release while captured
+    #[test]
+    fn the_title_says_whether_input_is_captured() {
+        let mut capture = Capture::new();
+        assert_eq!(capture.title_suffix(), " \u{2014} click to capture input");
         capture.click_in_image(true);
         assert!(capture.title_suffix().contains("captured"));
         assert!(capture.title_suffix().contains("\u{2303}\u{2325}\u{2318}"));
         capture.release();
-        assert_eq!(capture.title_suffix(), "");
+        assert_eq!(capture.title_suffix(), UNCAPTURED_SUFFIX);
+        capture.click_in_image(false);
+        capture.resign_key();
+        assert_eq!(capture.title_suffix(), UNCAPTURED_SUFFIX);
     }
 }

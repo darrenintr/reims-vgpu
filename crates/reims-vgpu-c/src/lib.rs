@@ -41,6 +41,22 @@ mod table;
 
 pub use status::RvgStatus;
 
+/// The library's allocator on the targets that ship, x86-64 Linux and arm64 macOS: jemalloc, for
+/// every Rust allocation in the library, metal2vulkan's runtime's among them. FIFO 1's commands
+/// allocate memory that the runtime's threads free, and glibc's allocator refills its arena for
+/// each such block on the allocating thread (measured on ms01's Iris Xe with jemalloc preloaded
+/// into all of QEMU, not this build: a drag at 36 frames/s under glibc, 42 under jemalloc). Its
+/// symbols are prefixed (`_rjem_`), so the host's C code and the drivers keep the system's
+/// `malloc`, and no block crosses between the two: the one block the host is handed,
+/// [`device::rvg_bytes_free`]'s, goes back through that function, and the bytes the library gives
+/// Metal to free are `malloc`'s own.
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[cfg(all(target_os = "linux", not(feature = "vulkan")))]
 compile_error!("on Linux, reims-vgpu-c builds only with the `vulkan` feature (VulkanPlatform)");
 

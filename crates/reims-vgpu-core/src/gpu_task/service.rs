@@ -242,6 +242,11 @@ impl<P: Platform> GpuTask<P> {
 
     /// Completes the host's async token `token_id` with `success`.
     pub(super) fn complete_token(&self, token_id: u64, success: u32, error: Option<NsErrorText>) {
+        // exec-complete: task, service completion token, status.
+        crate::trace::event(
+            "exec-complete",
+            &[u64::from(self.id()), token_id, u64::from(success)],
+        );
         self.send_host(ToHost::CompleteAsyncToken {
             token_id,
             success,

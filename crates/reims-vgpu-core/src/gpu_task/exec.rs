@@ -171,6 +171,18 @@ impl<P: Platform> GpuTask<P> {
         gpu_completion: u64,
         reply: &Reply<(u32, Option<Vec<u8>>, u32)>,
     ) {
+        // exec-received: task, FIFO, service completion token, event value, resources, buffers.
+        crate::trace::event(
+            "exec-received",
+            &[
+                u64::from(self.id()),
+                u64::from(stamp_index),
+                gpu_completion,
+                fifo_event_value_in,
+                u64::from(resource_count),
+                u64::from(cmd_buffer_count),
+            ],
+        );
         let _lock = self.task_lock(Access::Shared);
         if let Err(t) = self.ensure_object_list_mapped(hold) {
             log::warn!("task {}: exec refused: {}", self.id(), exception(&t));
@@ -200,6 +212,8 @@ impl<P: Platform> GpuTask<P> {
         let wait_value = fifo_event_value_in;
         let signaled_value = signaled.load(Ordering::SeqCst);
         let mut shared_texture_backing_ids: Vec<u32> = Vec::new();
+        let mut command_buffer_present = false;
+        let mut paging_out_required = false;
         let executed = (|| -> RaiseResult<_> {
             let prepare_event = if wait_value == 0 || wait_value == signaled_value {
                 None
@@ -218,6 +232,7 @@ impl<P: Platform> GpuTask<P> {
                 Some(q) => q.command_buffer(OnFault::Return)?,
                 None => None,
             };
+            command_buffer_present = command_buffer.is_some();
             if sync.needs_sync {
                 let paging_event = &self.core().paging_event;
                 if paging_event.is_none() {
@@ -240,6 +255,7 @@ impl<P: Platform> GpuTask<P> {
                 deserializer.decode_segments(hold, &mut cursors, command_buffer.as_ref())?;
             let this = Arc::clone(self);
             let needs_complete = sync.needs_complete;
+            paging_out_required = sync.needs_complete;
             // The completion runs as the task's code, and not at all once the task has ended.
             let completed: CompletedHandler = self.carry(move |buffer: CompletedInfo| {
                 this.exec_completed(buffer, needs_complete, gpu_completion);
@@ -273,10 +289,33 @@ impl<P: Platform> GpuTask<P> {
         })();
         if let Err(t) = executed {
             log::warn!("task {}: exec faulted: {}", self.id(), exception(&t));
+            // exec-refused: task, FIFO, service completion token, status 2.
+            crate::trace::event(
+                "exec-refused",
+                &[
+                    u64::from(self.id()),
+                    u64::from(stamp_index),
+                    gpu_completion,
+                    2,
+                ],
+            );
             reply.call((2, None, 0));
             hold.land(t);
             return;
         }
+        // exec-scheduled: task, FIFO, token, scheduled event value, command-buffer present,
+        // paging-out required.
+        crate::trace::event(
+            "exec-scheduled",
+            &[
+                u64::from(self.id()),
+                u64::from(stamp_index),
+                gpu_completion,
+                fifo_event_value_in.wrapping_add(1),
+                u64::from(command_buffer_present),
+                u64::from(paging_out_required),
+            ],
+        );
         let count = shared_texture_backing_ids.len().low_u32();
         let backing_ids = (count != 0).then(|| {
             shared_texture_backing_ids
