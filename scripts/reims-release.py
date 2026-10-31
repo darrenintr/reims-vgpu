@@ -26,15 +26,50 @@ ROOT = DATA / "qemu"
 STATE = DATA / "release-manager.json"
 
 def fetch(url):
-    request = urllib.request.Request(url, headers={
+    headers = {
         "User-Agent": "reims-vgpu-release-manager/1",
         "Accept": "application/vnd.github+json" if url.startswith(API) else "application/octet-stream",
-    })
+    }
+    # Never send a GitHub token to browser_download_url or its redirects.
+    if url.startswith("https://api.github.com/"):
+        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=60) as response:
         return response.read()
 
+def release_index():
+    """Prefer the authenticated GitHub CLI to avoid the anonymous 60/hour IP limit.
+
+    The CLI uses its existing credential store; no token is printed, persisted
+    by this script or passed to asset-download redirects.
+    """
+    if shutil.which("gh"):
+        try:
+            result = subprocess.run(
+                ["gh", "api", f"repos/{REPO}/releases?per_page=100"],
+                check=True, capture_output=True, text=True, timeout=40,
+            )
+            return json.loads(result.stdout)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
+            # GitHub CLI may be installed but not logged in. A GH_TOKEN,
+            # GITHUB_TOKEN, or unauthed API request can still work.
+            pass
+    try:
+        return json.loads(fetch(API + "?per_page=100"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (403, 429):
+            raise RuntimeError(
+                "GitHub API rate limited (HTTP 403/429). Log in with "
+                "`gh auth login` and retry; the downloader will use "
+                "authenticated `gh api` automatically. Alternatively set "
+                "GH_TOKEN or wait for GitHub's rate-limit reset."
+            ) from exc
+        raise
+
 def fetch_releases(channel):
-    items = json.loads(fetch(API + "?per_page=100"))
+    items = release_index()
     for release in items:
         if release.get("draft"):
             continue
