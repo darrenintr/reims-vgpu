@@ -97,6 +97,15 @@ class ReleasePickerTests(unittest.TestCase):
         unknown = release.describe_release(row("exp-abc-2-abcdef123456", ""))
         self.assertIn("未分类", unknown["test_label"])
 
+    def test_native_v3_stable_and_portable_rollback_labels(self):
+        stable = row("v0.1.1", "2026-10-31T08:06:26Z")
+        rollback = row("v0.1.0", "2026-10-31T04:34:40Z")
+        self.assertIn("需 x86-64-v3", stable["test_label"])
+        self.assertIn("Native-v3", stable["test_label"])
+        self.assertIn("回滚", rollback["test_label"])
+        selected = release.curated_releases([rollback, stable])
+        self.assertEqual(selected[0]["tag"], "v0.1.1")
+
     def test_safe_tag_blocks_paths(self):
         for bad in ("", "../escape", "a/b", "a b"):
             with self.subTest(bad=bad), self.assertRaises(RuntimeError):
