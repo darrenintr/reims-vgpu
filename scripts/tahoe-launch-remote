@@ -178,12 +178,19 @@ case "$MODE" in
     export REIMS_CTL_SESSION_STATS=0
     export REIMS_CTL_SESSION_LOG=warn ;;
   fps)
+    # Older stable builds also inherit this variable from reims-ctl's process.
+    export REIMS_VGPU_STATS=1
     export REIMS_CTL_SESSION_STATS=1
     export REIMS_CTL_SESSION_LOG=warn ;;
   gpu)
+    export REIMS_VGPU_STATS=1
     export REIMS_CTL_SESSION_STATS=1
     export REIMS_CTL_SESSION_LOG='warn,reims_vgpu_vulkan::gpu::timing=debug'
-    export M2V_SCHED_STATS=1 ;;
+    export M2V_SCHED_STATS=1
+    case "$TAG" in
+      exp-*) ;;
+      *) notify 'GPU Timing compatibility' 'Older releases can show FPS; detailed timing requires a new experiment build.' ;;
+    esac ;;
   *) exit 0 ;;
 esac
 {
