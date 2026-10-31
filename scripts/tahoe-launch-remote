@@ -47,7 +47,7 @@ dialog_question() {
 
 show_test_guide() {
   local message
-  message=$'推荐顺序：\n1. Stable v0.1.1：Native-v3，现行性能基准。\n2. native-v3-fat-lto：在基准上叠加 Fat-LTO，测相同操作的帧率及间隔。\n3. Fat-LTO 单独版：历史比较用，不等同于组合版。\n4. qemu-thp：发布後验证 QEMU 大页内存优化。\n5. profiler：只用来诊断卡顿，不用于性能排名。\n\n每版保持相同 VM 磁盘状态、CPU 绑定和分辨率；先测 Finder 拖窗 30 秒，再测 Safari 滚动 30 秒、Launchpad 动画 10 次。\n启用 FPS 监控，记录 guest/window FPS 与 max gap；空闲时的 0 FPS 不代表卡顿。日志中的 max gap 不等于 p95/p99，需要更细粒度仪器才能统计。'
+  message=$'推荐顺序：\n1. Stable v0.1.2：Native-v3 + Fat-LTO，新的性能基准。\n2. QEMU THP：发布后在相同编译配置下测试内存大页优化。\n3. QEMU USB 安全修复：检查稳定性及兼容性。\n4. GPU FIFO / Dirty-page：未来独立性能实验。\n5. Profiler：仅用于诊断卡顿，不用于性能排名。\n\n旧版 Native-v3 和 Fat-LTO 独立构建已经归入历史版本。\n\n每版保持相同 VM 磁盘状态、CPU 绑定和分辨率；先测 Finder 拖窗 30 秒，再测 Safari 滚动 30 秒、Launchpad 动画 10 次。\n启用 FPS 监控，记录 guest/window FPS 与 max gap；空闲时的 0 FPS 不代表卡顿。日志中的 max gap 不等于 p95/p99，需要更细粒度仪器才能统计。'
   if command -v kdialog >/dev/null; then
     kdialog --title 'macOS Tahoe · 测试说明' --msgbox "$message"
   elif command -v zenity >/dev/null; then
@@ -129,12 +129,13 @@ choose_release() {
 
 test_goal_for_tag() {
   case $1 in
-    v0.1.1) printf '%s\n' '最新 Stable：Native-v3 编译基线（CPU 需支持 x86-64-v3），对比帧时间与卡顿' ;;
-    v0.1.0) printf '%s\n' '原 Stable：通用回滚版本，跟 v0.1.1 比较体验' ;;
+    v0.1.2) printf '%s\n' '最新 Stable：Native-v3 + Fat-LTO，需支持 x86-64-v3；新的性能比较基线' ;;
+    v0.1.1) printf '%s\n' '上一个 Stable：仅 Native-v3，性能回归时可回滚' ;;
+    v0.1.0) printf '%s\n' '原 Stable：通用 x86-64 回滚版本' ;;
     v*) printf '%s\n' 'Stable：按同样场景测量 Finder / Safari / Launchpad 的帧时间' ;;
     testing-14-*) printf '%s\n' '兼容性对照：与 Stable GPU 核心相同，检查启动器及现有顺畅度' ;;
     testing-*) printf '%s\n' 'Testing：先查 Release 变更，再做相同场景性能及回归测试' ;;
-    exp-native-v3-fat-lto-*) printf '%s\n' '组合候选：Native-v3 + Fat-LTO + 单代码生成单元，直接对照 v0.1.1' ;;
+    exp-native-v3-fat-lto-*) printf '%s\n' 'Native-v3 + Fat-LTO：首个组合实验已提升为 Stable v0.1.2，其他版本按发行说明测试' ;;
     exp-native-v3-*) printf '%s\n' 'CPU ISA：仅比较 x86-64-v3 代码生成的性能影响' ;;
     exp-fat-lto-*) printf '%s\n' 'LTO：仅比较 Fat LTO 编译优化的性能影响' ;;
     exp-profiler-*) printf '%s\n' 'Profiler：定位卡顿，不用于性能排名' ;;
