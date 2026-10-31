@@ -103,6 +103,21 @@ pub fn invocation(vm: &Vm, ctx: &Ctx) -> Result<Invocation> {
         unset.retain(|u| u != k);
         env.push((k.clone(), v.clone()));
     }
+    // The desktop launcher may request diagnostics for this *one boot*.
+    // Apply after saved settings; do not rewrite the VM config, so a debug
+    // session cannot accidentally leave logging enabled on future boots.
+    for (request, key) in [
+        ("REIMS_CTL_SESSION_STATS", "REIMS_VGPU_STATS"),
+        ("REIMS_CTL_SESSION_LOG", "REIMS_VGPU_LOG"),
+    ] {
+        if let Ok(value) = std::env::var(request) {
+            if value.len() <= 512 && !value.contains(['\n', '\r', '\0']) {
+                env.retain(|(ek, _)| ek != key);
+                unset.retain(|u| u != key);
+                env.push((key.into(), value));
+            }
+        }
+    }
     Ok(Invocation {
         program: ctx.qemu.clone(),
         args: a,
