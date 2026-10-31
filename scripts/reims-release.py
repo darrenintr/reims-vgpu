@@ -84,6 +84,10 @@ def channel_for(release):
 # Experimental releases are produced by a matrix job; their older run numbers
 # remain available in history but should not crowd the daily testing menu.
 EXPERIMENTS = {
+    "native-v3-fat-lto": (
+        "【组合优化 · 下一候选】 Native-v3 + Fat-LTO",
+        "同时启用 x86-64-v3 指令集、Fat LTO 和单代码生成单元；对照 Stable v0.1.1，测持续操作和帧时间。",
+    ),
     "qemu-thp": (
         "【QEMU 上游】 2 MiB 大页内存对齐",
         "对比 QEMU memfd/THP 相关延迟；需核对宿主机 THP 设置和 KVM 映射。",
@@ -162,9 +166,9 @@ def curated_releases(rows):
         if key not in newest:
             newest[key] = row
     priority = (
-        "stable", "testing", "experimental:qemu-thp",
-        "experimental:native-v3", "experimental:fat-lto",
-        "experimental:profiler",
+        "stable", "testing", "experimental:native-v3-fat-lto",
+        "experimental:qemu-thp", "experimental:native-v3",
+        "experimental:fat-lto", "experimental:profiler",
     )
     ordered = [newest[k] for k in priority if k in newest]
     ordered.extend(newest[k] for k in sorted(newest) if k not in priority)
