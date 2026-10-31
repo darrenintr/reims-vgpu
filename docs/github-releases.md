@@ -42,3 +42,4 @@ The archive checksum verifies transfer integrity, not independent signing: the m
 Builds on GitHub runners cannot validate performance, display correctness, or a macOS Tahoe boot on an RX 7600. Ubuntu 26.10 requires an actual host smoke test. Host dependencies (Vulkan/RADV, `/dev/kvm`, `/dev/udmabuf` permissions, OVMF/OpenCore and QEMU dynamic libraries) are still required.
 
 The upstream shader-cache and GPU-buffer enhancements are **not included** in this distribution-only branch. They must be ported, tested, and pinned in `Cargo.toml` and `Cargo.lock` before a testing release can claim to include them.
+This integration also includes the tested local Tahoe changes up to 26231fa7 and preserves the two unpublished QEMU EFI/AppleSMC fixes via the darrenintr/qemu-reims-vgpu fork, branch reims-local-applesmc-efi. Linux CI explicitly enables libusb, retaining the host USB pass-through used locally.

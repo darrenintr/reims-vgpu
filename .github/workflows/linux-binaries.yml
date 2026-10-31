@@ -53,7 +53,7 @@ jobs:
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
             libxfixes-dev libxss-dev libxtst-dev libxkbcommon-dev \
             libwayland-dev libwayland-bin libdecor-0-dev \
-            libegl-dev libgl-dev libdrm-dev libgbm-dev libdbus-1-dev libudev-dev
+            libegl-dev libgl-dev libdrm-dev libgbm-dev libdbus-1-dev libudev-dev libusb-1.0-0-dev
 
       - name: Fetch pinned QEMU
         run: |
@@ -77,7 +77,7 @@ jobs:
             "$GITHUB_WORKSPACE/vendor/qemu/configure" \
               --prefix=/reims-ctl-qemu \
               --target-list=x86_64-softmmu \
-              --enable-kvm --disable-sdl --disable-gtk --enable-slirp \
+              --enable-kvm --disable-sdl --disable-gtk --enable-slirp --enable-libusb \
               --enable-pvg --disable-docs --disable-tests --disable-werror
           ninja -j2
           DESTDIR="$RUNNER_TEMP/reims-qemu-stage" ninja install
