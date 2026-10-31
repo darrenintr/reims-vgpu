@@ -85,12 +85,12 @@ def channel_for(release):
 # remain available in history but should not crowd the daily testing menu.
 EXPERIMENTS = {
     "native-v3-fat-lto": (
-        "【组合优化 · 下一候选】 Native-v3 + Fat-LTO",
-        "同时启用 x86-64-v3 指令集、Fat LTO 和单代码生成单元；对照 Stable v0.1.1，测持续操作和帧时间。",
+        "【组合优化 · 新实验】 Native-v3 + Fat-LTO",
+        "v0.1.2 已包含两项编译优化；此选项仅用于将来有额外代码更改的新实验。",
     ),
     "qemu-thp": (
-        "【QEMU 上游】 2 MiB 大页内存对齐",
-        "对比 QEMU memfd/THP 相关延迟；需核对宿主机 THP 设置和 KVM 映射。",
+        "【下一项性能测试】 Stable v0.1.2 + QEMU THP（2 MiB）",
+        "唯一的核心变化是 QEMU memfd 大页对齐；测试帧间隔并检查 shmem THP/KVM 映射是否生效。",
     ),
     "native-v3": (
         "【CPU 指令集】 x86-64-v3 编译",
@@ -459,7 +459,7 @@ def fetch_releases(channel=None, tag=None):
     raise RuntimeError(f"No downloadable GitHub Release for {tag or channel}")
 
 def safe_tag(tag):
-    if not tag or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._" for c in tag):
+    if not tag or tag in (".", "..") or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._" for c in tag):
         raise RuntimeError("Unexpected release tag")
     return tag
 
