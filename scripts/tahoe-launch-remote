@@ -62,6 +62,8 @@ choose_release_page() {
   local -a choices=()
   if [[ $page == curated ]]; then
     data=$("$RELEASE_MANAGER" --list --curated --json 2>>"$LOG") || return 1
+  elif [[ $page == diagnostics ]]; then
+    data=$("$RELEASE_MANAGER" --list --diagnostics --json 2>>"$LOG") || return 1
   else
     data=$("$RELEASE_MANAGER" --list --json 2>>"$LOG") || return 1
   fi
@@ -84,19 +86,26 @@ for r in releases:
 ' 2>>"$LOG"
   )
   ((${#choices[@]})) || return 1
+  local prompt
   if [[ $page == curated ]]; then
     choices+=('__guide__' '【测试说明】 推荐顺序、场景与记录指标')
-    choices+=('__history__' '【历史版本】 展开旧版、重复构建与回滚版本')
+    choices+=('__diagnostics__' '【诊断工具】 FPS Profiler / 卡顿排查')
+    choices+=('__history__' '【历史及回滚】 查看全部已发布版本')
+    choices+=('__cleanup__' '【清理本机缓存】 预览并移除过期下载版本（不删除 GitHub Release）')
+    local chosen
+    chosen=$(readlink -f "$QEMU_ROOT/current" 2>/dev/null || true)
+    prompt="请选择本次测试的目标（本机安装已选：${chosen##*/}；旧版请查看历史）："
   else
     choices=('__back__' '【返回】 最新推荐测试版本' "${choices[@]}")
+    prompt='请选择历史版本或诊断版本（旧版不会自动删除）：'
   fi
   if command -v kdialog >/dev/null; then
     kdialog --title 'macOS Tahoe · 测试版本' --menu \
-      '请选择本次测试的目标（默认隐藏过时的构建）：' "${choices[@]}" 2>/dev/null
+      "$prompt" "${choices[@]}" 2>/dev/null
   elif command -v zenity >/dev/null; then
     printf '%s\n' "${choices[@]}" | paste -d '\t' - - |
       zenity --list --title='macOS Tahoe · 测试版本' \
-        --text='请选择本次测试的目标' --column='Tag' --column='Description' \
+        --text="$prompt" --column='Tag' --column='Description' \
         --hide-column=1 --print-column=1 2>/dev/null
   elif [[ -t 0 ]]; then
     local i answer idx
@@ -114,14 +123,79 @@ for r in releases:
   fi
 }
 
+show_cleanup_dialog() {
+  if running; then
+    notify -u critical '无法清理' '请先关闭 macOS Tahoe 虚拟机'
+    return 1
+  fi
+  local preview summary plan result
+  preview=$("$RELEASE_MANAGER" --cleanup-preview --json 2>>"$LOG") || {
+    notify -u critical '无法预览清理列表' "检查网络与 $LOG"
+    return 1
+  }
+  summary=$(printf '%s' "$preview" | python3 -c '
+import json, sys
+p = json.load(sys.stdin)
+items = p.get("candidates", [])
+if not items:
+    print("没有需要清理的旧版安装。当前 Stable、诊断工具和选中版本均已保护。")
+else:
+    print("只移除以下本机已下载的旧版，不影响 VM 数据或 GitHub Release：\n")
+    for i in items:
+        print(f"• {i["tag"]}: {i["bytes"]/1048576:.1f} MiB")
+    print(f"\n预计释放约 {p["total_bytes"]/1048576:.1f} MiB。")
+    print("\nStable、当前选择的版本、最新实验及 Profiler 均不会删除。")
+    print("执行前会再次检查是否有 QEMU 运行，以及清理列表是否改变。")
+') || return 1
+  plan=$(printf '%s' "$preview" | python3 -c '
+import json,sys
+p=json.load(sys.stdin)
+if p.get("candidates"): print(p["plan_id"])
+') || return 1
+  if [[ -z "$plan" ]]; then
+    if command -v kdialog >/dev/null; then
+      kdialog --title 'macOS Tahoe · 清理完成' --msgbox "$summary"
+    elif command -v zenity >/dev/null; then
+      zenity --info --title='macOS Tahoe · 无需清理' --text="$summary"
+    else
+      notify '无需清理' "$summary"
+    fi
+    return 0
+  fi
+  if command -v kdialog >/dev/null; then
+    kdialog --title 'macOS Tahoe · 确认清理' --yesno "$summary" 2>/dev/null || return 0
+  elif command -v zenity >/dev/null; then
+    zenity --question --title='macOS Tahoe · 确认清理' --text="$summary" 2>/dev/null || return 0
+  elif [[ -t 0 ]]; then
+    printf '%s\n' "$summary" >&2
+    local answer
+    read -r -p '输入 DELETE 才能清理：' answer
+    [[ "$answer" == DELETE ]] || return 0
+  else
+    notify -u critical '安全确认不可用' '清理缓存需要图形确认或终端输入 DELETE'
+    return 1
+  fi
+  # Never auto-confirm cleanup in a headless session.
+  result=$("$RELEASE_MANAGER" --cleanup-apply --confirm --plan-id "$plan" 2>>"$LOG") || {
+    notify -u critical '清理已取消或失败' "请查看 $LOG"
+    return 1
+  }
+  notify '已清理过期安装' "$result"
+  if command -v kdialog >/dev/null; then
+    kdialog --title 'macOS Tahoe · 缓存清理完成' --msgbox "$result"
+  fi
+}
+
 choose_release() {
   local page=curated result
   while :; do
     result=$(choose_release_page "$page") || return 1
     case $result in
       __history__) page=history ;;
+      __diagnostics__) page=diagnostics ;;
       __back__) page=curated ;;
       __guide__) show_test_guide ;;
+      __cleanup__) show_cleanup_dialog ;;
       *) printf '%s\n' "$result"; return 0 ;;
     esac
   done
