@@ -256,7 +256,7 @@ class ReleasePickerTests(unittest.TestCase):
                     release.cleanup_plan()
 
     def test_safe_tag_blocks_paths(self):
-        for bad in ("", "../escape", "a/b", "a b"):
+        for bad in ("", ".", "..", "../escape", "a/b", "a b"):
             with self.subTest(bad=bad), self.assertRaises(RuntimeError):
                 release.safe_tag(bad)
 
