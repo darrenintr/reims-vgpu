@@ -146,7 +146,10 @@ def describe_release(row):
             goal = "阅读 Release 变更后，针对变更测试功能和回归，并测帧时间。"
     else:
         variant = experiment_variant(tag)
-        if variant in EXPERIMENTS:
+        if tag == "exp-native-v3-fat-lto-1-c8838347f0e5":
+            label = "【已晋升 Stable v0.1.2】 原组合实验 · 二进制完全相同"
+            goal = "这个实验包与 Stable v0.1.2 相同，不需要重复测试；保留作历史记录。"
+        elif variant in EXPERIMENTS:
             label, goal = EXPERIMENTS[variant]
         else:
             label = f"【未分类实验】 {tag} · 请先查阅 Release 说明"
