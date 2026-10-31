@@ -1,0 +1,117 @@
+name: Promote Native-v3 to Stable v0.1.1
+
+# One-time, artifact-identical promotion. Do NOT rebuild QEMU.
+on:
+  push:
+    branches:
+      - release/promote-v0.1.1-native-v3
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    name: Verify and publish tested Native-v3 bundle
+    if: github.repository == 'darrenintr/reims-vgpu'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Verify exact Native-v3 artifact and publish without recompilation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo='darrenintr/reims-vgpu'
+          source_tag='exp-native-v3-3-e4a42df79f14'
+          stable_tag='v0.1.1'
+          source_sha='e4a42df79f1487a4f18d9ed1bad4782a3deaa05e'
+          archive_sha='d2a7edf04b5d6621e353342d94301cb9533ab10cf7e25867dc74f0833f44cb1b'
+
+          if gh api "repos/$repo/git/ref/tags/$stable_tag" > /dev/null 2>&1; then
+            echo "::error::Tag $stable_tag exists; never overwrite Stable."
+            exit 1
+          fi
+          actual_sha="$(gh api "repos/$repo/commits/$source_tag" --jq '.sha')"
+          test "$actual_sha" = "$source_sha" || {
+            echo "::error::Experiment tag moved; refusing to promote."
+            exit 1
+          }
+          conclusion="$(gh api "repos/$repo/actions/runs/41170050601/jobs?per_page=100" \
+            --jq '.jobs[] | select(.name == "Linux x86_64 / native-v3") | .conclusion')"
+          test "$conclusion" = 'success' || {
+            echo "::error::Native-v3 source GitHub Actions job was not successful."
+            exit 1
+          }
+
+          mkdir -p "$RUNNER_TEMP/reims-native-v3-stable"
+          cd "$RUNNER_TEMP/reims-native-v3-stable"
+          gh release download "$source_tag" --repo "$repo" \
+            --pattern 'reims-vgpu-linux-x86_64.tar.gz' \
+            --pattern 'SHA256SUMS' --dir .
+          test -s reims-vgpu-linux-x86_64.tar.gz
+          test -s SHA256SUMS
+          sha256sum -c SHA256SUMS
+          actual_archive_sha="$(sha256sum reims-vgpu-linux-x86_64.tar.gz | awk '{print $1}')"
+          test "$actual_archive_sha" = "$archive_sha" || {
+            echo "::error::Archive differs from verified experimental build."
+            exit 1
+          }
+
+          tar -tzf reims-vgpu-linux-x86_64.tar.gz > contents.txt
+          for required in bin/qemu-system-x86_64 bin/qemu-img bin/reims-ctl; do
+            grep -Fx "./$required" contents.txt >/dev/null ||
+              grep -Fx "$required" contents.txt >/dev/null || {
+                echo "::error::Missing $required"
+                exit 1
+              }
+          done
+          grep -F 'ReimsVgpu.rom' contents.txt >/dev/null || {
+            echo "::error::Missing ReimsVgpu.rom"
+            exit 1
+          }
+          tar -xOf reims-vgpu-linux-x86_64.tar.gz ./BUILD-INFO.txt > BUILD-INFO.txt
+          grep -Fx "reims-vgpu commit: $source_sha" BUILD-INFO.txt
+          grep -Fx 'Variant: native-v3' BUILD-INFO.txt
+          grep -Fx 'RUSTFLAGS=-C target-cpu=x86-64-v3' BUILD-INFO.txt
+
+          cat > RELEASE-NOTES.md <<'NOTES'
+          ## Reims vGPU v0.1.1 — RX 7600 / x86-64-v3 performance baseline
+
+          Promoted the exact prebuilt artifact from successful
+          [Native-v3 experiment](https://github.com/darrenintr/reims-vgpu/releases/tag/exp-native-v3-3-e4a42df79f14),
+          without recompilation, with the original SHA256SUMS.
+
+          - Source: e4a42df79f1487a4f18d9ed1bad4782a3deaa05e
+          - Build workflow: [run 41170050601](https://github.com/darrenintr/reims-vgpu/actions/runs/41170050601), Linux x86_64 / native-v3
+          - Rust build: RUSTFLAGS=-C target-cpu=x86-64-v3, release Thin LTO, 16 codegen units
+          - Pinned QEMU: d8b3a798430d70248f566a53aad2a8f732e4598b
+          - Pinned Metal2Vulkan: 6d6f5d92326361562ac5d482eb017f41d80c82d9
+
+          **CPU requirement:** x86-64-v3 or newer; tested subjectively on Ryzen 5 3600 + RX 7600.
+          This is a CPU-targeted Rust build variant, NOT a new QEMU upstream
+          patch or a Metal2Vulkan GPU fix. Systems without x86-64-v3 should stay
+          on [v0.1.0](https://github.com/darrenintr/reims-vgpu/releases/tag/v0.1.0).
+
+          The user observed a small perceived improvement. Their sampled log
+          reaches 116–120 guest FPS in short intervals but includes frame drops
+          and large frame gaps. A controlled A/B benchmark and stable 120 FPS
+          have NOT been established. Stable here means a preserved,
+          user-selected rollback baseline, not production-ready macOS rendering.
+
+          **Rollback:** v0.1.0 remains unchanged and downloadable. Testing,
+          Fat-LTO, profiler and QEMU THP experiments are NOT included.
+          NOTES
+
+          gh release create "$stable_tag" \
+            reims-vgpu-linux-x86_64.tar.gz SHA256SUMS \
+            --repo "$repo" --target "$source_sha" \
+            --title 'v0.1.1 — RX 7600 / x86-64-v3 performance baseline' \
+            --notes-file RELEASE-NOTES.md --latest
+
+          result_sha="$(gh api "repos/$repo/commits/$stable_tag" --jq '.sha')"
+          test "$result_sha" = "$source_sha"
+          gh release view "$stable_tag" --repo "$repo" \
+            --json tagName,isPrerelease,assets \
+            --jq '{tag: .tagName, prerelease: .isPrerelease, assets: [.assets[].name]}'
+          echo "Promoted exact native-v3 artifact: https://github.com/$repo/releases/tag/$stable_tag"
