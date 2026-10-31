@@ -120,6 +120,47 @@ class ReleasePickerTests(unittest.TestCase):
         selected = release.curated_releases([rollback, stable])
         self.assertEqual(selected[0]["tag"], "v0.1.1")
 
+    def test_stable_v0_1_2_archives_promoted_experiments(self):
+        rows = self.sample_rows()
+        rows.extend([
+            row("v0.1.1", "2026-10-31T08:06:26Z"),
+            row("v0.1.2", "2026-10-31T09:00:22Z"),
+            row("exp-native-v3-fat-lto-1-c8838347f0e5",
+                "2026-10-31T08:49:51Z"),
+        ])
+        selected = release.curated_releases(rows)
+        tags = [r["tag"] for r in selected]
+        self.assertEqual(tags, [
+            "v0.1.2",
+            "testing-14-e41957269871",
+            "exp-profiler-3-e4a42df79f14",
+        ])
+        latest = selected[0]
+        self.assertIn("Native-v3 + Fat-LTO", latest["test_label"])
+        self.assertIn("x86-64-v3", latest["test_label"])
+        historical = release.describe_release(
+            row("exp-native-v3-fat-lto-1-c8838347f0e5", ""))
+        self.assertIn("已晋升 Stable v0.1.2", historical["test_label"])
+
+        # A newly built stacked experiment is visible, rather than hidden
+        # because some older stacked experiment became Stable.
+        rows.append(row("exp-native-v3-fat-lto-2-abcdef123456",
+                        "2026-11-01T08:00:00Z"))
+        tags = [r["tag"] for r in release.curated_releases(rows)]
+        self.assertIn("exp-native-v3-fat-lto-2-abcdef123456", tags)
+
+    def test_selected_promoted_experiment_is_still_reachable(self):
+        rows = self.sample_rows()
+        rows.extend([
+            row("v0.1.2", "2026-10-31T09:00:22Z"),
+            row("exp-native-v3-fat-lto-1-c8838347f0e5",
+                "2026-10-31T08:49:51Z", current=True),
+        ])
+        selected = release.curated_releases(rows)
+        self.assertEqual(selected[-1]["tag"],
+                         "exp-native-v3-fat-lto-1-c8838347f0e5")
+        self.assertIn("当前选中旧版", selected[-1]["test_label"])
+
     def test_safe_tag_blocks_paths(self):
         for bad in ("", "../escape", "a/b", "a b"):
             with self.subTest(bad=bad), self.assertRaises(RuntimeError):
