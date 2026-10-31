@@ -160,45 +160,75 @@ def describe_release(row):
     return row
 
 
-def curated_releases(rows):
-    """Newest valid build per experiment, plus a selected legacy build for safety.
+# Legacy runs promoted into a stable baseline, or superseded by that baseline.
+# Only their displayed catalog status changes; GitHub Releases remain intact.
+SUPERSEDED_TAGS = {
+    "testing-12-f36b720da5d1",
+    "testing-14-e41957269871",
+    "exp-native-v3-1-2a63d397e686",
+    "exp-native-v3-3-e4a42df79f14",
+    "exp-fat-lto-1-2a63d397e686",
+    "exp-fat-lto-3-e4a42df79f14",
+    "exp-native-v3-fat-lto-1-c8838347f0e5",
+    "exp-profiler-1-2a63d397e686",
+}
 
-    'current' means the install symlink, NOT necessarily the running QEMU PID.
-    Older builds and duplicate build-matrix runs remain available via --list.
+
+def stable_version(tag):
+    found = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", tag)
+    return tuple(map(int, found.groups())) if found else (-1, -1, -1)
+
+
+def latest_stable(rows):
+    stable = [row for row in rows if row["channel"] == "stable"]
+    return max(stable, key=lambda row: stable_version(row["tag"]), default=None)
+
+
+def diagnostic_releases(rows):
+    """Keep only the newest profiler in a separate diagnostics submenu."""
+    candidates = [r for r in rows if r.get("variant") == "profiler"]
+    return sorted(candidates, key=lambda r: (r.get("published_at") or "", r["tag"]),
+                  reverse=True)[:1]
+
+
+def curated_releases(rows):
+    """Main picker: one Stable baseline and only new, actionable experiments.
+
+    Historical builds, profiling tools, and previously promoted experiments
+    live in the secondary menus even when the install symlink still selects one.
+    The current *running* binary must be checked separately from the symlink.
     """
-    newest = {}
+    ordered = []
+    stable = latest_stable(rows)
+    if stable:
+        ordered.append(stable)
+
+    # A legacy Testing-14 is not a new change on top of current Stable.
+    # A future genuinely newer Testing Release is eligible for display.
+    testing = [r for r in rows if r["channel"] == "testing"
+               and r["tag"] not in SUPERSEDED_TAGS
+               and (not stable or (r.get("published_at") or "") >
+                    (stable.get("published_at") or ""))]
+    if testing:
+        ordered.append(max(testing, key=lambda r: r.get("published_at") or ""))
+
+    newest_experiments = {}
     for row in sorted(rows, key=lambda r: r.get("published_at") or "", reverse=True):
-        key = release_group(row)
-        if key not in newest:
-            newest[key] = row
-    # Exact experimental artifacts already promoted to the current stable tag
-    # are historical builds, not extra performance variants for the main menu.
-    # Newly published experiments with different tags remain visible.
-    if newest.get("stable", {}).get("tag") == "v0.1.2":
-        promoted_history = {
-            "exp-native-v3-fat-lto-1-c8838347f0e5",
-            "exp-native-v3-3-e4a42df79f14",
-            "exp-fat-lto-3-e4a42df79f14",
-        }
-        for group, row in list(newest.items()):
-            if group.startswith("experimental:") and row["tag"] in promoted_history:
-                del newest[group]
-    priority = (
-        "stable", "testing", "experimental:native-v3-fat-lto",
-        "experimental:qemu-thp", "experimental:native-v3",
-        "experimental:fat-lto", "experimental:profiler",
-    )
-    ordered = [newest[k] for k in priority if k in newest]
-    ordered.extend(newest[k] for k in sorted(newest) if k not in priority)
-    chosen = {row["tag"] for row in ordered}
-    for row in rows:
-        if row.get("current") and row["tag"] not in chosen:
-            previous = dict(row)
-            previous["test_label"] = f"【当前选中旧版】 {row['tag']} · 建议只作回滚"
-            previous["test_goal"] = "这个安装版本不是最新候选；保留以免丢失回滚能力。"
-            ordered.append(previous)
-            chosen.add(row["tag"])
+        if row["channel"] != "experimental":
+            continue
+        if row["tag"] in SUPERSEDED_TAGS:
+            continue
+        group = release_group(row)
+        if group in ("experimental:profiler", "experimental:other"):
+            continue
+        newest_experiments.setdefault(group, row)
+
+    for group in ("experimental:qemu-thp", "experimental:native-v3-fat-lto"):
+        if group in newest_experiments:
+            ordered.append(newest_experiments.pop(group))
+    ordered.extend(newest_experiments[k] for k in sorted(newest_experiments))
     return ordered
+
 
 def valid_install(tag):
     if not tag:
@@ -267,7 +297,7 @@ def cached_records():
                   key=lambda item: (not item["current"], item["tag"]))
 
 
-def show_releases(offline=False, as_json=False, curated=False):
+def show_releases(offline=False, as_json=False, curated=False, diagnostics=False):
     if offline:
         rows = cached_records()
     else:
@@ -282,6 +312,8 @@ def show_releases(offline=False, as_json=False, curated=False):
         row["historical"] = row["tag"] not in latest_tags
     if curated:
         rows = recommended
+    elif diagnostics:
+        rows = diagnostic_releases(rows)
     if as_json:
         print(json.dumps(rows, ensure_ascii=False))
     else:
@@ -409,7 +441,9 @@ def main():
                           help="Compatibility option: newest release in this channel")
     parser.add_argument("--list", action="store_true", help="List available releases (all by default)")
     parser.add_argument("--curated", action="store_true",
-                        help="With --list, show newest stable/testing and one per experiment")
+                        help="With --list, show the latest baseline and actionable experiments")
+    parser.add_argument("--diagnostics", action="store_true",
+                        help="With --list, show the latest profiler separately")
     parser.add_argument("--json", action="store_true", help="Machine-readable --list output")
     parser.add_argument("--offline", action="store_true", help="Use only installed builds with --list")
     parser.add_argument("--no-check", action="store_true", help="Use a downloaded build without a network query")
@@ -421,7 +455,8 @@ def main():
         parser.error("Prebuilt releases currently support Linux x86_64 only")
     if args.list:
         return show_releases(offline=args.offline or args.no_check,
-                             as_json=args.json, curated=args.curated)
+                             as_json=args.json, curated=args.curated,
+                             diagnostics=args.diagnostics)
 
     state = read_state()
     channel = args.channel
