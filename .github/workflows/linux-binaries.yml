@@ -18,7 +18,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: reims-linux-release
+  group: reims-linux-release-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
