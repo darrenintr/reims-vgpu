@@ -88,6 +88,20 @@ class ReleasePickerTests(unittest.TestCase):
         self.assertEqual(tags[2], "exp-qemu-thp-7-bf4a3a511ecb")
         self.assertIn("QEMU", release.describe_release(rows[-1])["test_label"])
 
+    def test_combined_native_v3_fat_lto_candidate_is_distinct(self):
+        rows = self.sample_rows()
+        rows.extend([
+            row("exp-qemu-thp-7-bf4a3a511ecb", "2026-10-31T06:00:00Z"),
+            row("exp-native-v3-fat-lto-8-abcdef123456", "2026-10-31T08:25:00Z"),
+        ])
+        selected = release.curated_releases(rows)
+        tags = [r["tag"] for r in selected]
+        self.assertEqual(tags[2], "exp-native-v3-fat-lto-8-abcdef123456")
+        self.assertEqual(tags[3], "exp-qemu-thp-7-bf4a3a511ecb")
+        self.assertIn("组合优化", selected[2]["test_label"])
+        self.assertEqual(release.experiment_variant(tags[2]), "native-v3-fat-lto")
+        self.assertIn("Fat-LTO", selected[2]["test_label"])
+
     def test_known_and_unknown_experiments(self):
         self.assertEqual(release.experiment_variant("exp-native-v3-3-e4a42df79f14"),
                          "native-v3")
