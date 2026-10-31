@@ -9,6 +9,9 @@ on:
       - feature/github-release-binaries
     tags:
       - 'v*'
+  pull_request:
+    branches:
+      - master
   workflow_dispatch:
 
 permissions:
@@ -125,7 +128,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish Stable / Testing GitHub Release
-        if: github.repository == 'darrenintr/reims-vgpu'
+        if: github.repository == 'darrenintr/reims-vgpu' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
