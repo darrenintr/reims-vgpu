@@ -121,8 +121,15 @@ def describe_release(row):
     tag = row["tag"]
     channel = row["channel"]
     if channel == "stable":
-        label = f"【稳定基准】 {tag} · 首先测量，用作 A/B 对照"
-        goal = "基准测试：相同 Guest、分辨率与 CPU 绑定；记录 FPS、最大帧间隔。"
+        if tag == "v0.1.1":
+            label = "【最新 Stable · 需 x86-64-v3】 v0.1.1 · Native-v3 性能基线"
+            goal = "已保留用户认为更顺畅的 Native-v3 编译；比较相同场景帧时间，仍未稳定 120 FPS。"
+        elif tag == "v0.1.0":
+            label = "【原 Stable · 通用回滚】 v0.1.0 · 无 Native-v3 要求"
+            goal = "保留的原始基准版本；用于无法运行 x86-64-v3 或新版本发生回归时回滚。"
+        else:
+            label = f"【稳定版本】 {tag} · 检查 CPU 要求和 Release 说明"
+            goal = "基准测试：相同 Guest、分辨率与 CPU 绑定；记录 FPS、最大帧间隔。"
     elif channel == "testing":
         if tag == "testing-14-e41957269871":
             label = "【兼容性对照】 Testing-14 · GPU 核心与 Stable v0.1.0 相同"
