@@ -45,10 +45,26 @@ dialog_question() {
   fi
 }
 
-choose_release() {
-  local data tag label
+show_test_guide() {
+  local message
+  message=$'推荐顺序：\n1. Stable v0.1.0：记录基准（现有 Testing-14 可先记录原始体验）。\n2. native-v3：只测试 CPU 指令集编译的影响。\n3. fat-lto：只测试链接与代码生成优化的影响。\n4. qemu-thp：发布后验证 QEMU 内存大页优化。\n5. profiler：只为诊断卡顿，不用于性能排名。\n\n每版保持相同 VM 磁盘状态、CPU 绑定和分辨率；先测 Finder 拖窗 30 秒，再测 Safari 滚动 30 秒、Launchpad 动画 10 次。\n启用 FPS 监控，记录 guest/window FPS 与 max gap；空闲时的 0 FPS 不代表卡顿。日志中的 max gap 不等于 p95/p99，需要更细粒度仪器才能统计。'
+  if command -v kdialog >/dev/null; then
+    kdialog --title 'macOS Tahoe · 测试说明' --msgbox "$message"
+  elif command -v zenity >/dev/null; then
+    zenity --info --title='macOS Tahoe · 测试说明' --width=620 --text="$message"
+  else
+    printf '%s\n' "$message" >&2
+  fi
+}
+
+choose_release_page() {
+  local page=$1 data tag label
   local -a choices=()
-  data=$("$RELEASE_MANAGER" --list --json 2>>"$LOG") || return 1
+  if [[ $page == curated ]]; then
+    data=$("$RELEASE_MANAGER" --list --curated --json 2>>"$LOG") || return 1
+  else
+    data=$("$RELEASE_MANAGER" --list --json 2>>"$LOG") || return 1
+  fi
   while IFS=$'\t' read -r tag label; do
     [[ -n "$tag" ]] && choices+=("$tag" "$label")
   done < <(
@@ -60,30 +76,36 @@ except (ValueError, TypeError):
     releases = []
 for r in releases:
     tag = str(r.get("tag", ""))
-    title = (r.get("name") or tag).replace("\n", " ").replace("\t", " ")
-    status = " [downloaded]" if r.get("installed") else ""
-    active = " [active]" if r.get("current") else ""
-    channel = r.get("channel", "experimental").upper()
-    print(tag + "\t[" + channel + "] " + title + status + active)
+    label = str(r.get("test_label") or r.get("name") or tag).replace("\n", " ").replace("\t", " ")
+    status = " [已下载]" if r.get("installed") else ""
+    selected = " [已选中]" if r.get("current") else ""
+    older = " [旧版]" if r.get("historical") else ""
+    print(tag + "\t" + label + status + selected + older)
 ' 2>>"$LOG"
   )
   ((${#choices[@]})) || return 1
+  if [[ $page == curated ]]; then
+    choices+=('__guide__' '【测试说明】 推荐顺序、场景与记录指标')
+    choices+=('__history__' '【历史版本】 展开旧版、重复构建与回滚版本')
+  else
+    choices=('__back__' '【返回】 最新推荐测试版本' "${choices[@]}")
+  fi
   if command -v kdialog >/dev/null; then
-    kdialog --title 'macOS Tahoe · GitHub Releases' --menu \
-      '選擇本次使用的版本（從 GitHub 即時取得）：' "${choices[@]}" 2>/dev/null
+    kdialog --title 'macOS Tahoe · 测试版本' --menu \
+      '请选择本次测试的目标（默认隐藏过时的构建）：' "${choices[@]}" 2>/dev/null
   elif command -v zenity >/dev/null; then
     printf '%s\n' "${choices[@]}" | paste -d '\t' - - |
-      zenity --list --title='macOS Tahoe · GitHub Releases' \
-        --text='選擇發佈版本' --column='Tag' --column='Description' \
+      zenity --list --title='macOS Tahoe · 测试版本' \
+        --text='请选择本次测试的目标' --column='Tag' --column='Description' \
         --hide-column=1 --print-column=1 2>/dev/null
   elif [[ -t 0 ]]; then
-    local i answer
+    local i answer idx
     for ((i=0; i<${#choices[@]}; i+=2)); do
       printf '%2d: %s\n' "$((i/2+1))" "${choices[i+1]}" >&2
     done
-    read -r -p 'Choose release number: ' answer
+    read -r -p '选择版本编号：' answer
     [[ "$answer" =~ ^[0-9]+$ ]] || return 1
-    local idx=$(( (answer-1)*2 ))
+    idx=$(( (answer-1)*2 ))
     ((idx>=0 && idx<${#choices[@]})) || return 1
     printf '%s\n' "${choices[idx]}"
   else
@@ -91,23 +113,61 @@ for r in releases:
     return 1
   fi
 }
+
+choose_release() {
+  local page=curated result
+  while :; do
+    result=$(choose_release_page "$page") || return 1
+    case $result in
+      __history__) page=history ;;
+      __back__) page=curated ;;
+      __guide__) show_test_guide ;;
+      *) printf '%s\n' "$result"; return 0 ;;
+    esac
+  done
+}
+
+test_goal_for_tag() {
+  case $1 in
+    v*) printf '%s\n' 'Stable 对照：Finder 拖窗 / Safari 滚动 / Launchpad，记录 FPS 和最大帧间隔' ;;
+    testing-14-*) printf '%s\n' '兼容性对照：与 Stable GPU 核心相同，检查启动器及现有顺畅度' ;;
+    testing-*) printf '%s\n' 'Testing：先查 Release 变更，再做相同场景性能及回归测试' ;;
+    exp-native-v3-*) printf '%s\n' 'CPU ISA：仅比较 x86-64-v3 代码生成的性能影响' ;;
+    exp-fat-lto-*) printf '%s\n' 'LTO：仅比较 Fat LTO 编译优化的性能影响' ;;
+    exp-profiler-*) printf '%s\n' 'Profiler：定位卡顿，不用于性能排名' ;;
+    exp-qemu-thp-*) printf '%s\n' 'QEMU THP：检查 memfd 2 MiB 对齐及帧时间变化' ;;
+    *) printf '%s\n' '未知实验：先阅读 GitHub Release 说明' ;;
+  esac
+}
+
 choose_debug() {
   case ${TAHOE_DEBUG_MODE:-} in off|fps|gpu) echo "$TAHOE_DEBUG_MODE"; return ;; esac
+  local -a choices=(
+    fps '【推荐测试】 FPS / GPU 估算耗时 / 最大帧间隔'
+    off '【日常使用】 关闭额外性能日志'
+    gpu '【排查卡顿】 FPS + 更详细的 GPU 调试日志（有开销）'
+  )
+  if [[ $TAG == exp-profiler-* ]]; then
+    choices=(
+      gpu '【Profiler 推荐】 收集详细时序以定位卡顿'
+      fps '仅收集每秒 FPS 与 max gap'
+      off '关闭监控'
+    )
+  fi
   if command -v kdialog >/dev/null; then
     kdialog --title 'macOS Tahoe · Performance' --menu \
-      '本次開啟的效能監控：' \
-      off '正常啟動（不額外收集 FPS）' \
-      fps 'FPS 與 GPU 時間（每秒一條）' \
-      gpu 'FPS + 詳細 Vulkan Timing 記錄' 2>/dev/null
+      '本次测试建议启用 FPS；监控会有少量开销：' "${choices[@]}" 2>/dev/null
   elif command -v zenity >/dev/null; then
-    zenity --list --title='macOS Tahoe · Performance' \
-      --text='選擇效能監控' --column='Mode' off fps gpu 2>/dev/null
+    printf '%s\n' "${choices[@]}" | paste -d '\t' - - |
+      zenity --list --title='macOS Tahoe · Performance' \
+        --text='本次测试的日志等级' --column='Mode' --column='Description' \
+        --hide-column=1 --print-column=1 2>/dev/null
   elif [[ -t 0 ]]; then
     local answer
-    read -r -p 'Performance [off/fps/gpu] (default off): ' answer
-    case "$answer" in fps|gpu) echo "$answer";; *) echo off;; esac
+    read -r -p 'Performance [fps/off/gpu] (default fps): ' answer
+    case "$answer" in off|gpu) echo "$answer";; *) echo fps;; esac
   else
-    echo off
+    echo fps
   fi
 }
 open_monitor() {
@@ -145,7 +205,7 @@ if running; then
   exit 0
 fi
 
-# The Start Menu shows ALL published releases through kdialog or zenity.
+# The Start Menu shows only latest purposeful builds; history remains available.
 # TAHOE_RELEASE_TAG or --tag can bypass the dialog for custom desktop entries.
 TAG=${TAHOE_RELEASE_TAG:-}
 case ${1:-} in
@@ -172,6 +232,7 @@ elif ! dialog_question 'macOS Tahoe · Download' \
   "下載 GitHub Release $TAG？"$'\n'"只下載已編譯的 QEMU，不會在本機編譯。"; then
   exit 0
 fi
+TEST_GOAL=$(test_goal_for_tag "$TAG")
 MODE=$(choose_debug) || exit 0
 case "$MODE" in
   off)
@@ -195,6 +256,7 @@ case "$MODE" in
 esac
 {
   echo "==== $(date '+%F %T') $VM release=$TAG performance=$MODE"
+  echo "TEST GOAL: $TEST_GOAL"
   echo "Previous QEMU: $(readlink -f "$QEMU_ROOT/current" 2>/dev/null || echo none)"
 } >>"$LOG"
 notify 'Preparing macOS Tahoe' "Release $TAG · $MODE"
@@ -220,6 +282,7 @@ fi
   "$CTL" --version
 } >>"$LOG" 2>&1
 notify 'Starting macOS Tahoe' "Using $TAG · $MODE"
+notify '本次测试目的' "$TEST_GOAL"
 
 if ! "$CTL" start "$VM" >>"$LOG" 2>&1; then
   notify -u critical 'Tahoe failed to start' "$(tail -n 5 "$LOG")"
