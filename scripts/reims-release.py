@@ -125,9 +125,12 @@ def describe_release(row):
     tag = row["tag"]
     channel = row["channel"]
     if channel == "stable":
-        if tag == "v0.1.1":
-            label = "【最新 Stable · 需 x86-64-v3】 v0.1.1 · Native-v3 性能基线"
-            goal = "已保留用户认为更顺畅的 Native-v3 编译；比较相同场景帧时间，仍未稳定 120 FPS。"
+        if tag == "v0.1.2":
+            label = "【最新 Stable · 需 x86-64-v3】 v0.1.2 · Native-v3 + Fat-LTO 基线"
+            goal = "已将用户实测的 Native-v3 + Fat-LTO 组合编译提升为正式基线；帧间隔仍须测试。"
+        elif tag == "v0.1.1":
+            label = "【上一版 Stable · 回滚】 v0.1.1 · Native-v3（需 x86-64-v3）"
+            goal = "保留 Native-v3 单独编译的稳定回滚基线，用来对照 v0.1.2。"
         elif tag == "v0.1.0":
             label = "【原 Stable · 通用回滚】 v0.1.0 · 无 Native-v3 要求"
             goal = "保留的原始基准版本；用于无法运行 x86-64-v3 或新版本发生回归时回滚。"
@@ -165,6 +168,18 @@ def curated_releases(rows):
         key = release_group(row)
         if key not in newest:
             newest[key] = row
+    # Exact experimental artifacts already promoted to the current stable tag
+    # are historical builds, not extra performance variants for the main menu.
+    # Newly published experiments with different tags remain visible.
+    if newest.get("stable", {}).get("tag") == "v0.1.2":
+        promoted_history = {
+            "exp-native-v3-fat-lto-1-c8838347f0e5",
+            "exp-native-v3-3-e4a42df79f14",
+            "exp-fat-lto-3-e4a42df79f14",
+        }
+        for group, row in list(newest.items()):
+            if group.startswith("experimental:") and row["tag"] in promoted_history:
+                del newest[group]
     priority = (
         "stable", "testing", "experimental:native-v3-fat-lto",
         "experimental:qemu-thp", "experimental:native-v3",
