@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -78,6 +79,98 @@ def channel_for(release):
     return "experimental"
 
 
+
+# These categories describe the actual build deltas, not advertised FPS gains.
+# Experimental releases are produced by a matrix job; their older run numbers
+# remain available in history but should not crowd the daily testing menu.
+EXPERIMENTS = {
+    "qemu-thp": (
+        "【QEMU 上游】 2 MiB 大页内存对齐",
+        "对比 QEMU memfd/THP 相关延迟；需核对宿主机 THP 设置和 KVM 映射。",
+    ),
+    "native-v3": (
+        "【CPU 指令集】 x86-64-v3 编译",
+        "只更换 Rust 代码生成目标；比较同场景帧时间，非 QEMU 上游改动。",
+    ),
+    "fat-lto": (
+        "【编译优化】 Fat LTO + 单代码生成单元",
+        "只更换 Rust 链接/代码生成优化；比较同场景帧时间。",
+    ),
+    "profiler": (
+        "【诊断】 Profiler（不是加速版本）",
+        "保留帧指针与调试符号，用于定位卡顿，不参与纯性能排名。",
+    ),
+}
+
+def experiment_variant(tag):
+    match = re.fullmatch(r"exp-(.+)-[0-9]+-[0-9a-fA-F]{12}", tag)
+    return match.group(1) if match else None
+
+
+def release_group(row):
+    channel = row.get("channel")
+    if channel in ("stable", "testing"):
+        return channel
+    variant = experiment_variant(row.get("tag", ""))
+    return f"experimental:{variant or 'other'}"
+
+
+def describe_release(row):
+    """Attach actionable descriptions without relying on untrusted release notes."""
+    row = dict(row)
+    tag = row["tag"]
+    channel = row["channel"]
+    if channel == "stable":
+        label = f"【稳定基准】 {tag} · 首先测量，用作 A/B 对照"
+        goal = "基准测试：相同 Guest、分辨率与 CPU 绑定；记录 FPS、最大帧间隔。"
+    elif channel == "testing":
+        if tag == "testing-14-e41957269871":
+            label = "【兼容性对照】 Testing-14 · GPU 核心与 Stable v0.1.0 相同"
+            goal = "确认启动器/下载器兼容性；此构建未加入新的 GPU 性能优化。"
+        else:
+            label = f"【测试渠道】 {tag} · 与稳定版比较"
+            goal = "阅读 Release 变更后，针对变更测试功能和回归，并测帧时间。"
+    else:
+        variant = experiment_variant(tag)
+        if variant in EXPERIMENTS:
+            label, goal = EXPERIMENTS[variant]
+        else:
+            label = f"【未分类实验】 {tag} · 请先查阅 Release 说明"
+            goal = "目前没有已登记的实验目标；不要直接当作性能提升版。"
+    row["test_label"] = label
+    row["test_goal"] = goal
+    row["variant"] = experiment_variant(tag)
+    return row
+
+
+def curated_releases(rows):
+    """Newest valid build per experiment, plus a selected legacy build for safety.
+
+    'current' means the install symlink, NOT necessarily the running QEMU PID.
+    Older builds and duplicate build-matrix runs remain available via --list.
+    """
+    newest = {}
+    for row in sorted(rows, key=lambda r: r.get("published_at") or "", reverse=True):
+        key = release_group(row)
+        if key not in newest:
+            newest[key] = row
+    priority = (
+        "stable", "testing", "experimental:qemu-thp",
+        "experimental:native-v3", "experimental:fat-lto",
+        "experimental:profiler",
+    )
+    ordered = [newest[k] for k in priority if k in newest]
+    ordered.extend(newest[k] for k in sorted(newest) if k not in priority)
+    chosen = {row["tag"] for row in ordered}
+    for row in rows:
+        if row.get("current") and row["tag"] not in chosen:
+            previous = dict(row)
+            previous["test_label"] = f"【当前选中旧版】 {row['tag']} · 建议只作回滚"
+            previous["test_goal"] = "这个安装版本不是最新候选；保留以免丢失回滚能力。"
+            ordered.append(previous)
+            chosen.add(row["tag"])
+    return ordered
+
 def valid_install(tag):
     if not tag:
         return False
@@ -111,7 +204,7 @@ def selectable_releases():
 
 def record(release, assets, state):
     tag = release["tag_name"]
-    return {
+    return describe_release({
         "tag": tag,
         "name": release.get("name") or tag,
         "channel": channel_for(release),
@@ -121,8 +214,7 @@ def record(release, assets, state):
         "installed": valid_install(tag),
         "current": (ROOT / "current").resolve() == (ROOT / tag).resolve(),
         "description": (release.get("body") or "").splitlines()[0][:180] if release.get("body") else "",
-    }
-
+    })
 
 def cached_records():
     rows = []
@@ -142,10 +234,11 @@ def cached_records():
             "current": (ROOT / "current").resolve() == folder.resolve(),
             "description": "Available offline (already installed)",
         })
-    return sorted(rows, key=lambda item: (not item["current"], item["tag"]))
+    return sorted((describe_release(row) for row in rows),
+                  key=lambda item: (not item["current"], item["tag"]))
 
 
-def show_releases(offline=False, as_json=False):
+def show_releases(offline=False, as_json=False, curated=False):
     if offline:
         rows = cached_records()
     else:
@@ -154,15 +247,21 @@ def show_releases(offline=False, as_json=False):
         except (OSError, RuntimeError, ValueError, urllib.error.URLError) as exc:
             print(f"GitHub release listing unavailable: {exc}; showing installed builds", file=sys.stderr)
             rows = cached_records()
+    recommended = curated_releases(rows)
+    latest_tags = {row["tag"] for row in recommended}
+    for row in rows:
+        row["historical"] = row["tag"] not in latest_tags
+    if curated:
+        rows = recommended
     if as_json:
         print(json.dumps(rows, ensure_ascii=False))
     else:
         for item in rows:
             installed = " [downloaded]" if item["installed"] else ""
-            active = " [active]" if item["current"] else ""
-            print(f"{item['tag']:47} {item['channel']:12} {item['name']}{installed}{active}")
+            selected = " [selected]" if item["current"] else ""
+            historical = " [history]" if item.get("historical") else ""
+            print(f"{item['tag']:47} {item['test_label']}{installed}{selected}{historical}")
     return 0 if rows else 1
-
 
 def fetch_releases(channel=None, tag=None):
     matches = selectable_releases()
@@ -279,7 +378,9 @@ def main():
     selected.add_argument("--tag", help="Exact GitHub Release tag (including experimental builds)")
     selected.add_argument("--channel", choices=("stable", "testing"),
                           help="Compatibility option: newest release in this channel")
-    parser.add_argument("--list", action="store_true", help="List ALL releases with a Linux bundle")
+    parser.add_argument("--list", action="store_true", help="List available releases (all by default)")
+    parser.add_argument("--curated", action="store_true",
+                        help="With --list, show newest stable/testing and one per experiment")
     parser.add_argument("--json", action="store_true", help="Machine-readable --list output")
     parser.add_argument("--offline", action="store_true", help="Use only installed builds with --list")
     parser.add_argument("--no-check", action="store_true", help="Use a downloaded build without a network query")
@@ -290,7 +391,8 @@ def main():
     if sys.platform != "linux" or os.uname().machine != "x86_64":
         parser.error("Prebuilt releases currently support Linux x86_64 only")
     if args.list:
-        return show_releases(offline=args.offline or args.no_check, as_json=args.json)
+        return show_releases(offline=args.offline or args.no_check,
+                             as_json=args.json, curated=args.curated)
 
     state = read_state()
     channel = args.channel
