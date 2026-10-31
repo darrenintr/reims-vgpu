@@ -129,7 +129,9 @@ choose_release() {
 
 test_goal_for_tag() {
   case $1 in
-    v*) printf '%s\n' 'Stable 对照：Finder 拖窗 / Safari 滚动 / Launchpad，记录 FPS 和最大帧间隔' ;;
+    v0.1.1) printf '%s\n' '最新 Stable：Native-v3 编译基线（CPU 需支持 x86-64-v3），对比帧时间与卡顿' ;;
+    v0.1.0) printf '%s\n' '原 Stable：通用回滚版本，跟 v0.1.1 比较体验' ;;
+    v*) printf '%s\n' 'Stable：按同样场景测量 Finder / Safari / Launchpad 的帧时间' ;;
     testing-14-*) printf '%s\n' '兼容性对照：与 Stable GPU 核心相同，检查启动器及现有顺畅度' ;;
     testing-*) printf '%s\n' 'Testing：先查 Release 变更，再做相同场景性能及回归测试' ;;
     exp-native-v3-*) printf '%s\n' 'CPU ISA：仅比较 x86-64-v3 代码生成的性能影响' ;;
