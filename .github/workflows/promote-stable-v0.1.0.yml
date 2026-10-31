@@ -1,0 +1,86 @@
+name: Promote tested Linux bundle to Stable v0.1.0
+
+# One-time release branch: preserve the successful testing artifacts exactly.
+on:
+  push:
+    branches:
+      - release/promote-v0.1.0
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    name: Promote checksummed Testing artifact
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    if: github.repository == 'darrenintr/reims-vgpu'
+    steps:
+      - name: Verify and publish stable assets without recompiling
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="darrenintr/reims-vgpu"
+          source_tag="testing-12-f36b720da5d1"
+          stable_tag="v0.1.0"
+          source_sha="f36b720da5d1c44f172a6aa662e9ab11d1081b5f"
+
+          if gh api "repos/$repo/git/ref/tags/$stable_tag" >/dev/null 2>&1; then
+            echo "::error::Stable tag already exists; refusing to overwrite."
+            exit 1
+          fi
+
+          actual_sha="$(gh api "repos/$repo/commits/$source_tag" --jq '.sha')"
+          if [[ "$actual_sha" != "$source_sha" ]]; then
+            echo "::error::Testing source tag does not match successful CI build."
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/reims-stable"
+          cd "$RUNNER_TEMP/reims-stable"
+          gh release download "$source_tag" --repo "$repo" \
+            --pattern 'reims-vgpu-linux-x86_64.tar.gz' \
+            --pattern 'SHA256SUMS' --dir .
+
+          test -s reims-vgpu-linux-x86_64.tar.gz
+          test -s SHA256SUMS
+          sha256sum -c SHA256SUMS
+          tar -tzf reims-vgpu-linux-x86_64.tar.gz > contents.txt
+          for required in bin/qemu-system-x86_64 bin/qemu-img bin/reims-ctl; do
+            grep -Fx "./$required" contents.txt >/dev/null \
+              || grep -Fx "$required" contents.txt >/dev/null \
+              || { echo "::error::Missing archive file: $required"; exit 1; }
+          done
+          grep -F 'ReimsVgpu.rom' contents.txt >/dev/null \
+            || { echo "::error::Missing ReimsVgpu.rom"; exit 1; }
+
+          cat > RELEASE-NOTES.md <<'NOTES'
+          ## Reims vGPU v0.1.0 — Linux x86_64
+
+          Promoted without recompilation from successful Testing Release
+          testing-12-f36b720da5d1, GitHub Actions run 41161349994.
+
+          Source commit: f36b720da5d1c44f172a6aa662e9ab11d1081b5f
+          Metal2Vulkan fork commit: 6d6f5d92326361562ac5d482eb017f41d80c82d9
+
+          Includes RX 7600/RADV and Tahoe integration fixes, shader cache warm-stage
+          reuse, discrete GPU native buffer fills, selected tiled staging reuse,
+          and libusb-enabled QEMU.
+
+          Attached assets are the exact Testing binaries and original SHA256SUMS.
+          This is the selected stable baseline; the RX 7600/Tahoe path remains
+          experimental and may need host-specific fixes. Keep a working rollback.
+          NOTES
+
+          gh release create "$stable_tag" \
+            reims-vgpu-linux-x86_64.tar.gz SHA256SUMS \
+            --repo "$repo" --target "$source_sha" \
+            --title 'v0.1.0 — Linux x86_64 stable baseline' \
+            --notes-file RELEASE-NOTES.md --latest
+
+          result_sha="$(gh api "repos/$repo/commits/$stable_tag" --jq '.sha')"
+          test "$result_sha" = "$source_sha"
+          gh release view "$stable_tag" --repo "$repo" --json tagName,isPrerelease,assets \
+            --jq '{tag: .tagName, prerelease: .isPrerelease, assets: [.assets[].name]}'
+          echo "Stable release: https://github.com/$repo/releases/tag/$stable_tag"
