@@ -97,7 +97,10 @@ jobs:
             git submodule update --init vendor/qemu
           test -f vendor/qemu/configure
           test "$(git -C vendor/qemu rev-parse HEAD)" = 4e9e3de2adfe6e333f594811d7bfc4a3a840ac64
-          git -C vendor/qemu diff d8b3a798430d70248f566a53aad2a8f732e4598b HEAD --name-only | grep -Fx 'system/physmem.c'
+          # The submodule is a shallow checkout; fetch the pinned parent object
+          # explicitly before comparing the exact one-file QEMU patch.
+          git -C vendor/qemu fetch --no-tags --depth 1 origin d8b3a798430d70248f566a53aad2a8f732e4598b
+          test "$(git -C vendor/qemu diff d8b3a798430d70248f566a53aad2a8f732e4598b HEAD --name-only)" = 'system/physmem.c'
 
       - name: Compile pinned Metal2Vulkan and Vulkan option ROM
         run: |
