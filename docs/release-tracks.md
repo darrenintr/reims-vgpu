@@ -24,7 +24,9 @@
 ## Future performance experiments inherit v0.1.1
 
 - For an apples-to-apples QEMU/Metal2Vulkan A/B run on the Ryzen 5 3600, compile Rust and its dependencies with `RUSTFLAGS=-C target-cpu=x86-64-v3`, Thin LTO, 16 codegen units; keep host, RAM, CPU pinning, resolution, GPU driver, disk state, and test scene fixed.
-- The earlier `exp-fat-lto-3-e4a42df79f14` bundle used default Rust target flags (not Native-v3). It is an independent experiment, **not** a Fat-LTO patch applied on top of v0.1.1. Build a combined Native-v3 + Fat-LTO bundle if that incremental optimization is desired.
+- The earlier `exp-fat-lto-3-e4a42df79f14` bundle used default Rust target flags (not Native-v3). It is an independent experiment, **not** a Fat-LTO patch applied on top of v0.1.1.
+- The owner reports a subjective improvement on Fat-LTO. Their `vmlog3.txt` shows roughly 28 consecutive samples at >=115 FPS versus five consecutive samples in `vmlog2.txt`; the logs have different lengths and are not matched workloads, and high-FPS samples still exhibit >8.33 ms max gaps. These logs do not embed binary SHA or build identity, so the test attribution relies on which build the owner selected.
+- **Next candidate, not yet Stable:** compile Native-v3 + Fat-LTO + one codegen unit on the same QEMU and Metal2Vulkan pins as v0.1.1. Flags: `RUSTFLAGS=-C target-cpu=x86-64-v3`, `CARGO_PROFILE_RELEASE_LTO=fat`, `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1`. Publish a distinct `exp-native-v3-fat-lto-*` prerelease with SHA256SUMS. Do not promote to v0.1.2 unless the actual combined binary passes real Tahoe/RX 7600 tests and comparison against v0.1.1.
 - The QEMU THP experimental branch is source-only until a new built bundle is published. Build that candidate with the same Native-v3 flags before comparing to the new Stable baseline.
 - Never infer a renderer improvement from compiler flags or a GitHub Actions success alone; compare matched runtime frame intervals and check correctness.
 
