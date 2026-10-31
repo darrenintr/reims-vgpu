@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import tempfile
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -55,15 +56,16 @@ class ReleasePickerTests(unittest.TestCase):
             "testing-14-e41957269871",
             "exp-native-v3-3-e4a42df79f14",
             "exp-fat-lto-3-e4a42df79f14",
-            "exp-profiler-3-e4a42df79f14",
         ])
-        self.assertIn("不是加速", result[-1]["test_label"])
+        self.assertEqual(release.diagnostic_releases(self.sample_rows())[0]["tag"],
+                         "exp-profiler-3-e4a42df79f14")
 
     def test_current_old_build_remains_reachable(self):
         result = release.curated_releases(self.sample_rows(old_selected=True))
-        self.assertEqual(len(result), 6)
-        self.assertEqual(result[-1]["tag"], "exp-native-v3-1-2a63d397e686")
-        self.assertIn("当前选中旧版", result[-1]["test_label"])
+        self.assertNotIn("exp-native-v3-1-2a63d397e686",
+                         [x["tag"] for x in result])
+        self.assertEqual(result[0]["tag"], "v0.1.0")
+        self.assertTrue(any(x["current"] for x in self.sample_rows(old_selected=True)))
 
     def test_full_history_still_available(self):
         rows = self.sample_rows()
@@ -79,7 +81,7 @@ class ReleasePickerTests(unittest.TestCase):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 release.show_releases(offline=True, as_json=True, curated=True)
-            self.assertEqual(len(json.loads(out.getvalue())), 5)
+            self.assertEqual(len(json.loads(out.getvalue())), 4)
 
     def test_new_qemu_thp_candidate_is_high_priority(self):
         rows = self.sample_rows()
@@ -96,11 +98,11 @@ class ReleasePickerTests(unittest.TestCase):
         ])
         selected = release.curated_releases(rows)
         tags = [r["tag"] for r in selected]
-        self.assertEqual(tags[2], "exp-native-v3-fat-lto-8-abcdef123456")
-        self.assertEqual(tags[3], "exp-qemu-thp-7-bf4a3a511ecb")
-        self.assertIn("组合优化", selected[2]["test_label"])
-        self.assertEqual(release.experiment_variant(tags[2]), "native-v3-fat-lto")
-        self.assertIn("Fat-LTO", selected[2]["test_label"])
+        self.assertEqual(tags[2], "exp-qemu-thp-7-bf4a3a511ecb")
+        self.assertEqual(tags[3], "exp-native-v3-fat-lto-8-abcdef123456")
+        self.assertIn("组合优化", selected[3]["test_label"])
+        self.assertEqual(release.experiment_variant(tags[3]), "native-v3-fat-lto")
+        self.assertIn("Fat-LTO", selected[3]["test_label"])
 
     def test_known_and_unknown_experiments(self):
         self.assertEqual(release.experiment_variant("exp-native-v3-3-e4a42df79f14"),
@@ -130,11 +132,7 @@ class ReleasePickerTests(unittest.TestCase):
         ])
         selected = release.curated_releases(rows)
         tags = [r["tag"] for r in selected]
-        self.assertEqual(tags, [
-            "v0.1.2",
-            "testing-14-e41957269871",
-            "exp-profiler-3-e4a42df79f14",
-        ])
+        self.assertEqual(tags, ["v0.1.2"])
         latest = selected[0]
         self.assertIn("Native-v3 + Fat-LTO", latest["test_label"])
         self.assertIn("x86-64-v3", latest["test_label"])
@@ -157,9 +155,105 @@ class ReleasePickerTests(unittest.TestCase):
                 "2026-10-31T08:49:51Z", current=True),
         ])
         selected = release.curated_releases(rows)
-        self.assertEqual(selected[-1]["tag"],
-                         "exp-native-v3-fat-lto-1-c8838347f0e5")
-        self.assertIn("当前选中旧版", selected[-1]["test_label"])
+        self.assertNotIn("exp-native-v3-fat-lto-1-c8838347f0e5",
+                         [r["tag"] for r in selected])
+        self.assertEqual(selected[0]["tag"], "v0.1.2")
+        self.assertTrue(rows[-1]["current"])  # remains in full history
+
+    def test_cleanup_removes_only_obsolete_local_releases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "qemu"
+            root.mkdir()
+            tags = [
+                "v0.1.2", "v0.1.1", "v0.1.0",
+                "testing-14-e41957269871",
+                "exp-native-v3-fat-lto-1-c8838347f0e5",
+                "exp-profiler-3-e4a42df79f14",
+                "exp-profiler-1-2a63d397e686",
+                "exp-qemu-thp-1-abcdef123456",
+            ]
+            dates = ["2026-10-31T09:00:22Z", "2026-10-31T08:00:00Z",
+                     "2026-10-31T04:00:00Z", "2026-10-31T04:40:00Z",
+                     "2026-10-31T08:49:51Z", "2026-10-31T05:35:00Z",
+                     "2026-10-31T05:01:00Z", "2026-10-31T10:00:00Z"]
+            releases = []
+            for tag, date in zip(tags, dates):
+                binary = root / tag / "bin"
+                binary.mkdir(parents=True)
+                for file in ("reims-ctl", "qemu-system-x86_64", "qemu-img"):
+                    (binary / file).write_bytes(b"fake-test-binary")
+                releases.append(({
+                    "tag_name": tag, "name": tag, "published_at": date,
+                    "prerelease": not tag.startswith("v"),
+                }, {release.ASSET: {"size": 800}, "SHA256SUMS": {}}))
+            (root / "current").symlink_to("v0.1.2")
+            (root / "macos-disk.qcow2").write_bytes(b"never touch vm disk")
+            state_file = Path(tmp) / "release-manager.json"
+            state_file.write_text(json.dumps({
+                "stable": "v0.1.2", "testing": "testing-14-e41957269871",
+                "current_tag": "v0.1.2", "current_channel": "stable"
+            }))
+            with (mock.patch.object(release, "ROOT", root),
+                  mock.patch.object(release, "STATE", state_file),
+                  mock.patch.object(release, "selectable_releases",
+                                    return_value=releases),
+                  mock.patch.object(release, "qemu_running", return_value=False)):
+                plan = release.cleanup_plan()
+                names = {r["tag"] for r in plan["candidates"]}
+                self.assertEqual(names, {
+                    "testing-14-e41957269871",
+                    "exp-native-v3-fat-lto-1-c8838347f0e5",
+                    "exp-profiler-1-2a63d397e686",
+                })
+                self.assertGreater(plan["total_bytes"], 0)
+                with self.assertRaisesRegex(RuntimeError, "changed since preview"):
+                    release.apply_cleanup("0" * 64)
+                result = release.apply_cleanup(plan["plan_id"])
+                self.assertEqual(set(result["removed"]), names)
+                for tag in names:
+                    self.assertFalse((root / tag).exists())
+                for tag in set(tags) - names:
+                    self.assertTrue((root / tag / "bin/reims-ctl").exists())
+                self.assertTrue((root / "macos-disk.qcow2").exists())
+                self.assertEqual((root / "current").resolve(),
+                                 (root / "v0.1.2").resolve())
+                self.assertNotIn("testing", json.loads(state_file.read_text()))
+
+    def test_cleanup_never_deletes_selected_or_running_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "qemu"
+            root.mkdir()
+            current = "exp-native-v3-fat-lto-1-c8838347f0e5"
+            baseline = "v0.1.2"
+            dates = ["2026-10-31T08:49:51Z", "2026-10-31T09:00:22Z"]
+            rows = []
+            for tag, date in zip([current, baseline], dates):
+                bin_dir = root / tag / "bin"
+                bin_dir.mkdir(parents=True)
+                for name in ("reims-ctl", "qemu-system-x86_64", "qemu-img"):
+                    (bin_dir / name).write_bytes(b"a")
+                rows.append(({"tag_name": tag, "published_at": date,
+                              "prerelease": not tag.startswith("v")},
+                             {release.ASSET: {"size": 1}, "SHA256SUMS": {}}))
+            (root / "current").symlink_to(current)
+            with (mock.patch.object(release, "ROOT", root),
+                  mock.patch.object(release, "STATE", Path(tmp) / "state.json"),
+                  mock.patch.object(release, "selectable_releases", return_value=rows)):
+                plan = release.cleanup_plan()
+                self.assertEqual(plan["candidates"], [])
+                with mock.patch.object(release, "qemu_running", return_value=True):
+                    with self.assertRaisesRegex(RuntimeError, "running"):
+                        release.apply_cleanup("0" * 64)
+                self.assertTrue((root / current / "bin/reims-ctl").exists())
+
+    def test_cleanup_refuses_qemu_root_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "other-data"
+            target.mkdir()
+            (Path(tmp) / "qemu").symlink_to(target, target_is_directory=True)
+            with mock.patch.object(release, "ROOT", Path(tmp) / "qemu"):
+                with self.assertRaisesRegex(RuntimeError, "symlink"):
+                    release.cleanup_plan()
 
     def test_safe_tag_blocks_paths(self):
         for bad in ("", "../escape", "a/b", "a b"):
