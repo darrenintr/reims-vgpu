@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import re
 import tempfile
 from pathlib import Path
 import unittest
@@ -254,6 +255,14 @@ class ReleasePickerTests(unittest.TestCase):
             with mock.patch.object(release, "ROOT", Path(tmp) / "qemu"):
                 with self.assertRaisesRegex(RuntimeError, "symlink"):
                     release.cleanup_plan()
+
+    def test_embedded_python_in_launcher_compiles(self):
+        launcher = (Path(__file__).resolve().parents[1]
+                    / "scripts" / "tahoe-launch-remote").read_text()
+        snippets = re.findall(r"python3 -c '([^']*)'", launcher, re.S)
+        self.assertGreaterEqual(len(snippets), 3)
+        for snippet in snippets:
+            compile(snippet, "<tahoe-launch-remote embedded Python>", "exec")
 
     def test_safe_tag_blocks_paths(self):
         for bad in ("", ".", "..", "../escape", "a/b", "a b"):
