@@ -1,0 +1,36 @@
+name: Tahoe release-picker checks
+
+on:
+  push:
+    branches:
+      - feature/curated-release-picker
+      - testing
+    paths:
+      - scripts/reims-release.py
+      - scripts/tahoe-launch-remote
+      - tests/test_release_picker.py
+      - .github/workflows/release-picker-checks.yml
+  pull_request:
+    branches:
+      - testing
+    paths:
+      - scripts/reims-release.py
+      - scripts/tahoe-launch-remote
+      - tests/test_release_picker.py
+      - .github/workflows/release-picker-checks.yml
+
+permissions:
+  contents: read
+
+jobs:
+  validate-menu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python compilation and Bash parser
+        run: |
+          python3 -m py_compile scripts/reims-release.py
+          bash -n scripts/tahoe-launch-remote
+      - name: Release-picker regression tests
+        run: python3 -m unittest discover -s tests -p test_release_picker.py -v
