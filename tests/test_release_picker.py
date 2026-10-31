@@ -54,8 +54,8 @@ class ReleasePickerTests(unittest.TestCase):
         self.assertEqual([x["tag"] for x in result], [
             "v0.1.0",
             "testing-14-e41957269871",
-            "exp-native-v3-3-e4a42df79f14",
             "exp-fat-lto-3-e4a42df79f14",
+            "exp-native-v3-3-e4a42df79f14",
         ])
         self.assertEqual(release.diagnostic_releases(self.sample_rows())[0]["tag"],
                          "exp-profiler-3-e4a42df79f14")
