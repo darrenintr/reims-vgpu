@@ -1,14 +1,17 @@
 # Stable and Testing release tracks
 
-## Stable (frozen)
+## Stable (versioned; keep rollback)
 
-- Published baseline: [v0.1.0](https://github.com/darrenintr/reims-vgpu/releases/tag/v0.1.0)
-- Exact source: `f36b720da5d1c44f172a6aa662e9ab11d1081b5f`
-- QEMU submodule: `d8b3a798430d70248f566a53aad2a8f732e4598b`
-- Metal2Vulkan pin: `6d6f5d92326361562ac5d482eb017f41d80c82d9`
-- Keep binary artifacts and SHA256SUMS; do not rebuild or replace this tag just to update documentation.
+- Current official Stable: [v0.1.1](https://github.com/darrenintr/reims-vgpu/releases/tag/v0.1.1), the exact prebuilt x86-64-v3 Rust optimization promoted from [exp-native-v3-3-e4a42df79f14](https://github.com/darrenintr/reims-vgpu/releases/tag/exp-native-v3-3-e4a42df79f14). It is intended for Ryzen 5 3600 or other x86-64-v3-capable hosts; **not** a general x86-64 binary.
+- Exact source commit: e4a42df79f1487a4f18d9ed1bad4782a3deaa05e; verified archived bundle SHA256: d2a7edf04b5d6621e353342d94301cb9533ab10cf7e25867dc74f0833f44cb1b.
+- Successful native-v3 build: [GitHub Actions run 41170050601](https://github.com/darrenintr/reims-vgpu/actions/runs/41170050601); promotion [run 41183204162](https://github.com/darrenintr/reims-vgpu/actions/runs/41183204162).
+- Original portable Stable [v0.1.0](https://github.com/darrenintr/reims-vgpu/releases/tag/v0.1.0) remains preserved exactly, with source f36b720da5d1c44f172a6aa662e9ab11d1081b5f, as the rollback for other CPUs or performance regressions.
+- Both builds pin QEMU d8b3a798430d70248f566a53aad2a8f732e4598b and Metal2Vulkan 6d6f5d92326361562ac5d482eb017f41d80c82d9. v0.1.1 changes Rust code generation, not QEMU/Metal2Vulkan GPU algorithms.
+- v0.1.1 is a user-selected **performance baseline**, not a claim of sustained 120 FPS. The user's 2026-10-31 sample includes a short 116–120 FPS stretch and many lower-FPS intervals; subjective improvement is encouraging but no controlled, matched A/B improvement is established.
+- Release assets are immutable by policy: never retag or overwrite an existing Stable tag or bundle. A change requires a new semver release.
 
-**Important:** the binary currently running on the owner's Ubuntu host has NOT yet been SHA256-verified against this published release. Do not label that running binary `v0.1.0` without checking `/proc/<qemu-pid>/exe`, its SHA256, and the installed `BUILD-INFO.txt`.
+**Important:** a chosen installation symlink is not proof of which QEMU process is running. A reproducible host comparison also checks `/proc/<pid>/exe`, the running binary's SHA256 and installed `BUILD-INFO.txt`.
+
 
 ## Testing
 
