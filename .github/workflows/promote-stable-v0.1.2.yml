@@ -1,0 +1,128 @@
+name: Promote Native-v3 + Fat-LTO to Stable v0.1.2
+
+# One-time, artifact-identical promotion. Do NOT rebuild QEMU.
+on:
+  push:
+    branches:
+      - release/promote-v0.1.2-native-v3-fat-lto
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    name: Verify and publish tested Native-v3 + Fat-LTO bundle
+    if: github.repository == 'darrenintr/reims-vgpu'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Verify exact stacked artifact and publish without recompilation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo='darrenintr/reims-vgpu'
+          source_tag='exp-native-v3-fat-lto-1-c8838347f0e5'
+          stable_tag='v0.1.2'
+          source_sha='c8838347f0e5500c0950d2b15695a78a2ff165f8'
+          archive_sha='35170d85a3a5fb00936b0209f7590d52d438b1e9b0399ef94a045185f28c0c57'
+          sums_sha='6916002fb135f9680b093dba91a1360a2842d6f0215e23b308071dbd092978a0'
+
+          if gh api "repos/$repo/git/ref/tags/$stable_tag" > /dev/null 2>&1; then
+            echo "::error::Tag $stable_tag exists; never overwrite Stable."
+            exit 1
+          fi
+          actual_sha="$(gh api "repos/$repo/commits/$source_tag" --jq '.sha')"
+          test "$actual_sha" = "$source_sha" || {
+            echo "::error::Experiment tag moved; refusing to promote."
+            exit 1
+          }
+          conclusion="$(gh api "repos/$repo/actions/runs/41184582089/jobs?per_page=100" \
+            --jq '.jobs[] | select(.name == "Linux x86_64 / native-v3-fat-lto") | .conclusion')"
+          test "$conclusion" = 'success' || {
+            echo "::error::Combined source GitHub Actions job was not successful."
+            exit 1
+          }
+
+          mkdir -p "$RUNNER_TEMP/reims-native-v3-fat-lto-stable"
+          cd "$RUNNER_TEMP/reims-native-v3-fat-lto-stable"
+          gh release download "$source_tag" --repo "$repo" \
+            --pattern 'reims-vgpu-linux-x86_64.tar.gz' \
+            --pattern 'SHA256SUMS' --dir .
+          test -s reims-vgpu-linux-x86_64.tar.gz
+          test -s SHA256SUMS
+          echo "$sums_sha  SHA256SUMS" | sha256sum -c -
+          sha256sum -c SHA256SUMS
+          actual_archive_sha="$(sha256sum reims-vgpu-linux-x86_64.tar.gz | awk '{print $1}')"
+          test "$actual_archive_sha" = "$archive_sha" || {
+            echo "::error::Archive differs from verified experimental build."
+            exit 1
+          }
+
+          tar -tzf reims-vgpu-linux-x86_64.tar.gz > contents.txt
+          for required in bin/qemu-system-x86_64 bin/qemu-img bin/reims-ctl; do
+            grep -Fx "./$required" contents.txt >/dev/null ||
+              grep -Fx "$required" contents.txt >/dev/null || {
+                echo "::error::Missing $required"
+                exit 1
+              }
+          done
+          grep -F 'ReimsVgpu.rom' contents.txt >/dev/null || {
+            echo "::error::Missing ReimsVgpu.rom"
+            exit 1
+          }
+          tar -xOf reims-vgpu-linux-x86_64.tar.gz ./BUILD-INFO.txt > BUILD-INFO.txt
+          grep -Fx "reims-vgpu commit: $source_sha" BUILD-INFO.txt
+          grep -Fx 'Variant: native-v3-fat-lto' BUILD-INFO.txt
+          grep -Fx 'RUSTFLAGS=-C target-cpu=x86-64-v3' BUILD-INFO.txt
+          grep -Fx 'CARGO_PROFILE_RELEASE_LTO=fat' BUILD-INFO.txt
+          grep -Fx 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1' BUILD-INFO.txt
+
+          cat > RELEASE-NOTES.md <<'NOTES'
+          ## Reims vGPU v0.1.2 — Native-v3 + Fat-LTO performance baseline
+
+          Promoted **exactly the same prebuilt Linux bundle** from
+          [exp-native-v3-fat-lto-1-c8838347f0e5](https://github.com/darrenintr/reims-vgpu/releases/tag/exp-native-v3-fat-lto-1-c8838347f0e5)
+          into the new official Stable channel **without recompilation**.
+          Its original SHA256SUMS and archive digest were checked.
+
+          **Build identity**
+          - Source commit: `c8838347f0e5500c0950d2b15695a78a2ff165f8`
+          - Experiment: [GitHub Actions run 41184582089](https://github.com/darrenintr/reims-vgpu/actions/runs/41184582089) — Linux x86_64 / native-v3-fat-lto (success)
+          - `RUSTFLAGS=-C target-cpu=x86-64-v3`
+          - `CARGO_PROFILE_RELEASE_LTO=fat`
+          - `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1`
+          - Pinned QEMU: `d8b3a798430d70248f566a53aad2a8f732e4598b`
+          - Pinned Metal2Vulkan: `6d6f5d92326361562ac5d482eb017f41d80c82d9`
+          - Archive SHA256: `35170d85a3a5fb00936b0209f7590d52d438b1e9b0399ef94a045185f28c0c57`
+
+          **Test status:** The owner reports good perceived performance in the
+          combined build on Ryzen 5 3600 / RX 7600 / macOS Tahoe, and requested
+          it be the new stable performance baseline. No controlled frame-time
+          p95/p99 improvement or sustained 120 FPS is asserted. Stable denotes
+          the chosen reproducible baseline, not guaranteed production-ready
+          macOS graphics acceleration.
+
+          **CPU requirement:** x86-64-v3 or newer. It may not run on older CPUs.
+          This version changes the Rust compiler optimizations; it does **not**
+          contain the untested QEMU THP, QEMU security backports, newer Reims
+          runtime or unrelated rendering features.
+
+          **Rollback and history:** Previous official [v0.1.1](https://github.com/darrenintr/reims-vgpu/releases/tag/v0.1.1)
+          (Native-v3 only) and [v0.1.0](https://github.com/darrenintr/reims-vgpu/releases/tag/v0.1.0)
+          (generic x86-64) are preserved unchanged. Stop the VM before
+          switching between installed versions.
+          NOTES
+          gh release create "$stable_tag" \
+            reims-vgpu-linux-x86_64.tar.gz SHA256SUMS \
+            --repo "$repo" --target "$source_sha" \
+            --title 'v0.1.2 — Native-v3 + Fat-LTO performance baseline' \
+            --notes-file RELEASE-NOTES.md --latest
+
+          result_sha="$(gh api "repos/$repo/commits/$stable_tag" --jq '.sha')"
+          test "$result_sha" = "$source_sha"
+          gh release view "$stable_tag" --repo "$repo" \
+            --json tagName,isPrerelease,assets \
+            --jq '{tag: .tagName, prerelease: .isPrerelease, assets: [.assets[].name]}'
+          echo "Promoted exact stacked native-v3-fat-lto artifact: https://github.com/$repo/releases/tag/$stable_tag"
