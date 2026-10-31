@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# Start-menu launcher for the existing macOS Tahoe VM.
+# Uses GitHub Release binaries instead of building QEMU locally.
+# Preserves focus, stop, clipboard synchronization and SSH-ready notifications.
+# Requires ~/.local/bin/reims-release (GitHub-managed downloader).
+set -uo pipefail
+
+VM=tahoe
+DATA=${REIMS_CTL_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/reims-ctl}
+QEMU_ROOT=$DATA/qemu
+RELEASE_MANAGER=$HOME/.local/bin/reims-release
+LEGACY_CTL=$HOME/.local/bin/reims-ctl
+PIDFILE=$DATA/vms/$VM/qemu.pid
+LOG=${XDG_STATE_HOME:-$HOME/.local/state}/tahoe-launch.log
+STATE=$DATA/release-manager.json
+mkdir -p "$(dirname "$LOG")"
+
+notify() { command -v notify-send >/dev/null && notify-send -a 'macOS Tahoe' -i computer "$@" 2>/dev/null || true; }
+running() { [[ -f $PIDFILE ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+current_ctl() {
+  if [[ -x "$QEMU_ROOT/current/bin/reims-ctl" ]]; then
+    printf '%s\n' "$QEMU_ROOT/current/bin/reims-ctl"
+  elif [[ -x "$LEGACY_CTL" ]]; then
+    printf '%s\n' "$LEGACY_CTL"
+  else
+    return 1
+  fi
+}
+
+dialog_question() {
+  local title=$1 message=$2
+  if command -v kdialog >/dev/null; then
+    kdialog --title "$title" --yesno "$message" 2>/dev/null
+  elif command -v zenity >/dev/null; then
+    zenity --question --title="$title" --text="$message" 2>/dev/null
+  elif [[ -t 0 ]]; then
+    local answer
+    read -r -p "$message [Y/n] " answer
+    [[ -z "$answer" || "$answer" =~ ^[yY]([eE][sS])?$ ]]
+  else
+    # Headless/non-interactive fallback: notify and proceed with the update.
+    # Install kdialog on KDE if you want explicit graphical confirmation.
+    notify 'GUI confirmation unavailable' 'Downloading the selected GitHub build automatically.'
+    return 0
+  fi
+}
+
+choose_release() {
+  local data tag label
+  local -a choices=()
+  data=$("$RELEASE_MANAGER" --list --json 2>>"$LOG") || return 1
+  while IFS=$'\t' read -r tag label; do
+    [[ -n "$tag" ]] && choices+=("$tag" "$label")
+  done < <(
+    printf '%s' "$data" | python3 -c '
+import json, sys
+try:
+    releases = json.load(sys.stdin)
+except (ValueError, TypeError):
+    releases = []
+for r in releases:
+    tag = str(r.get("tag", ""))
+    title = (r.get("name") or tag).replace("\n", " ").replace("\t", " ")
+    status = " [downloaded]" if r.get("installed") else ""
+    active = " [active]" if r.get("current") else ""
+    channel = r.get("channel", "experimental").upper()
+    print(tag + "\t[" + channel + "] " + title + status + active)
+' 2>>"$LOG"
+  )
+  ((${#choices[@]})) || return 1
+  if command -v kdialog >/dev/null; then
+    kdialog --title 'macOS Tahoe · GitHub Releases' --menu \
+      '選擇本次使用的版本（從 GitHub 即時取得）：' "${choices[@]}" 2>/dev/null
+  elif command -v zenity >/dev/null; then
+    printf '%s\n' "${choices[@]}" | paste -d '\t' - - |
+      zenity --list --title='macOS Tahoe · GitHub Releases' \
+        --text='選擇發佈版本' --column='Tag' --column='Description' \
+        --hide-column=1 --print-column=1 2>/dev/null
+  elif [[ -t 0 ]]; then
+    local i answer
+    for ((i=0; i<${#choices[@]}; i+=2)); do
+      printf '%2d: %s\n' "$((i/2+1))" "${choices[i+1]}" >&2
+    done
+    read -r -p 'Choose release number: ' answer
+    [[ "$answer" =~ ^[0-9]+$ ]] || return 1
+    local idx=$(( (answer-1)*2 ))
+    ((idx>=0 && idx<${#choices[@]})) || return 1
+    printf '%s\n' "${choices[idx]}"
+  else
+    notify 'Select a GitHub release' 'Install kdialog for graphical version selection'
+    return 1
+  fi
+}
+choose_debug() {
+  case ${TAHOE_DEBUG_MODE:-} in off|fps|gpu) echo "$TAHOE_DEBUG_MODE"; return ;; esac
+  if command -v kdialog >/dev/null; then
+    kdialog --title 'macOS Tahoe · Performance' --menu \
+      '本次開啟的效能監控：' \
+      off '正常啟動（不額外收集 FPS）' \
+      fps 'FPS 與 GPU 時間（每秒一條）' \
+      gpu 'FPS + 詳細 Vulkan Timing 記錄' 2>/dev/null
+  elif command -v zenity >/dev/null; then
+    zenity --list --title='macOS Tahoe · Performance' \
+      --text='選擇效能監控' --column='Mode' off fps gpu 2>/dev/null
+  elif [[ -t 0 ]]; then
+    local answer
+    read -r -p 'Performance [off/fps/gpu] (default off): ' answer
+    case "$answer" in fps|gpu) echo "$answer";; *) echo off;; esac
+  else
+    echo off
+  fi
+}
+open_monitor() {
+  local logfile=$DATA/vms/$VM/logs/qemu.log
+  if command -v konsole >/dev/null; then
+    konsole -e tail -n 30 -F "$logfile" >/dev/null 2>&1 &
+    disown
+  elif command -v xterm >/dev/null; then
+    xterm -T 'Tahoe performance' -e tail -n 30 -F "$logfile" >/dev/null 2>&1 &
+    disown
+  else
+    notify 'Performance log' "$logfile"
+  fi
+}
+
+# These paths must work without connecting to GitHub or switching QEMU versions.
+if [[ ${1:-} == --stop ]]; then
+  if ! running; then notify 'Tahoe is not running'; exit 0; fi
+  CTL=$(current_ctl) || { notify -u critical 'Cannot find reims-ctl'; exit 1; }
+  notify 'Shutting Tahoe down…'
+  "$CTL" stop "$VM" >>"$LOG" 2>&1 && notify 'Tahoe is off' || {
+    notify -u critical 'Tahoe did not stop' "See $LOG"
+    exit 1
+  }
+  exit 0
+fi
+if [[ ${1:-} == --monitor ]]; then
+  open_monitor
+  exit 0
+fi
+if running; then
+  WINDOW=$HOME/.local/bin/reims-window
+  if [[ -x "$WINDOW" ]]; then exec "$WINDOW" focus; fi
+  notify 'Tahoe is already running' 'Focus the macOS window from the desktop.'
+  exit 0
+fi
+
+# The Start Menu shows ALL published releases through kdialog or zenity.
+# TAHOE_RELEASE_TAG or --tag can bypass the dialog for custom desktop entries.
+TAG=${TAHOE_RELEASE_TAG:-}
+case ${1:-} in
+  '') ;;
+  --tag) TAG=${2:-} ;;
+  --tag=*) TAG=${1#--tag=} ;;
+  *) notify -u critical 'Invalid Tahoe launcher option' "$1"; exit 2 ;;
+esac
+[[ -x "$RELEASE_MANAGER" ]] || {
+  notify -u critical 'GitHub release manager missing' "Install $RELEASE_MANAGER first"
+  exit 1
+}
+if [[ -z "$TAG" ]]; then
+  TAG=$(choose_release) || exit 0
+fi
+[[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || {
+  notify -u critical 'Invalid Release tag' "$TAG"
+  exit 2
+}
+ARGS=(--tag "$TAG" --install-only)
+if [[ -x "$QEMU_ROOT/$TAG/bin/reims-ctl" && -x "$QEMU_ROOT/$TAG/bin/qemu-system-x86_64" ]]; then
+  ARGS+=(--no-check)
+elif ! dialog_question 'macOS Tahoe · Download' \
+  "下載 GitHub Release $TAG？"$'\n'"只下載已編譯的 QEMU，不會在本機編譯。"; then
+  exit 0
+fi
+MODE=$(choose_debug) || exit 0
+case "$MODE" in
+  off)
+    export REIMS_CTL_SESSION_STATS=0
+    export REIMS_CTL_SESSION_LOG=warn ;;
+  fps)
+    export REIMS_CTL_SESSION_STATS=1
+    export REIMS_CTL_SESSION_LOG=warn ;;
+  gpu)
+    export REIMS_CTL_SESSION_STATS=1
+    export REIMS_CTL_SESSION_LOG='warn,reims_vgpu_vulkan::gpu::timing=debug'
+    export M2V_SCHED_STATS=1 ;;
+  *) exit 0 ;;
+esac
+{
+  echo "==== $(date '+%F %T') $VM release=$TAG performance=$MODE"
+  echo "Previous QEMU: $(readlink -f "$QEMU_ROOT/current" 2>/dev/null || echo none)"
+} >>"$LOG"
+notify 'Preparing macOS Tahoe' "Release $TAG · $MODE"
+if ! "$RELEASE_MANAGER" "${ARGS[@]}" >>"$LOG" 2>&1; then
+  notify -u critical 'Tahoe build unavailable' "Could not select $TAG. See $LOG"
+  exit 1
+fi
+USING_LEGACY=0
+# Do not accidentally run an older reims-ctl or an overridden source-build QEMU.
+if [[ $USING_LEGACY == 1 ]]; then
+  CTL=$LEGACY_CTL
+else
+  CTL=$QEMU_ROOT/current/bin/reims-ctl
+  if [[ ! -x "$CTL" ]]; then
+    notify -u critical 'Incomplete prebuilt QEMU installation' "Missing $CTL"
+    exit 1
+  fi
+  unset REIMS_CTL_QEMU
+fi
+
+{
+  echo "QEMU: $(readlink -f "$QEMU_ROOT/current")"
+  "$CTL" --version
+} >>"$LOG" 2>&1
+notify 'Starting macOS Tahoe' "Using $TAG · $MODE"
+
+if ! "$CTL" start "$VM" >>"$LOG" 2>&1; then
+  notify -u critical 'Tahoe failed to start' "$(tail -n 5 "$LOG")"
+  exit 1
+fi
+if [[ "$MODE" != off ]]; then
+  open_monitor
+fi
+
+# Original clipboard bridge: restart so it reconnects when macOS SSH is ready.
+systemctl --user restart mac-clip-sync.service 2>>"$LOG" ||
+  notify 'Clipboard sync is not running' 'systemctl --user status mac-clip-sync'
+
+(
+  for _ in $(seq 120); do
+    running || exit 0
+    if ssh -o BatchMode=yes -o ConnectTimeout=3 macos-vm true 2>/dev/null; then
+      notify 'Tahoe is up' 'Clipboard synced · Meta+Shift+F full screen · Meta+Shift+W windowed'
+      exit 0
+    fi
+    sleep 5
+  done
+  notify 'Tahoe: clipboard sync not connected' 'Guest SSH (macos-vm) did not answer'
+) >>"$LOG" 2>&1 &
+disown
