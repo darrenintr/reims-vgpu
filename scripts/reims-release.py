@@ -202,11 +202,12 @@ def curated_releases(rows):
     stable = latest_stable(rows)
     if stable:
         ordered.append(stable)
+    superseded_by_stable = bool(stable and stable_version(stable["tag"]) >= (0, 1, 2))
 
     # A legacy Testing-14 is not a new change on top of current Stable.
     # A future genuinely newer Testing Release is eligible for display.
     testing = [r for r in rows if r["channel"] == "testing"
-               and r["tag"] not in SUPERSEDED_TAGS
+               and (not superseded_by_stable or r["tag"] not in SUPERSEDED_TAGS)
                and (not stable or (r.get("published_at") or "") >
                     (stable.get("published_at") or ""))]
     if testing:
@@ -216,7 +217,7 @@ def curated_releases(rows):
     for row in sorted(rows, key=lambda r: r.get("published_at") or "", reverse=True):
         if row["channel"] != "experimental":
             continue
-        if row["tag"] in SUPERSEDED_TAGS:
+        if superseded_by_stable and row["tag"] in SUPERSEDED_TAGS:
             continue
         group = release_group(row)
         if group in ("experimental:profiler", "experimental:other"):
