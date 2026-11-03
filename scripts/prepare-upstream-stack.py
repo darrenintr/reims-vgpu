@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
-"""Candidate entrypoint and explicit adaptations for the retained fork.
-
-The generic, fail-closed port engine lives in upstream_stack_prepare.py.
-Rust test-module declaration order is not semantic: registering a new test
-module at the end avoids depending on unrelated upstream test additions.
-No production-code conflict is resolved by this special case.
-"""
+"""Documented adaptations over the strict upstream port engine."""
 from __future__ import annotations
 
 import re
 import subprocess
 import sys
 import upstream_stack_prepare as engine
+from upstream_stack_test_compat import adapt_test_helpers
 
 original_patch = engine.apply_patch
 original_port = engine.port
@@ -39,8 +34,6 @@ def transactional_port(*args, **kwargs):
     try:
         return original_port(*args, **kwargs)
     except OSError as error:
-        # Missing intermediate-upstream files are a failed port, not permission
-        # to transplant a partial feature. The engine records optional deferrals.
         raise RuntimeError(f"Source tree prerequisite missing: {error}") from error
 
 
@@ -50,6 +43,7 @@ engine.port = transactional_port
 if __name__ == "__main__":
     try:
         engine.main()
+        adapt_test_helpers(engine)
     except (RuntimeError, OSError, subprocess.SubprocessError) as error:
         print(f"ASSEMBLY FAILED: {error}", file=sys.stderr)
         sys.exit(1)
