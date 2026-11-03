@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Assemble an isolated candidate; never install it or touch Stable refs.
 
-Run from the experiment checkout. All upstream inputs are immutable commits.
-Exact patch matching is required. Context trimming is allowed only when the
-remaining old text occurs exactly once; changed lines are never fuzzy-matched.
-Optional translator ports are transactional and explicitly reported if deferred.
+All upstream inputs are immutable commits. Changed lines must match exactly.
+Outer unchanged context may be shortened only to an unambiguous anchored match.
+Optional translator ports are transactional and reported if deferred.
 """
 from __future__ import annotations
 
@@ -45,6 +44,44 @@ def occurrences(lines: list[str], needle: list[str]) -> list[int]:
             if lines[i:i + len(needle)] == needle]
 
 
+def match_hunk(lines: list[str], hunk: list[str]) -> tuple[list[str], tuple[int, int]]:
+    lead = 0
+    for line in hunk:
+        if not line.startswith(" "):
+            break
+        lead += 1
+    tail = 0
+    for line in reversed(hunk):
+        if not line.startswith(" "):
+            break
+        tail += 1
+    # Prefer the greatest amount of original context. All equally strong
+    # anchors must produce the same result. An insertion never matches empty
+    # text, and deletion/replacement lines are never shortened or ignored.
+    for total in range(lead + tail + 1):
+        results: dict[tuple[str, ...], tuple[int, int]] = {}
+        for left in range(lead + 1):
+            right = total - left
+            if not 0 <= right <= tail:
+                continue
+            slim = hunk[left:len(hunk) - right if right else len(hunk)]
+            old = [s[1:] for s in slim if s[0] in " -"]
+            new = [s[1:] for s in slim if s[0] in " +"]
+            found = occurrences(lines, old)
+            if len(found) != 1:
+                continue
+            start = found[0]
+            result = tuple(lines[:start] + new + lines[start + len(old):])
+            results[result] = (left, right)
+        if len(results) > 1:
+            raise RuntimeError("Equally strong context anchors disagree")
+        if results:
+            result, trimmed = next(iter(results.items()))
+            return list(result), trimmed
+    changed = [s for s in hunk if not s.startswith(" ")]
+    raise RuntimeError(f"No unique exact source match; changes={changed[:5]!r}")
+
+
 def apply_patch(source: str, patch: str, filename: str) -> str:
     hunks: list[list[str]] = []
     for line in patch.splitlines():
@@ -56,35 +93,20 @@ def apply_patch(source: str, patch: str, filename: str) -> str:
         raise RuntimeError(f"No text hunks: {filename}")
     lines = source.splitlines()
     for number, hunk in enumerate(hunks, 1):
-        old = [s[1:] for s in hunk if s[0] in " -"]
-        new = [s[1:] for s in hunk if s[0] in " +"]
-        found = occurrences(lines, old)
-        if len(found) != 1:
-            # Keep all modifications and internal context; trim only unchanged
-            # outer context, which differs due to the fork's trace/batching code.
-            slim = hunk[:]
-            while slim and slim[0].startswith(" "):
-                slim.pop(0)
-            while slim and slim[-1].startswith(" "):
-                slim.pop()
-            old2 = [s[1:] for s in slim if s[0] in " -"]
-            new2 = [s[1:] for s in slim if s[0] in " +"]
-            found = occurrences(lines, old2)
-            if len(found) != 1:
-                raise RuntimeError(f"Conflict in {filename}, hunk {number}; "
-                                   f"unique old-text match required, got {len(found)}; "
-                                   f"context={old2[:5]!r}")
-            old, new = old2, new2
+        try:
+            lines, trimmed = match_hunk(lines, hunk)
+        except RuntimeError as error:
+            raise RuntimeError(f"Conflict in {filename}, hunk {number}: {error}") from error
+        if trimmed != (0, 0):
             AUDIT.append({"file": filename, "hunk": number,
-                          "resolution": "unique exact changed block; outer context trimmed"})
-        start = found[0]
-        lines[start:start + len(old)] = new
+                          "resolution": "unique exact anchored match",
+                          "outer_context_removed": list(trimmed)})
     return "\n".join(lines) + "\n"
 
 
 def port(target: Path, upstream: Path, commit: str, *, translator: bool = False) -> list[str]:
     files = git(upstream, "diff", "--name-status", commit + "^", commit).splitlines()
-    writes: list[tuple[Path, str | None]] = []
+    writes: list[tuple[Path, str]] = []
     for entry in files:
         status, name = entry.split("\t", 1)
         if not name.startswith("crates/") or not name.endswith(".rs"):
@@ -99,8 +121,7 @@ def port(target: Path, upstream: Path, commit: str, *, translator: bool = False)
             raise RuntimeError(f"Unsupported change {status}: {name}")
         patch = git(upstream, "diff", "--no-ext-diff", "--unified=3", commit + "^", commit, "--", name)
         if translator and commit == DEBUG:
-            # The retained fork predates TypeLayouts. Debug metadata needs Md,
-            # not the newer layout implementation or its unrelated API changes.
+            # Debug metadata needs Md, not the later unrelated TypeLayouts API.
             patch = patch.replace("MdId, Module, Type, TypeId, TypeLayouts",
                                   "MdId, Module, Type, TypeId")
             if name == "crates/metal2vulkan/src/cache/mod.rs":
@@ -114,15 +135,15 @@ def port(target: Path, upstream: Path, commit: str, *, translator: bool = False)
         writes.append((path, apply_patch(path.read_text(), patch, name)))
     if not writes:
         raise RuntimeError(f"No source changes selected for {commit}")
-    # Commit each port to disk only once every file has matched.
     for path, content in writes:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content or "")
+        path.write_text(content)
     return [str(path.relative_to(target)) for path, _ in writes]
 
 
 def fetch(repo: Path, remote: str, *refs: str) -> None:
-    git(repo, "fetch", "--no-tags", remote, *refs)
+    # Each port needs its parent tree, not the complete upstream history.
+    git(repo, "fetch", "--no-tags", "--depth=2", remote, *refs)
 
 
 def require(path: str, *strings: str) -> None:
@@ -132,7 +153,19 @@ def require(path: str, *strings: str) -> None:
             raise RuntimeError(f"Missing invariant in {path}: {s}")
 
 
+def self_test() -> None:
+    assert match_hunk(["a", "trace", "old", "b"], [" a", "-old", "+new", " b"])[0] == ["a", "trace", "new", "b"]
+    assert match_hunk(["mod old_a;", "mod common;"], [" mod upstream_only;", "+mod inserted;", " mod common;"])[0] == ["mod old_a;", "mod inserted;", "mod common;"]
+    for lines in (["old", "old"], ["newer"]):
+        try:
+            match_hunk(lines, ["-old", "+new"])
+        except RuntimeError:
+            continue
+        raise RuntimeError("Patch matcher accepted ambiguous or mismatched input")
+
+
 def main() -> None:
+    self_test()
     os.chdir(ROOT)
     if MARKER.exists():
         manifest = json.loads(MARKER.read_text())
@@ -141,8 +174,7 @@ def main() -> None:
         print("Already assembled; compiling the committed candidate unchanged.")
         return
     git(ROOT, "merge-base", "--is-ancestor", BASE, "HEAD")
-    partial = set(git(ROOT, "diff", "--name-only", BASE, "HEAD", "--",
-                      "crates/reims-vgpu-core").splitlines())
+    partial = set(git(ROOT, "diff", "--name-only", BASE, "HEAD", "--", "crates/reims-vgpu-core").splitlines())
     expected = {
         "crates/reims-vgpu-core/src/collections.rs",
         "crates/reims-vgpu-core/src/collections/hasher.rs",
@@ -152,9 +184,7 @@ def main() -> None:
     }
     if not partial.issubset(expected):
         raise RuntimeError(f"Unexpected pre-existing core edits: {partial - expected}")
-    # Finish the known partial port as one complete, repeatable source assembly.
-    git(ROOT, "restore", "--source=" + BASE, "--staged", "--worktree", "--",
-        "crates/reims-vgpu-core")
+    git(ROOT, "restore", "--source=" + BASE, "--staged", "--worktree", "--", "crates/reims-vgpu-core")
     fetch(ROOT, "https://github.com/steelbrain/reims-vgpu.git", DECODER, FIFO)
     applied = []
     for commit in (DECODER, FIFO):
@@ -178,18 +208,13 @@ def main() -> None:
             except RuntimeError as error:
                 if commit == DEBUG:
                     raise
-                # A newer compiler feature may require much newer translator
-                # infrastructure. Do not replace the tested RDNA3 fork wholesale.
-                deferred.append({"component": "metal2vulkan", "commit": commit,
-                                 "reason": str(error)})
+                deferred.append({"component": "metal2vulkan", "commit": commit, "reason": str(error)})
                 print(f"DEFERRED {commit}: {error}", flush=True)
                 continue
             applied.append({"component": "metal2vulkan", "commit": commit, "files": paths})
             print(f"Applied Metal2Vulkan {commit}: {len(paths)} source files", flush=True)
         git(m2v, "add", "crates")
-        git(m2v, "-c", "user.name=Reims candidate builder", "-c",
-            "user.email=41898282+github-actions[bot]@users.noreply.github.com",
-            "commit", "-m", "Assemble pinned translator compatibility backports")
+        git(m2v, "-c", "user.name=Reims candidate builder", "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com", "commit", "-m", "Assemble pinned translator compatibility backports")
         m2v_tree = git(m2v, "rev-parse", "HEAD^{tree}").strip()
         archive = ROOT / ".m2v-source.tar"
         git(m2v, "archive", "--format=tar", "--output=" + str(archive), "HEAD")
