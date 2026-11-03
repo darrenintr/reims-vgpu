@@ -711,6 +711,7 @@ pub(super) mod test_support {
                 command_buffer: Some(command_buffer),
                 pipeline: None,
                 max_color_attachment_index: 0,
+                caps: std::cell::OnceCell::new(),
             };
             p.call_log().clear();
             Rig {

@@ -31,6 +31,7 @@
 //! - **A raise** out of a segment faults the decoder (ends the encoder, drops it and the pipeline)
 //!   and goes on; a raise from that `endEncoding` goes on in its place and leaves both held.
 
+use std::cell::OnceCell;
 use std::fmt;
 use std::sync::{Arc, Weak};
 
@@ -45,6 +46,7 @@ use crate::deserializer::records::{
     CmdSetSamplerStates, CmdSetSamplerStatesLODClamp, CmdSetSamplerStatesLODClampEntry,
     CmdSetTextures, CmdSetThreadgroupMemoryLength, CmdUseHeaps, CmdUseResources, SegmentHeader,
 };
+use crate::deserializer::short_list::ShortList;
 use crate::deserializer::walk::{RECORD_HEADER_SIZE, next_record};
 use crate::deserializer::{Deserializer, RaiseKind, upgrade};
 use crate::memory::cursor::Cursor;
@@ -202,6 +204,10 @@ pub struct ComputeDecoder<P: Platform> {
     /// Whether the encoder's pass asked for concurrent dispatch (0xdb 1), set with each new
     /// segment's encoder.
     concurrent: bool,
+    /// The device's capabilities, read at a segment's first limit or flag (none for a task
+    /// without a device) and kept to its end: each record would read them again otherwise,
+    /// which on the Metal platform is a send and a lock.
+    caps: OnceCell<Option<Arc<DeviceCaps>>>,
 }
 
 impl<P: Platform> ComputeDecoder<P> {
@@ -216,6 +222,7 @@ impl<P: Platform> ComputeDecoder<P> {
             command_buffer,
             pipeline: None,
             concurrent: false,
+            caps: OnceCell::new(),
         }
     }
 
@@ -232,18 +239,21 @@ impl<P: Platform> ComputeDecoder<P> {
         }
     }
 
+    /// The device's capabilities, as the segment first read them; none for a deserializer
+    /// without a device.
+    fn caps(&self) -> Option<&DeviceCaps> {
+        let read = || self.deserializer().device().map(|device| device.caps());
+        self.caps.get_or_init(read).as_deref()
+    }
+
     /// A limit from the device's capabilities; 0 for a deserializer without a device.
     fn device_limit(&self, limit: impl FnOnce(&DeviceCaps) -> u64) -> u64 {
-        self.deserializer()
-            .device()
-            .map_or(0, |device| limit(&device.caps()))
+        self.caps().map_or(0, limit)
     }
 
     /// A flag from the device's capabilities; false for a deserializer without a device.
     fn device_supports(&self, flag: impl FnOnce(&Flags) -> bool) -> bool {
-        self.deserializer()
-            .device()
-            .is_some_and(|device| flag(&device.caps().flags))
+        self.caps().is_some_and(|caps| flag(&caps.flags))
     }
 
     /// Decodes one segment. A raise out of it faults the decoder and goes on; a raise from the
@@ -254,6 +264,7 @@ impl<P: Platform> ComputeDecoder<P> {
         header: &SegmentHeader,
         mut segment: Cursor,
     ) -> RaiseResult<()> {
+        self.caps = OnceCell::new();
         let mut decoded = self.decode_segment(hold, header, &mut segment);
         if decoded.is_err() {
             hold.cleanup_step(&mut decoded, self.fault())?;
@@ -456,8 +467,8 @@ impl<P: Platform> ComputeDecoder<P> {
             );
         }
         let count = command.range_length.to_usize();
-        let mut buffers = Vec::with_capacity(count);
-        let mut offsets = Vec::with_capacity(count);
+        let mut buffers = ShortList::with_capacity(count);
+        let mut offsets = ShortList::with_capacity(count);
         for _ in 0..command.range_length {
             let entry: CmdSetBufferEntry = cursor.read_or_raise(OnFault::Return)?;
             buffers.push(
@@ -467,7 +478,7 @@ impl<P: Platform> ComputeDecoder<P> {
             );
             offsets.push(entry.offset);
         }
-        let buffers: Vec<Option<&P::Buffer>> = buffers.iter().map(Option::as_ref).collect();
+        let buffers: ShortList<Option<&P::Buffer>> = buffers.iter().map(Option::as_ref).collect();
         self.send(ComputeCmd::SetBuffers {
             buffers: &buffers,
             offsets: &offsets,
@@ -497,9 +508,9 @@ impl<P: Platform> ComputeDecoder<P> {
             );
         }
         let count = command.range_length.to_usize();
-        let mut buffers = Vec::with_capacity(count);
-        let mut offsets = Vec::with_capacity(count);
-        let mut strides = Vec::with_capacity(count);
+        let mut buffers = ShortList::with_capacity(count);
+        let mut offsets = ShortList::with_capacity(count);
+        let mut strides = ShortList::with_capacity(count);
         for _ in 0..command.range_length {
             let entry: CmdSetBufferEntryWithStride = cursor.read_or_raise(OnFault::Return)?;
             buffers.push(
@@ -518,7 +529,7 @@ impl<P: Platform> ComputeDecoder<P> {
                 "the device does not support dynamic attribute strides"
             );
         }
-        let buffers: Vec<Option<&P::Buffer>> = buffers.iter().map(Option::as_ref).collect();
+        let buffers: ShortList<Option<&P::Buffer>> = buffers.iter().map(Option::as_ref).collect();
         self.send(ComputeCmd::SetBuffersAttributeStrides {
             buffers: &buffers,
             offsets: &offsets,
@@ -544,7 +555,7 @@ impl<P: Platform> ComputeDecoder<P> {
                 )
             );
         }
-        let mut samplers = Vec::with_capacity(command.range_length.to_usize());
+        let mut samplers = ShortList::with_capacity(command.range_length.to_usize());
         for _ in 0..command.range_length {
             let reference: u32 = cursor.read_or_raise(OnFault::Return)?;
             samplers.push(
@@ -553,7 +564,8 @@ impl<P: Platform> ComputeDecoder<P> {
                     .get_sampler_state(hold, reference)?,
             );
         }
-        let samplers: Vec<Option<&P::SamplerState>> = samplers.iter().map(Option::as_ref).collect();
+        let samplers: ShortList<Option<&P::SamplerState>> =
+            samplers.iter().map(Option::as_ref).collect();
         self.send(ComputeCmd::SetSamplerStates {
             samplers: &samplers,
             range,
@@ -582,9 +594,9 @@ impl<P: Platform> ComputeDecoder<P> {
             );
         }
         let count = command.range_length.to_usize();
-        let mut samplers = Vec::with_capacity(count);
-        let mut lod_min_clamps = Vec::with_capacity(count);
-        let mut lod_max_clamps = Vec::with_capacity(count);
+        let mut samplers = ShortList::with_capacity(count);
+        let mut lod_min_clamps = ShortList::with_capacity(count);
+        let mut lod_max_clamps = ShortList::with_capacity(count);
         for _ in 0..command.range_length {
             let entry: CmdSetSamplerStatesLODClampEntry = cursor.read_or_raise(OnFault::Return)?;
             samplers.push(
@@ -595,7 +607,8 @@ impl<P: Platform> ComputeDecoder<P> {
             lod_min_clamps.push(entry.lod_min_clamp);
             lod_max_clamps.push(entry.lod_max_clamp);
         }
-        let samplers: Vec<Option<&P::SamplerState>> = samplers.iter().map(Option::as_ref).collect();
+        let samplers: ShortList<Option<&P::SamplerState>> =
+            samplers.iter().map(Option::as_ref).collect();
         self.send(ComputeCmd::SetSamplerStatesLodClamps {
             samplers: &samplers,
             lod_min_clamps: &lod_min_clamps,
@@ -621,7 +634,7 @@ impl<P: Platform> ComputeDecoder<P> {
                 )
             );
         }
-        let mut textures = Vec::with_capacity(command.range_length.to_usize());
+        let mut textures = ShortList::with_capacity(command.range_length.to_usize());
         for _ in 0..command.range_length {
             let reference: u32 = cursor.read_or_raise(OnFault::Return)?;
             textures.push(
@@ -630,7 +643,8 @@ impl<P: Platform> ComputeDecoder<P> {
                     .get_texture(hold, reference)?,
             );
         }
-        let textures: Vec<Option<&P::Texture>> = textures.iter().map(Option::as_ref).collect();
+        let textures: ShortList<Option<&P::Texture>> =
+            textures.iter().map(Option::as_ref).collect();
         self.send(ComputeCmd::SetTextures {
             textures: &textures,
             range,
@@ -1104,9 +1118,11 @@ mod tests {
             self.p.call_log().sels()
         }
 
-        /// Sets the device's capabilities: its defaults, changed by `f`.
-        fn set_caps(&self, f: impl FnOnce(&mut crate::platform::caps::DeviceCaps)) {
+        /// Sets the device's capabilities: its defaults, changed by `f`. The decoder reads them
+        /// again at its next record, as at a new segment (a real device's never change).
+        fn set_caps(&mut self, f: impl FnOnce(&mut crate::platform::caps::DeviceCaps)) {
             crate::deserializer::test_lookups::set_caps(&self.p, f);
+            self.d.caps = OnceCell::new();
         }
 
         fn last(&self, sel: &str) -> Vec<Arg> {

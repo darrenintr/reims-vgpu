@@ -17,7 +17,9 @@
 //! thread's last-resort holder: a thread core started (a queue's worker, the FIFO thread) keeps
 //! one, released once the worker has left its queue ([`crate::rt::pool::drain_idle`]) and at the
 //! thread's end, just before its last-resort real pool pops. On any other thread (Metal's, a
-//! test's) the value drops there.
+//! test's) the value drops there. A core thread that runs another queue's work in place (an
+//! isolated task's exec on the FIFO thread) holds that work's values to a scope of its own
+//! ([`LastResortScope`]), released when the work returns, as that queue's worker would.
 //!
 //! A raise carries values outward too: [`crate::raise::Raise::defer`] puts one in the raise's
 //! [`Deferred`], and the catch that ends the raise ([`Hold::land`]) hands them to its hold's
@@ -246,6 +248,46 @@ pub(in crate::rt) fn release_last_resort(again: bool) {
     drop(last);
     if again {
         let _ = LAST_RESORT.try_with(|l| *l.borrow_mut() = Some(Held::new()));
+    }
+}
+
+/// A scope of the thread's last-resort holder, for a core thread that runs another queue's work in
+/// place (an isolated task's exec delivered on the FIFO thread, its job and its reply): while it
+/// lives, what is held with no holder goes to a holder of its own, which its drop releases, most
+/// recent first, before the thread's own holder is back. That work's values then go at its end,
+/// once the thread has left the queues, as those queues' workers release theirs once they have
+/// left them ([`crate::rt::pool::drain_idle`]), not at the thread's end. On a thread with no
+/// last-resort holder (the host's, Metal's, a test's) it changes nothing: the values go at once.
+pub(crate) struct LastResortScope {
+    /// The thread's own holder, put back at the drop; `None` on a thread with none.
+    outer: Option<Held>,
+}
+
+impl LastResortScope {
+    /// Starts the scope on this thread.
+    pub(crate) fn enter() -> LastResortScope {
+        let outer = LAST_RESORT
+            .try_with(|l| {
+                let mut l = l.borrow_mut();
+                // Only a thread that has a holder gets the scope's.
+                l.is_some().then(|| l.replace(Held::new())).flatten()
+            })
+            .ok()
+            .flatten();
+        LastResortScope { outer }
+    }
+}
+
+impl Drop for LastResortScope {
+    /// Releases what the scope held, as [`release_last_resort`] does (a value held with no holder
+    /// meanwhile goes at once), then puts the thread's own holder back.
+    fn drop(&mut self) {
+        let Some(outer) = self.outer.take() else {
+            return;
+        };
+        let inner = LAST_RESORT.try_with(RefCell::take).ok().flatten();
+        drop(inner);
+        let _ = LAST_RESORT.try_with(|l| *l.borrow_mut() = Some(outer));
     }
 }
 
@@ -642,6 +684,49 @@ mod tests {
         release_last_resort(false);
         Hold::NONE.keep(Rel("after"));
         assert_eq!(events(), ["held", "release deep", "release after"]);
+    }
+
+    /// A last-resort scope releases at its end what was held with no holder inside it, most
+    /// recent first, and the thread's own holder keeps what it held before and after
+    #[test]
+    fn a_last_resort_scope_releases_at_its_end() {
+        release_last_resort(true);
+        Hold::NONE.keep(Rel("before"));
+        let scope = LastResortScope::enter();
+        Hold::NONE.keep(Rel("a"));
+        Hold::NONE.keep(Rel("b"));
+        note("delivered");
+        drop(scope);
+        note("left");
+        Hold::NONE.keep(Rel("after"));
+        note("drain");
+        release_last_resort(false);
+        assert_eq!(
+            events(),
+            [
+                "delivered",
+                "release b",
+                "release a",
+                "left",
+                "drain",
+                "release after",
+                "release before"
+            ]
+        );
+    }
+
+    /// On a thread with no last-resort holder, a scope changes nothing: what is held with no
+    /// holder goes at once, inside it as outside
+    #[test]
+    fn a_last_resort_scope_on_a_thread_with_no_holder_holds_nothing() {
+        let seen = releases(|| {
+            let scope = LastResortScope::enter();
+            Hold::NONE.keep(Rel("inside"));
+            note("held");
+            drop(scope);
+            Hold::NONE.keep(Rel("outside"));
+        });
+        assert_eq!(seen, ["release inside", "held", "release outside"]);
     }
 
     /// Counts its releases.

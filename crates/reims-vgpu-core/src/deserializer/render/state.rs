@@ -34,6 +34,7 @@ use crate::deserializer::records::{
     CmdSetVisibiliyResultMode, ReplyTileDimensions,
     VertexAmplificationViewMapping as ViewMappingRecord,
 };
+use crate::deserializer::short_list::ShortList;
 use crate::memory::cursor::{Cursor, WritableCursor};
 use crate::num::{ToUsize, Truncate};
 use crate::platform::render::{RenderCmd, RenderEncoder as _};
@@ -76,13 +77,13 @@ fn write_reply<T: IntoBytes + Immutable>(
 }
 
 /// The buffers and offsets of a buffer list.
-type BufferList<P> = (Vec<Option<<P as Platform>::Buffer>>, Vec<u64>);
+type BufferList<P> = (ShortList<Option<<P as Platform>::Buffer>>, ShortList<u64>);
 
 /// The samplers and the two clamp arrays of a LOD-clamp sampler list.
 type SamplerLodList<P> = (
-    Vec<Option<<P as Platform>::SamplerState>>,
-    Vec<f32>,
-    Vec<f32>,
+    ShortList<Option<<P as Platform>::SamplerState>>,
+    ShortList<f32>,
+    ShortList<f32>,
 );
 
 impl<P: Platform> RenderDecoder<P> {
@@ -95,8 +96,8 @@ impl<P: Platform> RenderDecoder<P> {
         c: &mut Cursor,
         count: u32,
     ) -> RaiseResult<BufferList<P>> {
-        let mut buffers = Vec::with_capacity(count.to_usize());
-        let mut offsets = Vec::with_capacity(count.to_usize());
+        let mut buffers = ShortList::with_capacity(count.to_usize());
+        let mut offsets = ShortList::with_capacity(count.to_usize());
         for _ in 0..count {
             let entry: CmdSetBufferEntry = c.read_or_raise(OnFault::Return)?;
             buffers.push(self.buffer(hold, entry.buffer_reference)?);
@@ -111,8 +112,8 @@ impl<P: Platform> RenderDecoder<P> {
         hold: Hold<'_>,
         c: &mut Cursor,
         count: u32,
-    ) -> RaiseResult<Vec<Option<P::SamplerState>>> {
-        let mut samplers = Vec::with_capacity(count.to_usize());
+    ) -> RaiseResult<ShortList<Option<P::SamplerState>>> {
+        let mut samplers = ShortList::with_capacity(count.to_usize());
         for _ in 0..count {
             let reference: u32 = c.read_or_raise(OnFault::Return)?;
             samplers.push(self.sampler_state(hold, reference)?);
@@ -129,9 +130,9 @@ impl<P: Platform> RenderDecoder<P> {
     ) -> RaiseResult<SamplerLodList<P>> {
         let n = count.to_usize();
         let (mut samplers, mut mins, mut maxs) = (
-            Vec::with_capacity(n),
-            Vec::with_capacity(n),
-            Vec::with_capacity(n),
+            ShortList::with_capacity(n),
+            ShortList::with_capacity(n),
+            ShortList::with_capacity(n),
         );
         for _ in 0..count {
             let entry: CmdSetSamplerStatesLODClampEntry = c.read_or_raise(OnFault::Return)?;
@@ -148,8 +149,8 @@ impl<P: Platform> RenderDecoder<P> {
         hold: Hold<'_>,
         c: &mut Cursor,
         count: u32,
-    ) -> RaiseResult<Vec<Option<P::Texture>>> {
-        let mut textures = Vec::with_capacity(count.to_usize());
+    ) -> RaiseResult<ShortList<Option<P::Texture>>> {
+        let mut textures = ShortList::with_capacity(count.to_usize());
         for _ in 0..count {
             let reference: u32 = c.read_or_raise(OnFault::Return)?;
             textures.push(self.texture(hold, reference)?);
