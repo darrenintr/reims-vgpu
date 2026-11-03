@@ -188,5 +188,16 @@
     "pipeline timeout behavior",
     "Rust / SDL upgrades"
   ],
-  "validation": "Source assembly only. CI compilation and tests are separate gates. No RX 7600 or Tahoe boot claim."
+  "validation": "Source assembly only. CI compilation and tests are separate gates. No RX 7600 or Tahoe boot claim.",
+  "test_adaptations": [
+    {
+      "file": "vendor/metal2vulkan/crates/metal2vulkan/src/tests/engine_debug_info.rs",
+      "reason": "Use test-local labeled RAII scratch helper; upstream assertions unchanged."
+    },
+    {
+      "file": "vendor/metal2vulkan/crates/metal2vulkan/src/tests/engine_aggregate_access.rs",
+      "reason": "Use test-local labeled RAII scratch helper; upstream assertions unchanged."
+    }
+  ],
+  "metal2vulkan_tree_scope": "Pinned port tree before documented test-only adaptations; final exact sources are in the candidate Git commit."
 }

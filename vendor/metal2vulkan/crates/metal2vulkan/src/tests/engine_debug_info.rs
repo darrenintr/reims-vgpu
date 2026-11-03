@@ -14,7 +14,7 @@ use crate::library::FunctionConstantValues;
 use crate::lower::select::LowerInputs;
 use crate::pipeline::compile::{compile_bitcode_linked, EntryRef, LinkedSource};
 use crate::pipeline::testing::{
-    compile, engine_dir, link_and_validate, llvm_assemble, meter, AssembleError, Scratch,
+    compile, engine_dir, link_and_validate, llvm_assemble, meter, AssembleError,
 };
 use crate::spirv::testing::committed_profiles;
 
@@ -255,5 +255,28 @@ fn linked_visible_functions_with_line_tables_compile_to_the_same_words() {
             words(&caller, &functions),
             "{stem}"
         );
+    }
+}
+
+// Test-only compatibility with the retained translator's helper API.
+struct Scratch(std::path::PathBuf);
+impl Scratch {
+    fn new(label: &str) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "{}-{}-{}", label, std::process::id(), id
+        ));
+        std::fs::create_dir(&path).expect("unique test scratch directory");
+        Self(path)
+    }
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }

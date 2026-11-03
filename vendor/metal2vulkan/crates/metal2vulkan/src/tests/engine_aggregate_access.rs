@@ -11,7 +11,7 @@
 
 use crate::device::DevicePolicy;
 use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage};
-use crate::pipeline::testing::{compile_kept, llvm_assemble, profile, AssembleError, Scratch};
+use crate::pipeline::testing::{compile_kept, llvm_assemble, profile, AssembleError};
 use crate::spirv::interp::{run, Buffer, Config, Resources};
 
 /// `struct P { float4 rect; float4x4 m; }`, `kernel k(constant P &p [[buffer(0)]], device float4
@@ -114,5 +114,28 @@ fn an_aggregate_buffer_access_moves_every_member() {
             .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert_eq!(got, want, "{stem}");
+    }
+}
+
+// Test-only compatibility with the retained translator's helper API.
+struct Scratch(std::path::PathBuf);
+impl Scratch {
+    fn new(label: &str) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "{}-{}-{}", label, std::process::id(), id
+        ));
+        std::fs::create_dir(&path).expect("unique test scratch directory");
+        Self(path)
+    }
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
