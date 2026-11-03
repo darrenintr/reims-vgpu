@@ -1,0 +1,209 @@
+name: Combined upstream testing bundle (2026-11-03)
+
+on:
+  push:
+    branches:
+      - experiment/upstream-stack-20261103
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: reims-upstream-stack-20261103
+  cancel-in-progress: false
+
+jobs:
+  combined-linux:
+    if: github.repository == 'darrenintr/reims-vgpu' && github.ref == 'refs/heads/experiment/upstream-stack-20261103'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TARGET_DIR: /home/runner/work/_temp/reims-stack-target
+      RUSTFLAGS: '-C target-cpu=x86-64-v3'
+      CARGO_PROFILE_RELEASE_LTO: fat
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '1'
+      CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Assemble pinned source ports without changing Stable
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/prepare-upstream-stack.py
+          python3 scripts/prepare-upstream-stack.py 2>&1 | tee "$RUNNER_TEMP/assembly.log"
+          git submodule update --init --depth 1 vendor/qemu || git submodule update --init vendor/qemu
+          test "$(git -C vendor/qemu rev-parse HEAD)" = b9d3bd5a9dd427ac42f6a2249c26a0b342f8f16e
+          grep -q 'xhci_engage_reentrancy_guard' vendor/qemu/hw/usb/hcd-xhci.c
+          python3 -m py_compile scripts/reims-release.py
+          bash -n scripts/tahoe-launch-remote
+          python3 -m unittest discover -s tests -p test_release_picker.py -v
+
+      - name: Commit assembled sources to this experiment only
+        id: source
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_NAME" = experiment/upstream-stack-20261103
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if ! git diff --cached --quiet; then
+            git commit -m 'build: materialize combined upstream candidate and pinned translator sources'
+            remote_head="$(git ls-remote origin "refs/heads/$GITHUB_REF_NAME" | cut -f1)"
+            test "$remote_head" = "$GITHUB_SHA"
+            git push origin "HEAD:refs/heads/$GITHUB_REF_NAME"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          cat docs/upstream-stack-20261103.json
+
+      - name: Install Linux build dependencies
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git curl ca-certificates pkg-config python3 python3-venv \
+            ninja-build flex bison bzip2 cmake clang lld binutils \
+            libglib2.0-dev libpixman-1-dev libslirp-dev zlib1g-dev libfdt-dev \
+            libpipewire-0.3-dev libpulse-dev libasound2-dev libvulkan1 \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxfixes-dev libxss-dev libxtst-dev libxkbcommon-dev \
+            libwayland-dev libwayland-bin libdecor-0-dev \
+            libegl-dev libgl-dev libdrm-dev libgbm-dev libdbus-1-dev libudev-dev libusb-1.0-0-dev
+
+      - name: Validate lockfiles and core regression tests
+        run: |
+          set -euo pipefail
+          cargo --version
+          cargo metadata --locked --format-version=1 --no-deps > "$RUNNER_TEMP/metadata.json"
+          cargo fetch --locked
+          cargo test --locked -p reims-vgpu-core --lib -- --test-threads=2 2>&1 | tee "$RUNNER_TEMP/core-tests.log"
+          cargo test --locked --manifest-path crates/reims-ctl/Cargo.toml 2>&1 | tee "$RUNNER_TEMP/ctl-tests.log"
+
+      - name: Test translator metadata compatibility
+        run: |
+          set -euo pipefail
+          cargo test --locked --manifest-path vendor/metal2vulkan/Cargo.toml \
+            -p metal2vulkan-air --lib debug_info -- --test-threads=2 2>&1 | tee "$RUNNER_TEMP/metadata-tests.log"
+          cargo test --locked --manifest-path vendor/metal2vulkan/Cargo.toml \
+            -p metal2vulkan --lib engine_debug_info -- --test-threads=2 2>&1 | tee "$RUNNER_TEMP/shader-tests.log"
+
+      - name: Compile Vulkan library with Stable v0.1.2 compiler settings
+        run: |
+          set -euo pipefail
+          test "$RUSTFLAGS" = '-C target-cpu=x86-64-v3'
+          test "$CARGO_PROFILE_RELEASE_LTO" = fat
+          test "$CARGO_PROFILE_RELEASE_CODEGEN_UNITS" = 1
+          cargo xtask dist
+          test -f "$CARGO_TARGET_DIR/dist-vulkan/lib/libreims_vgpu.a"
+          test -f "$CARGO_TARGET_DIR/dist-vulkan/lib/pkgconfig/reims-vgpu.pc"
+
+      - name: Compile patched QEMU and reims-ctl
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/qemu-stack-build"
+          cd "$RUNNER_TEMP/qemu-stack-build"
+          PKG_CONFIG_PATH="$CARGO_TARGET_DIR/dist-vulkan/lib/pkgconfig" \
+            "$GITHUB_WORKSPACE/vendor/qemu/configure" \
+              --prefix=/reims-ctl-qemu --target-list=x86_64-softmmu \
+              --enable-kvm --disable-sdl --disable-gtk --enable-slirp --enable-libusb \
+              --enable-pvg --disable-docs --disable-tests --disable-werror
+          ninja -j2
+          DESTDIR="$RUNNER_TEMP/qemu-stack-install" ninja install
+          cd "$GITHUB_WORKSPACE"
+          cargo install --locked --path crates/reims-ctl --root "$RUNNER_TEMP/ctl-stack-install"
+          install -m 755 "$RUNNER_TEMP/ctl-stack-install/bin/reims-ctl" \
+            "$RUNNER_TEMP/qemu-stack-install/reims-ctl-qemu/bin/reims-ctl"
+
+      - name: Smoke-test and package the combined candidate
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/qemu-stack-install/reims-ctl-qemu"
+          "$prefix/bin/reims-ctl" --help >/dev/null
+          "$prefix/bin/qemu-system-x86_64" --version
+          "$prefix/bin/qemu-img" --version
+          "$prefix/bin/qemu-system-x86_64" -device help > "$RUNNER_TEMP/devices.txt"
+          grep -q 'apple-gfx-pci' "$RUNNER_TEMP/devices.txt"
+          grep -q 'usb-host' "$RUNNER_TEMP/devices.txt"
+          find "$prefix" -type f -name ReimsVgpu.rom > "$RUNNER_TEMP/roms.txt"
+          test -s "$RUNNER_TEMP/roms.txt"
+          git diff --exit-code -- Cargo.toml Cargo.lock crates/reims-ctl/Cargo.lock vendor/metal2vulkan/Cargo.lock
+          mkdir -p out
+          cp docs/upstream-stack-20261103.json "$prefix/UPSTREAM-STACK.json"
+          {
+            echo "Candidate: combined upstream stack 2026-11-03; NOT STABLE"
+            echo "reims-vgpu commit: $SOURCE_SHA"
+            echo "workflow commit: $GITHUB_SHA"
+            echo "QEMU: $(git -C vendor/qemu rev-parse HEAD)"
+            echo "Metal2Vulkan: vendored; exact base/tree in UPSTREAM-STACK.json"
+            echo "RUSTFLAGS=$RUSTFLAGS"
+            echo "CARGO_PROFILE_RELEASE_LTO=$CARGO_PROFILE_RELEASE_LTO"
+            echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=$CARGO_PROFILE_RELEASE_CODEGEN_UNITS"
+            rustc --version
+            "$prefix/bin/qemu-system-x86_64" --version
+            echo "Validation: core/ctl and targeted translator tests; binary smoke tests"
+            echo "Not validated: RX 7600, Tahoe boot, GPU correctness, audio, FPS, QEMU qtests"
+            echo "Guest drivers, OpenCore, host THP policy and Stable binaries are NOT modified."
+            ldd "$prefix/bin/qemu-system-x86_64"
+          } > "$prefix/BUILD-INFO.txt"
+          tar -czf out/reims-vgpu-linux-x86_64.tar.gz -C "$prefix" .
+          git archive --format=tar.gz --output=out/reims-upstream-stack-sources.tar.gz "$SOURCE_SHA"
+          cp docs/upstream-stack-20261103.json out/UPSTREAM-STACK.json
+          (cd out && sha256sum *.tar.gz UPSTREAM-STACK.json > SHA256SUMS)
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          m = json.loads(Path('docs/upstream-stack-20261103.json').read_text())
+          lines = ['# Combined upstream candidate; not Stable', '',
+                   'Based on Stable v0.1.2 with the same Native-v3 + Fat-LTO settings.',
+                   'Includes QEMU THP alignment and three xHCI/USB lifetime fixes.',
+                   'Includes Reims FIFO in-thread execution and faster record decoding.',
+                   '', '## Translator ports']
+          for p in m['applied']:
+              if p['component'] == 'metal2vulkan':
+                  lines.append('- Applied: ' + p['commit'])
+          for p in m['deferred']:
+              lines.append('- NOT included: ' + p['commit'] + ': ' + p['reason'])
+          lines += ['', '## Explicitly outside this compatible-guest candidate']
+          lines += ['- ' + s for s in m['not_included']]
+          lines += ['', 'No RX 7600/Tahoe functional or performance validation. Keep v0.1.2 for rollback.',
+                    'THP requires a permissive host shmem policy; this bundle does not change it.',
+                    'Shader cache semantics change: the first boot may rebuild caches. Do not delete Stable caches.',
+                    'No automatic guest driver, OpenCore, disk-image or current-symlink modification.']
+          Path('out/RELEASE-NOTES.md').write_text('\n'.join(lines) + '\n')
+          PY
+
+      - name: Retain build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-stack-evidence-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/assembly.log
+            ${{ runner.temp }}/*-tests.log
+            docs/upstream-stack-20261103.json
+            out/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Publish a new prerelease only after every gate succeeds
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_NAME" = experiment/upstream-stack-20261103
+          tag="testing-upstream-stack-20261103-$GITHUB_RUN_NUMBER-${SOURCE_SHA:0:12}"
+          gh release create "$tag" \
+            out/reims-vgpu-linux-x86_64.tar.gz \
+            out/reims-upstream-stack-sources.tar.gz out/UPSTREAM-STACK.json out/SHA256SUMS \
+            --target "$SOURCE_SHA" --prerelease --latest=false \
+            --title "Testing: combined upstream stack 2026-11-03 ($GITHUB_RUN_NUMBER)" \
+            --notes-file out/RELEASE-NOTES.md
