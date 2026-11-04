@@ -203,7 +203,8 @@ choose_release() {
 
 test_goal_for_tag() {
   case $1 in
-    v0.1.2) printf '%s\n' '最新 Stable：Native-v3 + Fat-LTO，需支持 x86-64-v3；新的性能比较基线' ;;
+    v0.1.3) printf '%s\n' '最新 Stable：Native-v3 + Fat-LTO + QEMU THP，需 x86-64-v3；注意 THP 主机设置' ;;
+    v0.1.2) printf '%s\n' '上一版 Stable：Native-v3 + Fat-LTO；可回滚' ;;
     v0.1.1) printf '%s\n' '上一个 Stable：仅 Native-v3，性能回归时可回滚' ;;
     v0.1.0) printf '%s\n' '原 Stable：通用 x86-64 回滚版本' ;;
     v*) printf '%s\n' 'Stable：按同样场景测量 Finder / Safari / Launchpad 的帧时间' ;;
