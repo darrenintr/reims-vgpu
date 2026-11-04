@@ -1,0 +1,76 @@
+name: Promote tested QEMU THP bundle to Stable v0.1.3
+on:
+  push:
+    branches:
+      - release/promote-v0.1.3-qemu-thp
+permissions:
+  contents: write
+jobs:
+  promote:
+    if: github.repository == 'darrenintr/reims-vgpu'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check exact tested experiment and publish original bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo='darrenintr/reims-vgpu'
+          source_tag='exp-qemu-thp-2-ccb4d7a86dcf'
+          source_sha='ccb4d7a86dcf4d50b8af4aa401c9f42e178cdd7f'
+          archive_sha='1258e934a0d5aa04bd912fa10514ff33e886b0235481fd7f98d2f2632c1ff52e'
+          sums_sha='6f045376fcbe4481c7e7f43ffc1affd3773f7b365703913eaa6bb12c0681adb4'
+          stable_tag='v0.1.3'
+          if gh api "repos/$repo/git/ref/tags/$stable_tag" >/dev/null 2>&1; then
+            echo "::error::Stable tag exists. Never modify historical releases."
+            exit 1
+          fi
+          test "$(gh api "repos/$repo/commits/$source_tag" --jq .sha)" = "$source_sha"
+          test "$(gh api "repos/$repo/actions/runs/41187583295" --jq .conclusion)" = success
+          test "$(gh api "repos/$repo/actions/runs/41187583295" --jq .head_sha)" = "$source_sha"
+          test "$(gh api "repos/$repo/releases/tags/$source_tag" --jq .target_commitish)" = "$source_sha"
+          mkdir -p "$RUNNER_TEMP/promote-reims-v0.1.3"
+          cd "$RUNNER_TEMP/promote-reims-v0.1.3"
+          gh release download "$source_tag" --repo "$repo" --pattern 'reims-vgpu-linux-x86_64.tar.gz' --pattern SHA256SUMS
+          echo "$archive_sha  reims-vgpu-linux-x86_64.tar.gz" | sha256sum -c -
+          echo "$sums_sha  SHA256SUMS" | sha256sum -c -
+          sha256sum -c SHA256SUMS
+          tar -tzf reims-vgpu-linux-x86_64.tar.gz > contents.txt
+          for f in bin/qemu-system-x86_64 bin/qemu-img bin/reims-ctl; do
+            grep -Fx "./$f" contents.txt >/dev/null || grep -Fx "$f" contents.txt >/dev/null
+          done
+          grep -F 'ReimsVgpu.rom' contents.txt >/dev/null
+          tar -xOf reims-vgpu-linux-x86_64.tar.gz ./BUILD-INFO.txt > BUILD-INFO.txt
+          grep -Fx "reims-vgpu commit: $source_sha" BUILD-INFO.txt
+          grep -Fx 'Variant: qemu-thp' BUILD-INFO.txt
+          grep -Fx 'QEMU gitlink: 4e9e3de2adfe6e333f594811d7bfc4a3a840ac64' BUILD-INFO.txt
+          grep -Fx 'RUSTFLAGS=-C target-cpu=x86-64-v3' BUILD-INFO.txt
+          grep -Fx 'CARGO_PROFILE_RELEASE_LTO=fat' BUILD-INFO.txt
+          grep -Fx 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1' BUILD-INFO.txt
+          cat > RELEASE-NOTES.md <<'NOTES'
+          ## Stable v0.1.3 — tested QEMU THP + Native-v3 + Fat-LTO
+          This release promotes **the exact original prebuilt binary**, without recompiling, from
+          [exp-qemu-thp-2-ccb4d7a86dcf](https://github.com/darrenintr/reims-vgpu/releases/tag/exp-qemu-thp-2-ccb4d7a86dcf).
+
+          - Same x86-64-v3 + Fat-LTO + codegen-units=1 Rust configuration as Stable v0.1.2.
+          - QEMU changes only Linux file-backed guest RAM alignment for 2 MiB Transparent Huge Pages.
+          - QEMU gitlink: `4e9e3de2adfe6e333f594811d7bfc4a3a840ac64`.
+          - Source: `ccb4d7a86dcf4d50b8af4aa401c9f42e178cdd7f`.
+          - Artifact SHA256: `1258e934a0d5aa04bd912fa10514ff33e886b0235481fd7f98d2f2632c1ff52e`.
+          - Successful Linux build: [Actions run 41187583295](https://github.com/darrenintr/reims-vgpu/actions/runs/41187583295).
+          - The owner reports having run all downloaded test builds on Ryzen 5 3600, RX 7600 and macOS Tahoe.
+          - Actual THP availability depends on host kernel shmem policy and guest mappings; no measured 120 FPS claim.
+
+          **Rollback:** Stable [v0.1.2](https://github.com/darrenintr/reims-vgpu/releases/tag/v0.1.2),
+          [v0.1.1](https://github.com/darrenintr/reims-vgpu/releases/tag/v0.1.1),
+          and [v0.1.0](https://github.com/darrenintr/reims-vgpu/releases/tag/v0.1.0)
+          remain intact. Stop the VM before switching.
+          NOTES
+          gh release create "$stable_tag" reims-vgpu-linux-x86_64.tar.gz SHA256SUMS \
+            --repo "$repo" --target "$source_sha" \
+            --title "v0.1.3 — tested QEMU THP + Native-v3 + Fat-LTO" \
+            --notes-file RELEASE-NOTES.md --latest
+          test "$(gh api "repos/$repo/commits/$stable_tag" --jq .sha)" = "$source_sha"
+          gh release view "$stable_tag" --repo "$repo"
