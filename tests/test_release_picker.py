@@ -148,6 +148,17 @@ class ReleasePickerTests(unittest.TestCase):
         tags = [r["tag"] for r in release.curated_releases(rows)]
         self.assertIn("exp-native-v3-fat-lto-2-abcdef123456", tags)
 
+    def test_stable_v0_1_3_hides_promoted_qemu_thp(self):
+        rows = [
+            row("v0.1.2", "2026-10-31T09:00:22Z"),
+            row("exp-qemu-thp-2-ccb4d7a86dcf", "2026-10-31T09:30:17Z"),
+            row("v0.1.3", "2026-11-04T12:10:00Z"),
+        ]
+        selected = release.curated_releases(rows)
+        self.assertEqual([r["tag"] for r in selected], ["v0.1.3"])
+        self.assertIn("QEMU THP", selected[0]["test_label"])
+        self.assertEqual(release.stable_version("v0.1.3"), (0, 1, 3))
+
     def test_selected_promoted_experiment_is_still_reachable(self):
         rows = self.sample_rows()
         rows.extend([

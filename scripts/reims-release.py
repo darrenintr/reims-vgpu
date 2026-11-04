@@ -125,7 +125,10 @@ def describe_release(row):
     tag = row["tag"]
     channel = row["channel"]
     if channel == "stable":
-        if tag == "v0.1.2":
+        if tag == "v0.1.3":
+            label = "【最新 Stable · 需 x86-64-v3】 v0.1.3 · Native-v3 + Fat-LTO + QEMU THP"
+            goal = "已将实测的 QEMU 2 MiB THP 版本提升为 Stable；THP 是否生效取决于主机内核设置。"
+        elif tag == "v0.1.2":
             label = "【最新 Stable · 需 x86-64-v3】 v0.1.2 · Native-v3 + Fat-LTO 基线"
             goal = "已将用户实测的 Native-v3 + Fat-LTO 组合编译提升为正式基线；帧间隔仍须测试。"
         elif tag == "v0.1.1":
@@ -170,6 +173,7 @@ SUPERSEDED_TAGS = {
     "exp-fat-lto-1-2a63d397e686",
     "exp-fat-lto-3-e4a42df79f14",
     "exp-native-v3-fat-lto-1-c8838347f0e5",
+    "exp-qemu-thp-2-ccb4d7a86dcf",
     "exp-profiler-1-2a63d397e686",
 }
 
