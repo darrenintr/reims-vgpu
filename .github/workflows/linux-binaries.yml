@@ -1,0 +1,146 @@
+name: Linux prebuilt QEMU and reims-ctl
+
+# Stable: push a v* tag. Testing: push to development or this integration branch.
+# Manual dispatch is also available once this workflow reaches the default branch.
+on:
+  push:
+    branches:
+      - development
+      - feature/github-release-binaries
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: reims-linux-release-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux-x86_64:
+    name: Build Linux x86_64 (Vulkan)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TARGET_DIR: /home/runner/work/_temp/reims-cargo-target
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      - name: Recover runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          df -h .
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git curl ca-certificates pkg-config python3 python3-venv \
+            ninja-build flex bison bzip2 cmake clang lld binutils \
+            libglib2.0-dev libpixman-1-dev libslirp-dev zlib1g-dev libfdt-dev \
+            libpipewire-0.3-dev libpulse-dev libasound2-dev libvulkan1 \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxfixes-dev libxss-dev libxtst-dev libxkbcommon-dev \
+            libwayland-dev libwayland-bin libdecor-0-dev \
+            libegl-dev libgl-dev libdrm-dev libgbm-dev libdbus-1-dev libudev-dev libusb-1.0-0-dev
+
+      - name: Fetch pinned QEMU
+        run: |
+          git submodule update --init --depth 1 vendor/qemu ||
+            git submodule update --init vendor/qemu
+          test -f vendor/qemu/configure
+
+      - name: Build reims-vgpu Vulkan static library and option ROM
+        run: |
+          cargo --version
+          cargo fetch --locked
+          cargo xtask dist
+          test -f "$CARGO_TARGET_DIR/dist-vulkan/lib/pkgconfig/reims-vgpu.pc"
+          test -f "$CARGO_TARGET_DIR/dist-vulkan/lib/libreims_vgpu.a"
+
+      - name: Build and install patched QEMU
+        run: |
+          mkdir -p "$RUNNER_TEMP/reims-qemu-build"
+          cd "$RUNNER_TEMP/reims-qemu-build"
+          PKG_CONFIG_PATH="$CARGO_TARGET_DIR/dist-vulkan/lib/pkgconfig" \
+            "$GITHUB_WORKSPACE/vendor/qemu/configure" \
+              --prefix=/reims-ctl-qemu \
+              --target-list=x86_64-softmmu \
+              --enable-kvm --disable-sdl --disable-gtk --enable-slirp --enable-libusb \
+              --enable-pvg --disable-docs --disable-tests --disable-werror
+          ninja -j2
+          DESTDIR="$RUNNER_TEMP/reims-qemu-stage" ninja install
+          test -x "$RUNNER_TEMP/reims-qemu-stage/reims-ctl-qemu/bin/qemu-system-x86_64"
+          test -x "$RUNNER_TEMP/reims-qemu-stage/reims-ctl-qemu/bin/qemu-img"
+          find "$RUNNER_TEMP/reims-qemu-stage/reims-ctl-qemu" \
+            -type f -name ReimsVgpu.rom | grep -q .
+
+      - name: Build and test reims-ctl
+        run: |
+          cargo test --locked --manifest-path crates/reims-ctl/Cargo.toml
+          cargo install --locked --path crates/reims-ctl \
+            --root "$RUNNER_TEMP/reims-ctl-install"
+          install -m 755 "$RUNNER_TEMP/reims-ctl-install/bin/reims-ctl" \
+            "$RUNNER_TEMP/reims-qemu-stage/reims-ctl-qemu/bin/reims-ctl"
+
+      - name: Smoke test and package install prefix
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/reims-qemu-stage/reims-ctl-qemu"
+          "$prefix/bin/reims-ctl" --help >/dev/null
+          "$prefix/bin/qemu-system-x86_64" --version
+          "$prefix/bin/qemu-img" --version
+          mkdir -p out
+          {
+            echo "reims-vgpu commit: $GITHUB_SHA"
+            echo "runner: ubuntu-24.04"
+            echo "target: linux-x86_64"
+            rustc --version
+            "$prefix/bin/qemu-system-x86_64" --version
+            echo
+            echo "QEMU dynamic library requirements:"
+            ldd "$prefix/bin/qemu-system-x86_64"
+          } > "$prefix/BUILD-INFO.txt"
+          tar -czf out/reims-vgpu-linux-x86_64.tar.gz -C "$prefix" .
+          (cd out && sha256sum reims-vgpu-linux-x86_64.tar.gz > SHA256SUMS)
+          du -h out/*
+          df -h .
+
+      - name: Retain GitHub Actions build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reims-vgpu-linux-x86_64
+          path: |
+            out/reims-vgpu-linux-x86_64.tar.gz
+            out/SHA256SUMS
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Publish Stable / Testing GitHub Release
+        if: github.repository == 'darrenintr/reims-vgpu' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" == v* ]]; then
+            tag="$GITHUB_REF_NAME"
+            gh release create "$tag" out/reims-vgpu-linux-x86_64.tar.gz \
+              out/SHA256SUMS --verify-tag --title "$tag" --generate-notes --latest
+          else
+            short_sha="$(echo "$GITHUB_SHA" | cut -c1-12)"
+            tag="testing-$GITHUB_RUN_NUMBER-$short_sha"
+            gh release create "$tag" out/reims-vgpu-linux-x86_64.tar.gz \
+              out/SHA256SUMS --target "$GITHUB_SHA" --title "$tag" \
+              --prerelease --generate-notes
+          fi

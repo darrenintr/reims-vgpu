@@ -6,7 +6,9 @@
 //!   (`0` would keep apple-gfx headless), never a window of QEMU's own;
 //! - a QMP socket (`-qmp`), through which reims-ctl stops the VM and changes its CD;
 //! - QEMU's pid file;
-//! - user networking with virtio-net, and an optional SSH port forward;
+//! - user networking with virtio-net, and an optional SSH port forward; with networking off,
+//!   `-nic none`, without which QEMU gives the machine its default NIC on user networking (on
+//!   q35 an e1000e in the first free slot, 1, where the root port's address is);
 //! - a USB Audio Class device on the host's audio backend: x86-64 macOS 26 has no Intel HDA
 //!   driver, and Safari's Media Source players fail without an output device;
 //! - with logs on: the library's log (`REIMS_VGPU_LOG`), the serial console, timestamps.
@@ -15,7 +17,10 @@
 //! RAM as a shared memfd, which the library on Linux requires; the keyboard and tablet on a
 //! qemu-xhci controller, since on ICH9's EHCI the guest stops re-arming a device's interrupt
 //! transfers under GPU load and its input freezes; fixed PCI addresses (the AHCI controller at
-//! slot 2, where OpenCore's boot entries name it); `isa-applesmc` with Apple's SMC key, [`OSK`].
+//! slot 2, where OpenCore's boot entries name it); `isa-applesmc` with Apple's SMC key, [`OSK`];
+//! `dump-guest-core=off`, which leaves guest RAM out of a core dump of QEMU: with it in, a
+//! crash's core takes the process tens of seconds to end (docs/qemu.md). QEMU refuses the
+//! option where the OS cannot leave memory out of a core (macOS has no `MADV_DONTDUMP`).
 //!
 //! `vmapple-arm64` follows scripts/run_vmapple.sh.
 
@@ -112,7 +117,7 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     let mem = format!("{}M", c.memory_mib);
     let mut push = |xs: &[&str]| a.extend(xs.iter().map(|s| s.to_string()));
     if c.profile.memfd_ram(ctx.host) {
-        push(&["-machine", "q35,memory-backend=ram"]);
+        push(&["-machine", "q35,memory-backend=ram,dump-guest-core=off"]);
         push(&[
             "-object",
             &format!("memory-backend-memfd,id=ram,size={mem},share=on"),
@@ -334,6 +339,9 @@ fn audiodev(vm: &Vm, ctx: &Ctx) -> String {
 fn common(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     let c = &vm.config;
     let mut push = |xs: &[&str]| a.extend(xs.iter().map(|s| s.to_string()));
+    if !c.network.enabled {
+        push(&["-nic", "none"]);
+    }
     push(&["-display", "none"]);
     if c.logs.enabled {
         push(&["-serial", &format!("file:{}", vm.serial_log().display())]);
@@ -493,7 +501,7 @@ mod tests {
         let inv = invocation(&q35_vm(), &ctx(linux())).unwrap();
         let a = &inv.args;
         for pair in [
-            &["-machine", "q35,memory-backend=ram"][..],
+            &["-machine", "q35,memory-backend=ram,dump-guest-core=off"][..],
             &[
                 "-object",
                 "memory-backend-memfd,id=ram,size=12288M,share=on",
@@ -542,6 +550,26 @@ mod tests {
         vm.config.cpu.threads_per_core = 2;
         let inv = invocation(&vm, &ctx(linux())).unwrap();
         assert!(has(&inv.args, &["-smp", "8,sockets=1,cores=4,threads=2"]));
+    }
+
+    #[test]
+    fn network_off_gives_the_machine_no_nic() {
+        let mut q35 = q35_vm();
+        q35.config.network.enabled = false;
+        let mut vmapple = q35.clone();
+        vmapple.config.profile = Profile::VmappleArm64;
+        vmapple.config.q35 = None;
+        vmapple.config.vmapple = Some(Vmapple {
+            aux: "aux.img".into(),
+            ecid: 1234,
+        });
+        for (vm, host) in [(&q35, linux()), (&vmapple, mac())] {
+            let a = invocation(vm, &ctx(host)).unwrap().args;
+            assert!(has(&a, &["-nic", "none"]), "{a:?}");
+            assert!(!a.iter().any(|x| x == "-netdev" || x.contains("net-pci")));
+        }
+        let a = invocation(&q35_vm(), &ctx(linux())).unwrap().args;
+        assert!(!a.iter().any(|x| x == "-nic"));
     }
 
     #[test]
@@ -641,6 +669,7 @@ mod tests {
             assert!(has(&a, pair), "missing {pair:?} in {a:?}");
         }
         assert!(!a.iter().any(|x| x.contains("memfd")));
+        assert!(!a.iter().any(|x| x.contains("dump-guest-core")));
     }
 
     #[test]

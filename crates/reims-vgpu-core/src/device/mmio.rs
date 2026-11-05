@@ -197,6 +197,13 @@ impl<P: Platform> DeviceCore<P> {
         let Some(register) = Register::decode(index) else {
             return;
         };
+        if matches!(
+            register,
+            Register::WakeFifo | Register::FifoWritten | Register::DisplayDoorbell
+        ) {
+            // mmio: register index, value: the guest's doorbells
+            crate::trace::event("mmio", &[u64::from(index), u64::from(value)]);
+        }
         match register {
             // A nonzero value other than the current nonzero one reaches the enable's assert; an
             // equal value does nothing.

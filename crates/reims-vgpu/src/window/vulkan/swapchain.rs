@@ -3,14 +3,17 @@
 //!
 //! The window's render thread asks the sink for a presenter at its first draw: the sink makes the
 //! window's Vulkan surface on the runtime's instance (through the window's [`VulkanTarget`]: SDL's
-//! window on Linux, the window's `CAMetalLayer` on macOS) and a swapchain over it, presented on a
-//! presenting queue of the swapchain's own, apart from the guest's queues where the device has one
-//! to spare (`reims_vgpu_vulkan::swapchain`). Each draw then takes the swapchain's next image, has
-//! the display draw its current frame into the image's texture in a command buffer of the frame
+//! window on Linux, the window's `CAMetalLayer` on macOS) and a swapchain over it. The sink makes
+//! its frame-output queue through the runtime's presenting-queue path, which reserves it apart
+//! from guest queues where the device has one to spare; the swapchain makes its own presenting
+//! queue (`reims_vgpu_vulkan::swapchain`). Each draw then takes the swapchain's next image, has the
+//! display draw its current frame into the image's texture in a command buffer of the frame-output
 //! queue, as any window frame ([`SinkDisplay::encode`]), with the image's semaphore signalled
-//! after it, and presents the image once the runtime has scheduled that command buffer. The
-//! image's wait is the render thread's alone: the frame's command buffer waits for nothing of the
-//! compositor's, so the guest's frames never wait for the window. Where the swapchain's images are
+//! after it, and presents the image once the runtime has scheduled that command buffer. If the
+//! runtime has no spare queue to reserve, it falls back to the general queue pool and announces
+//! `shared-present-queue`. The image's wait is on the render thread alone: its command buffer
+//! waits for nothing of the compositor's, so the guest's frames never wait for the window. Where
+//! the swapchain's images are
 //! not the window's size (a surface with a size of its own, a step ahead of the window's during a
 //! resize), the frame's region is scaled to them ([`fit`]). On macOS the images are the layer's
 //! drawables, each fetched on the render thread as the image is taken
@@ -20,7 +23,7 @@
 //! give it the presenter made here ([`SwapchainSink::make_presenter`]).
 //!
 //! **Lifetime.** The display is held weakly, as the Metal platform's sink holds it, and upgraded
-//! for an encode and its commit alone. A presenter holds the frame queue, and with it the
+//! for an encode and its commit alone. A presenter holds the frame-output queue, and with it the
 //! display's device, until the window's render thread ends at the window's end: its swapchain and
 //! surface go there, before the window under them.
 //!
@@ -46,14 +49,14 @@ type CommandBuffer = <VulkanPlatform as Platform>::CommandBuffer;
 /// Its texture.
 type Texture = <VulkanPlatform as Platform>::Texture;
 
-/// The sink of a window display on `display`, drawn in command buffers of `queue`, the frame
-/// queue of its device.
+/// The sink of a window display on `display`, drawn in command buffers of its frame-output queue.
 pub(crate) fn sink(
     platform: Arc<VulkanPlatform>,
     display: Weak<CoreDisplay<VulkanPlatform>>,
     queue: Queue,
 ) -> Option<Arc<dyn FrameSink>> {
     drop(platform);
+    let queue = queue.device.new_frame_output_queue();
     let port = display.upgrade().map(|d| d.port());
     let sink: Arc<dyn FrameSink> = Arc::new(SwapchainSink {
         display: Arc::new(SinkDisplay::new(display, queue.clone_ref())),
@@ -65,9 +68,9 @@ pub(crate) fn sink(
 
 /// What draws a display's current frame into its window on the Vulkan platform (module doc).
 pub(crate) struct SwapchainSink {
-    /// The display, held only for a draw, and the frame queue; shared with the presenters.
+    /// The display, held only for a draw, and the frame-output queue; shared with the presenters.
     display: Arc<SinkDisplay<VulkanPlatform>>,
-    /// The frame queue, of whose device the swapchain makes its presenting queue.
+    /// The frame-output queue.
     queue: Queue,
     /// The display's port, which names its window in the log.
     port: Option<u64>,

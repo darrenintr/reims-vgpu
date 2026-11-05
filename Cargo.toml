@@ -30,9 +30,9 @@ reims-vgpu-vulkan = { path = "crates/reims-vgpu-vulkan" }
 # metal2vulkan's public repository at the commit both name: darrenintr's fork, which carries the
 # RDNA3 stand-in, shared dma-buf imports and chunks at offsets into their dma-bufs (docs/qemu.md,
 # the RX 7600).
-metal2vulkan-runtime = { git = "https://github.com/darrenintr/metal2vulkan", rev = "d9ca53ccaaf378f18e703c63630b1ae6d11432b8" }
+metal2vulkan-runtime = { git = "https://github.com/darrenintr/metal2vulkan", rev = "6d6f5d92326361562ac5d482eb017f41d80c82d9" }
 # Its translator, for the Metal enums and descriptor values the runtime's calls take.
-metal2vulkan = { git = "https://github.com/darrenintr/metal2vulkan", rev = "d9ca53ccaaf378f18e703c63630b1ae6d11432b8" }
+metal2vulkan = { git = "https://github.com/darrenintr/metal2vulkan", rev = "6d6f5d92326361562ac5d482eb017f41d80c82d9" }
 # The hashes of the Vulkan platform's metallib sources (reims-vgpu-vulkan/build.rs).
 sha2 = "0.10.9"
 # A display window's swapchain on Linux (reims-vgpu-vulkan/src/swapchain.rs), at the runtime's
@@ -70,6 +70,9 @@ objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std"] }
 mach2 = "0.7"
 libc = "0.2.180"
+# The library's allocator on the targets that ship (reims-vgpu-c's global allocator): jemalloc,
+# built from the crate's bundled source, with its symbols prefixed.
+tikv-jemallocator = "0.7.0"
 # dev and tooling
 proptest = "1.7"
 loom = "0.7"

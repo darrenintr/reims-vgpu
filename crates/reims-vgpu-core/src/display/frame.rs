@@ -74,7 +74,14 @@ impl<P: Platform> DisplayCore<P> {
         completion: Box<dyn FnOnce() + Send>,
     ) -> RaiseResult<()> {
         let mut g = self.display_mutex.lock();
+        // present: frames in flight, waited for next
+        crate::trace::event(
+            "present",
+            &[u64::from(self.in_flight_frame_count.load(Ordering::SeqCst))],
+        );
         self.wait_for_pending_frames(&mut g);
+        // presented: frames in flight were waited for
+        crate::trace::event("presented", &[]);
         if self.guest_color_space_dirty() {
             // The guest display's colour space (nil without a guest display). The guest display
             // pointer is read without its lock held across the call; the cell is a leaf.

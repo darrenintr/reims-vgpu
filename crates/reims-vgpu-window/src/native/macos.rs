@@ -208,7 +208,7 @@ pub(crate) fn monitored_events() -> NSEventMask {
         | NSEventMask::ScrollWheel
 }
 
-/// Window ▸ Release Input: the key window's input lets the keyboard go.
+/// Window ▸ Release Input: the key window's input lets the keyboard and the pointer go.
 pub(crate) fn release_key_input(mtm: MainThreadMarker) {
     if sdl_windows() {
         sdl::release_key_input(mtm);

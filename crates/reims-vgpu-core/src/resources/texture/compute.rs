@@ -189,6 +189,9 @@ impl<P: Platform> DualPlaneCompute<P> {
         let Some(task) = paged.task.upgrade() else {
             crate::fatal!(DeathKind::GoneTaskPages)
         };
+        // Trace `tobj`: the guest object whose pages the next `tbuf` imports (5, a compute
+        // texture), its page and its length.
+        crate::trace::event("tobj", &[5, u64::from(paged.page), paged.length]);
         // The task raises rather than answer nothing.
         let buffer = task.new_buffer_for_virtual_page(hold, paged.page, paged.length)?;
         drop(task);

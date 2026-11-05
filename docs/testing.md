@@ -2604,8 +2604,15 @@ are invalid there. Highlights (the full table is the main loop's dispatch in
   because the GPU lacks the lodBias setter (`render_state_limits`).
 - 0x87 UseResources looks refs up with the nullable getter: a ref that is not a
   resource (a pipeline) is nil, and the draw runs (`render_state_misc`).
-  Compute's 0x87 and 0xd6 do the same, while UseHeaps (0x86) faults on a ref
-  that is not a heap (`compute_err_resource_lists`).
+  0x89 does the same, and Metal skips a nil entry of it too (**measured**: a
+  ref past the list, then a triangle drawn as without it). Compute's 0x87 and
+  0xd6 do the same, while UseHeaps (0x86) faults on a ref that is not a heap
+  (`compute_err_resource_lists`). An empty entry (type 0) is nil to each of
+  them too, except compute's 0x87 in a concurrent encoder (0xdb 1), where it
+  raises ("resource lookup failed") and the exec faults, since Metal ends the
+  process at a nil entry there (section 7.4;
+  `interplay_lifetime_emptied_resource`,
+  `interplay_lifetime_emptied_resource_render`).
 - A pass with no attachment: with no target size, after 0x1e, Metal returns no
   encoder and the decoder throws "Failed to create render encoder"; with a
   target size and without 0x1e Metal aborts (section 7.4;
@@ -2771,7 +2778,13 @@ strings follow the entries, and a value gives their offset from the blob's
 start; an array is a u32 count then u32 offsets. A function is written as its
 `functionRef` (u32), which Metal resolves through the context's
 `functionWithFunctionRef:`; the device's context resolves it as an
-object-list reference.
+object-list reference. A failed lookup resolves to nil, except one whose entry
+is empty (type 0), which raises the function lookup's failure: the exec faults
+("function lookup failed") rather than reaching Metal's abort on a nil
+function. A guest empties a task's entries when the process that owns it
+ends, without waiting for the execs that process queued, so an exec the host
+runs after that end can meet them (`resources/manager/resolver.rs`,
+`interplay_lifetime_held_pipeline_function_retyped`).
 
 | blob | bytes (`<K>` = a function ref, u32 LE) |
 |---|---|
@@ -4020,12 +4033,12 @@ found or the code shows, that no expected file holds.
 | blocks setup: a map that finds its run block full among 128 blocks, while an emptied block stays after the others (runs added before an empty block all go to the block before it) and the runs' total is not a multiple of 240 | `compact` packs the blocks from the front, leaves the last non-empty one short with the empty one after it, and asserts `to_steal != 0`: host death at the map | **measured**, `mutgap_mem_tracker_compact_empty_block` |
 | blocks setup: a run block of 240 runs (239 single-page runs and one of three pages), an unmap inside the three-page run, which splits it in place to 241 runs, then a map into the block | `RunBlock::split` keeps `old_count - half` runs, 121 and 121 of 241, and asserts that they add up: host death at the map | **measured**, `mutgap2_res_tracker_split_odd_death` (`mutgap2_res_tracker_split_adjacent` is the even control: 240 runs split into two of 120) |
 | a guest version below 10 using object type 11 or 15 in-process | assert `mapperIOSurfaces`: host death. The service checks no feature, and a type 15 buffer works there | **measured** for type 15 in the map setup, `mutgap_svc_mapper_below_v10`; type 11 **read** |
-| a malformed serialized pipeline descriptor (garbage, truncated to 1 or 5 bytes), a function ref resolving to nil (ref 0, a wrong type, a short record or header, data outside the task, commandType 14, an empty, truncated or two-function library), an unspecialized function constant, a render descriptor with a nil vertex function or a buffer as its vertex function | abort inside Metal: host death in every setup | **measured**, `compute_death_blob_*`, `compute_death_function_*`, `render_objects_malformed_*`; and by another route, a compute pipeline and its function deleted (40) while an exec that names the pipeline is held on another FIFO's stamp, with the function's entry retyped to 0: the released exec makes the pipeline again, its function resolves to nil, and the host dies at the release in every setup (`interplay_lifetime_held_pipeline_function_retyped`) |
+| a malformed serialized pipeline descriptor (garbage, truncated to 1 or 5 bytes), a function ref resolving to nil (ref 0, a wrong type, a short record or header, data outside the task, commandType 14, an empty, truncated or two-function library), an unspecialized function constant, a render descriptor with a nil vertex function or a buffer as its vertex function | abort inside Metal: host death in every setup | **measured**, `compute_death_blob_*`, `compute_death_function_*`, `render_objects_malformed_*`. A function ref whose entry is empty (type 0) is not among them: it raises, and the exec faults (section 6.18, `interplay_lifetime_held_pipeline_function_retyped`) |
 | DispatchThreadgroupsIndirect or DispatchThreadsIndirect with indirect buffer ref 0 | nil reaches Metal: host death in every setup | **measured**, `compute_death_threadgroups_indirect_nil`, `compute_death_threads_indirect_nil` |
 | a protection envelope with options 1 around a compute pass | Metal aborts opening the encoder: host death in every setup | **measured**, `compute_death_protection_options`; options 2 and all ones only fault (`compute_err_protected_encoder`, whose docstring says 3 dies too: not locked) |
 | a second encoder over an open one (a carried decoder reused), an encoder left open at commit, a protection envelope while a carried encoder is open | Metal asserts: host death in every setup | **measured**, `compute_death_second_encoder`, `exec_carried_compute_reopened` and `_isolate`, `render_segments_open_twice`, `exec_open_encoder_at_commit` and `_isolate`, `render_segments_open_last`, `exec_protection_envelope_open_encoder` (section 6.13) |
 | a render pass with no attachment but a target size, without 0x1e | Metal aborts on its compiler's callback thread once `renderCommandEncoderWithDescriptor:` has returned: host death in every setup, in the wait after the exec's doorbell. With no target size either, Metal returns no encoder and "Failed to create render encoder" faults, with or without 0x1e | **measured**, `render_pass_no_target`, `interplay_decodewalk_24` |
-| a concurrent compute encoder (0xdb 1) whose 0x87 names a nil ref (ref 0, a non-resource ref, or one past the list); a serial encoder accepts it | host SIGSEGV in every setup | **measured**, `interplay_decodewalk_26` |
+| a concurrent compute encoder (0xdb 1) whose 0x87 names a nil ref (ref 0, a non-resource ref, or one past the list); a serial encoder accepts it | host SIGSEGV in every setup | **measured**, `interplay_decodewalk_26`. A ref whose entry is empty (type 0) is not among them: it raises, and the exec faults (`interplay_lifetime_emptied_resource`) |
 | consecutive compute encoders mixing dispatch types, with an indirect dispatch (0xc9 or 0xe6) | the host dies; in one program it killed isolate and not map, so it may depend on timing | **measured**, `interplay_decodewalk_27` (every setup) |
 | a memoryless depth or stencil attachment with store MultisampleResolve, one sample and no resolve texture (the memoryless rule keeps that action) | Metal crashes: host death in every setup | **measured**, `render_pass_memoryless`, `render_pass_memoryless_stencil_resolve` |
 | 8 programmable sample positions on a 4-sample pass | Metal aborts: host death in every setup | **measured**, `render_pass_msaa` |

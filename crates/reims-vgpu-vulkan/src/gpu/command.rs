@@ -1395,6 +1395,8 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         value: u64,
     ) -> RaiseResult<()> {
         let sel = "encodeSignalEvent:value:";
+        // evsig: command buffer, event, value
+        trace_event("evsig", &self.raw, event.as_ref(), value);
         let event = self::event(sel, event);
         predication::boundary(&self.predication, sel);
         encoding(sel, Policy::Dies, || {
@@ -1410,10 +1412,17 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         value: u64,
     ) -> RaiseResult<()> {
         let sel = "encodeSignalEventScheduled:value:";
+        let traced = signal_event_scheduled.map_or(0, event_id);
+        // evsched: command buffer, event, value
+        trace_event_id("evsched", &self.raw, traced, value);
         let event = signal_event_scheduled
             .map(|e| rt::SharedEvent::clone(e))
             .unwrap_or_else(|| unrepresentable(sel, "a nil event"));
-        let handler: rt::Handler = Box::new(move |_| event.set_signaled_value(value));
+        let handler: rt::Handler = Box::new(move |_| {
+            // evschedset: event, value: the scheduled handler sets it
+            reims_vgpu_core::trace::event("evschedset", &[traced, value]);
+            event.set_signaled_value(value)
+        });
         encoding(sel, Policy::Dies, || {
             self.raw.add_scheduled_handler(handler)
         })
@@ -1425,6 +1434,8 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         value: u64,
     ) -> RaiseResult<()> {
         let sel = "encodeWaitForEvent:value:";
+        // evwait: command buffer, event, value
+        trace_event("evwait", &self.raw, event.as_ref(), value);
         let event = self::event(sel, event);
         predication::boundary(&self.predication, sel);
         encoding(sel, Policy::Dies, || {
@@ -1538,6 +1549,33 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         metal_space::first_use(FirstUse::ComputeEncoder);
         Ok(Some(predication::encoder(raw, self)))
     }
+}
+
+/// An event's number in the trace: its object's address.
+pub(crate) fn event_id<T: Send + Sync + 'static>(event: &Obj<T>) -> u64 {
+    u64::try_from(std::ptr::from_ref::<T>(event).addr()).unwrap_or_default()
+}
+
+/// A traced encode of an event: its command buffer, the event and the value.
+fn trace_event(
+    kind: &str,
+    cb: &rt::CommandBuffer,
+    event: Option<&EventRef<'_, VulkanPlatform>>,
+    value: u64,
+) {
+    if !reims_vgpu_core::trace::on() {
+        return;
+    }
+    let id = match event {
+        Some(EventRef::Shared(e)) => event_id(*e),
+        Some(EventRef::Event(e)) => event_id(*e),
+        None => 0,
+    };
+    trace_event_id(kind, cb, id, value);
+}
+
+fn trace_event_id(kind: &str, cb: &rt::CommandBuffer, event: u64, value: u64) {
+    reims_vgpu_core::trace::event(kind, &[crate::gpu::timing::id(cb), event, value]);
 }
 
 #[cfg(test)]

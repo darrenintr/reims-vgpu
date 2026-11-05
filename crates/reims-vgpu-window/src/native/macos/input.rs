@@ -12,10 +12,11 @@
 //!
 //! What the guest gets:
 //! - **The pointer** once the guest has a mode, at the guest pixel under the host's pointer,
-//!   held at the image's nearest edge outside it. A click in the image captures the keyboard;
-//!   the click that makes the window key is not sent. A click outside the image is not sent and
-//!   starts nothing. A button's release is sent wherever it happens, so a drag that leaves the
-//!   window ends in the guest; AppKit keeps sending the drag's moves to the view meanwhile.
+//!   held at the image's nearest edge outside it. A click in the image captures the keyboard and
+//!   the pointer; the click that makes the window key is not sent. A click outside the image is
+//!   not sent and starts nothing. A button's release is sent wherever it happens, so a drag that
+//!   leaves the image ends in the guest; AppKit keeps sending the drag's moves to the view
+//!   meanwhile.
 //! - **The wheel** over the image, once the guest has a mode, after the pointer's position where
 //!   it moved: a window that is not key gets no moves, and the guest scrolls where the host's
 //!   pointer is. Where the host takes smooth scrolling, each event goes with its phases, and a
@@ -32,7 +33,8 @@
 //! - **No stuck keys**: losing the keyboard, releasing capture and closing send an up for every
 //!   key held; losing the keyboard and closing lift the buttons held too.
 //!
-//! While captured, the window holds the system's hot keys off ([`super::hotkeys`]).
+//! While captured, the window holds the system's hot keys off ([`super::hotkeys`]), and the host's
+//! pointer over the image ([`InputState::pointer_confinement`], which the view applies).
 
 use std::sync::Arc;
 
@@ -66,7 +68,7 @@ pub(crate) struct ViewContext {
 /// What the view does after an event.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Reaction {
-    /// The capture state changed: the window's title and the cursor are refreshed.
+    /// The capture state changed: the window's title, the cursor and the pointer's hold follow.
     pub(crate) capture_changed: bool,
     /// The event is AppKit's too: the view passes it to `super` (a ⌘ shortcut to the menu).
     pub(crate) pass_on: bool,
@@ -652,9 +654,15 @@ impl InputState {
         self.finish(Reaction::default());
     }
 
-    /// Whether the keyboard is captured.
+    /// Whether input, the keyboard and the pointer, is captured.
     pub(crate) fn is_captured(&self) -> bool {
         self.logic.capture.is_captured()
+    }
+
+    /// Where the host's pointer is held over `image`, the image's rectangle in the view's points:
+    /// the image while captured ([`Capture::pointer_confinement`]).
+    pub(crate) fn pointer_confinement(&self, image: Rect) -> Option<Rect> {
+        self.logic.capture.pointer_confinement(image)
     }
 
     /// What the window's title ends with in the current capture state.

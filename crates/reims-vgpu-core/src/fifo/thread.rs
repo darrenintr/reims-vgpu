@@ -215,6 +215,31 @@ impl<P: Platform> Fifo<P> {
             if !self.read_bytes(body) {
                 continue;
             }
+            if crate::trace::on() {
+                // cmd: FIFO, opcode, stamp value, barrier count, first barrier's slot and value
+                let first = |at: usize| {
+                    barriers
+                        .get(at..at.wrapping_add(4))
+                        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                        .map_or(0, |b| u64::from(u32::from_le_bytes(b)))
+                };
+                let (index, value) = if barrier_count == 0 {
+                    (0, 0)
+                } else {
+                    (first(0), first(4))
+                };
+                crate::trace::event(
+                    "cmd",
+                    &[
+                        u64::from(self.stamp_index()),
+                        u64::from(command.command_id),
+                        u64::from(command.stamp_value),
+                        u64::from(barrier_count),
+                        index,
+                        value,
+                    ],
+                );
+            }
             let waited = (|| -> RaiseResult<_> {
                 if barrier_count == 0 {
                     return Ok(true);
@@ -245,9 +270,28 @@ impl<P: Platform> Fifo<P> {
             }
             // The read count publishes before the push, which may block.
             self.advance();
+            if barrier_count != 0 {
+                // bar: FIFO, stamp value: its barriers were met
+                crate::trace::event(
+                    "bar",
+                    &[
+                        u64::from(self.stamp_index()),
+                        u64::from(command.stamp_value),
+                    ],
+                );
+            }
             self.push_stamp(command.stamp_value, command.command_id);
             let body = payload.get(..payload_len).unwrap_or(&[]);
             self.dispatch(&command, body);
+            // ran: FIFO, opcode, stamp value: its handler returned
+            crate::trace::event(
+                "ran",
+                &[
+                    u64::from(self.stamp_index()),
+                    u64::from(command.command_id),
+                    u64::from(command.stamp_value),
+                ],
+            );
         }
         drop(payload);
         // Outside the lock

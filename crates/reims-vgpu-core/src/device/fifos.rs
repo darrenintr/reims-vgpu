@@ -350,6 +350,8 @@ impl<P: Platform> DeviceCore<P> {
         }
         self.on_fifo_queue(move |d| {
             if let Some(child) = d.child_slot(fifo) {
+                // poke: the child FIFO woken
+                crate::trace::event("poke", &[u64::from(fifo)]);
                 child.poke();
             }
         });
@@ -377,6 +379,8 @@ impl<P: Platform> DeviceCore<P> {
         );
         self.interrupt_stamp
             .fetch_or(crate::num::bit32(stamp), Ordering::SeqCst);
+        // stamp: slot, value: written for the guest
+        crate::trace::event("stamp", &[u64::from(stamp), u64::from(stamp_value)]);
         self.signal_cond.notify_all();
         self.interrupt();
     }
@@ -422,6 +426,8 @@ impl<P: Platform> DeviceCore<P> {
             let Some(raise) = &self.blocks.raise_interrupt else {
                 crate::fatal!(DeviceDeath::NilBlock("raiseInterrupt"))
             };
+            // irq: the guest interrupt raised
+            crate::trace::event("irq", &[]);
             raise(0);
         }
     }

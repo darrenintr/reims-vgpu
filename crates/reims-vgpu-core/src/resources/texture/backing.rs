@@ -173,6 +173,9 @@ impl<P: Platform> BackingResource<P> {
             let io_surface = platform.surfaces().create_backing(&spec);
             // A torn-down task answers nothing: no buffer.
             let host = task.upgrade();
+            // Trace `tobj`: the guest object whose pages the next `tbuf` imports (6, a new shared
+            // texture backing), its page and its length.
+            crate::trace::event("tobj", &[6, u64::from(page), length]);
             let transfer_buffer = match &host {
                 Some(t) => match t.new_buffer_for_virtual_page(hold, page, length) {
                     Ok(b) => Some(b),
@@ -269,6 +272,9 @@ impl<P: Platform> BackingResource<P> {
         if let Some(b) = self.transfer_buffer.lock().as_ref() {
             return Ok(b.clone_ref());
         }
+        // Trace `tobj`: the guest object whose pages the next `tbuf` imports (7, a shared texture
+        // backing bound again), its page and its length.
+        crate::trace::event("tobj", &[7, u64::from(self.page), self.length]);
         let made = match self.task.upgrade() {
             Some(t) => Some(t.new_buffer_for_virtual_page(hold, self.page, self.length)?),
             None => None,

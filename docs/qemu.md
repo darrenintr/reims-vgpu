@@ -777,21 +777,41 @@ a qcow2 overlay of its disk, and the library and QEMU at `9b2c5452`:
 
 No value the host supplies decides any of this, so Apple's own host would
 end an x86-64 macOS 26 guest's icon service the same way. Read from the
-guest's binaries and registry:
+guest's binaries and registry, and from the x86-64 code of macOS 26.7:
 - The PCI device (`106b:eeee`) matches `AppleParavirtGPU.kext`, which names
   the `AppleParavirtGPUMetal` plugin (`MetalPluginName` in the registry).
   That plugin's device has no `targetDeviceArchitecture` of its own, so it
   answers Metal's base `nil`. The IOGPU-family plugin, which has one, is
-  matched only by vmapple's device-tree node, never by a PCI device.
+  matched only by vmapple's device-tree node, never by a PCI device, and
+  its kext is not in x86-64 macOS 26.6.2's kernel collections.
+- Metal's base `targetDeviceArchitecture` answers `nil` for every device,
+  and nothing reaches it from the host: the device info the plugin fetches
+  (method 261, synchronously, as its device is made) feeds only its shader
+  compiler. The binary archive's load reads the architecture alone.
 - Nothing on the path asks the device first. IconRendering attaches its
-  archive whenever the file is in its bundle, RenderBox loads it, and
-  Metal's base `newBinaryArchiveWithDescriptor:` makes it without asking
+  archive whenever the file is in its bundle, RenderBox makes it the first
+  time one of IconRendering's functions is used, asking the device nothing
+  (no family, no `supportsBinaryArchives`), and Metal's base
+  `newBinaryArchiveWithDescriptor:` loads it without asking
   `supportsBinaryArchives` (which this device answers NO). RenderBox's
   `RB_USE_BINARY_ARCHIVE` covers only RenderBox's own library, and does not
   help.
-- With neither `METAL_ERROR_MODE` (environment or defaults) nor
-  `MTL_ERROR_MODE` set, Metal's error mode is a constant 6, which logs and
-  asserts. No build variant, SIP, boot-args or AMFI condition changes it.
+- The device info the library sends comes from the same builder as Apple's
+  x86-64 framework's, key for key, in the same order. Only the family keys
+  differ from what an Intel Mac would send, since they carry the host GPU's
+  families: key 28's bit 0 (Apple5), key 37 (1009 here, 1005 on a GPU of no
+  Apple family) and key 44 (Apple5 to Apple9, none on an Intel or AMD
+  GPU). The archive's path reads none of them. RenderBox asks the device's
+  families for other choices (its depth buffer default, framebuffer reads);
+  which of them follow from these keys is not traced.
+- Metal takes its error mode from `METAL_ERROR_MODE` in the environment,
+  then from the defaults (arguments, the app's domain, the global domain),
+  then from `MTL_ERROR_MODE`. With none set it is a constant 6, which logs
+  and asserts. No build variant, SIP, boot-args or AMFI condition changes
+  it, and nothing a host or OpenCore supplies is among the sources.
+- A command buffer's error report, which a GPU channel restart makes, never
+  ends the process, in any error mode: the aborts do not cascade through
+  the restarts.
 - IconRendering's archive holds only Apple GPU slices, so a device that
   did answer an architecture would miss them too and compile from the
   library, as it does with the key.
@@ -820,13 +840,30 @@ Laptop GPU host on 2026-10-11 (macOS 26.6.1, one library build):
   exec after the guest's teardown. A host that decoded faster would only
   narrow the window: some faulting execs started after their process had
   ended.
-- Such an exec can also end QEMU. A render pipeline it makes resolves its
-  functions from entries already emptied, gets nil for them ("pipeline
-  function N not found, given to Metal as nil"), and dies where Metal
-  aborts at a render descriptor with no vertex function, as Apple's
-  framework was measured to (docs/testing.md, `render_objects_malformed_*`
-  and `interplay_lifetime_held_pipeline_function_retyped`). Seen once, in
-  the RTX 3050 beta tester's log of a boot before the key was set.
+- Such an exec makes its pipelines from the emptied entries too. A
+  function whose entry is empty raises ("pipeline function N not found:
+  object N has an empty entry"), so the exec faults like the others, where
+  a nil function would have Metal abort at a render descriptor with no
+  vertex function, ending QEMU (docs/testing.md, section 6.18). So does a
+  resource whose entry is empty in a concurrent compute encoder's
+  UseResources, where Metal ends the process at a nil entry; the other
+  resource lists take it as nil, which Metal skips (section 6.16). Answered
+  nil, it ended QEMU in the RTX 3050 beta tester's log of a boot before the
+  key was set, and at Setup Assistant on a new install on the RTX 5080
+  Laptop GPU host.
+- The guest empties the list in place, mid-exec. Measured on the RTX 5080
+  Laptop GPU host on 2026-10-12, in 10 boots of a new macOS 26.6.2 install
+  to Setup Assistant (no key), with the library logging each lookup: the
+  task's whole list read as type 0 with offset all ones at the fault, and
+  the same 1, 10 and 100 ms later, through the host's mapping and a fresh
+  page-table walk alike; the list's pages had not moved. Of the first 64
+  entries, 33 were filled when the exec started, 39-40 once it had made its
+  resources, and 0-8 at the fault, 1-5 ms in. Execs (opcode 55) ran on
+  child FIFO 1 and object deletes (40) on child FIFO 2, the deletes with no
+  barriers; each exec there took 20-80 ms while its pipelines compiled
+  cold, so FIFO 1 reached a process's last exec after its end. Each boot
+  faulted 9-21 execs; in 2 of the 10 a render pipeline's function resolved
+  to nil and QEMU ended.
 
 ### Slow icon generation after login
 

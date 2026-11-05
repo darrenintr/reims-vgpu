@@ -390,6 +390,9 @@ impl<P: Platform> PagedTexture<P> {
         let Some(task) = self.task.upgrade() else {
             crate::fatal!(DeathKind::GoneTaskPages)
         };
+        // Trace `tobj`: the guest object whose pages the next `tbuf` imports (4, a texture), its
+        // page and its length.
+        crate::trace::event("tobj", &[4, u64::from(self.page), self.length]);
         // The task raises rather than answer nothing.
         let buffer = task.new_buffer_for_virtual_page(hold, self.page, self.length)?;
         *self.transfer_buffer.lock() = Some(buffer);

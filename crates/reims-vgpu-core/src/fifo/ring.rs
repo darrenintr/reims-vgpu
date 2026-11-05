@@ -208,12 +208,14 @@ impl<P: Platform> Fifo<P> {
         self.command_offset.store(offset, Ordering::Relaxed);
     }
 
-    /// One wait for ring bytes, under `lock`'s guard `g`: a poke, a root's `written` or a
-    /// drain wakes it.
-    fn wait_for_bytes(&self, g: &mut MutexGuard<'_, ()>) {
-        // The burst ends: what the thread held back goes now, with the ring's lock free. Bytes
-        // that came meanwhile woke no one, so the caller looks for them again before it waits.
-        if MutexGuard::unlocked(g, crate::rt::thread::before_block) {
+    /// One wait for ring bytes while `waits` holds, under `lock`'s guard `g`: a poke, a root's
+    /// `written` or a drain wakes it.
+    fn wait_for_bytes(&self, g: &mut MutexGuard<'_, ()>, waits: impl Fn() -> bool) {
+        // The burst ends: what the thread held back goes now, with the ring's lock free. A
+        // doorbell rung meanwhile woke no one, so the ring is looked at again under the lock
+        // before the wait, whether or not anything was submitted; where something was, the
+        // caller looks again itself.
+        if MutexGuard::unlocked(g, crate::rt::thread::before_block) || !waits() {
             return;
         }
         #[cfg(test)]
@@ -254,12 +256,14 @@ impl<P: Platform> Fifo<P> {
                 .load(Ordering::SeqCst)
                 .wrapping_sub(r.read.load(Ordering::SeqCst));
             if available == 0 {
+                let waits = || {
+                    !self.quiesced.load(Ordering::SeqCst)
+                        && r.written.load(Ordering::SeqCst) == r.read.load(Ordering::SeqCst)
+                };
                 let mut g = self.lock.lock();
-                if !self.quiesced.load(Ordering::SeqCst)
-                    && r.written.load(Ordering::SeqCst) == r.read.load(Ordering::SeqCst)
-                {
+                if waits() {
                     // One wait, then the loop runs again
-                    self.wait_for_bytes(&mut g);
+                    self.wait_for_bytes(&mut g, waits);
                 }
                 continue;
             }
@@ -312,9 +316,11 @@ impl<P: Platform> Fifo<P> {
             // The cache is reloaded only when too small; a lowered `written` wraps.
             let count = available(dst.len());
             if count == 0 {
+                let wanted = dst.len();
+                let waits = || !self.quiesced.load(Ordering::SeqCst) && available(wanted) == 0;
                 let mut g = self.lock.lock();
-                if !self.quiesced.load(Ordering::SeqCst) && available(dst.len()) == 0 {
-                    self.wait_for_bytes(&mut g);
+                if waits() {
+                    self.wait_for_bytes(&mut g, waits);
                 }
                 continue;
             }

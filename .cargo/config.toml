@@ -1,2 +1,10 @@
 [alias]
 xtask = "run --package xtask --"
+
+[env]
+# jemalloc's build (tikv-jemalloc-sys, reims-vgpu-c's allocator on arm64 macOS) with no malloc
+# zone. Its configure reads `enable_zone_allocator` from the environment as it reads
+# `--disable-zone-allocator`, which the crate's build script does not pass. With the zone, the
+# archive `cargo xtask dist` links whole (`ld -r -force_load`) registers jemalloc as the first
+# malloc zone of every host that links it, ahead of the system's.
+enable_zone_allocator = "no"

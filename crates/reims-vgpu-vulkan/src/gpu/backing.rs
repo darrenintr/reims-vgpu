@@ -152,6 +152,7 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::host::HostPtr;
+use reims_vgpu_core::num::ToU64;
 use reims_vgpu_core::platform::os::vm::{HostVm, KernReturn, VmProt};
 use reims_vgpu_core::platform::types::ResourceAddressRange;
 use reims_vgpu_core::raise::RaiseResult;
@@ -499,7 +500,7 @@ impl Backing {
             return Ok(false);
         };
         let alias = Arc::new(alias);
-        let (first, keep) = Arc::clone(&alias).into_runtime();
+        let (first, keep) = Arc::clone(&alias).into_runtime(ImportSite::Replace);
         rebind(first, keep)?;
         let own = {
             let mut aliased = self.alias.lock();
@@ -845,20 +846,22 @@ unsafe impl Sync for Alias {}
 
 impl Alias {
     /// The first byte the runtime imports, and the runtime's keep-alive of the alias, which lets
-    /// go of it as it drops: once the runtime freed its import, or at once where the call was
+    /// go of it as it drops: once the runtime freed its import, at the buffer's release where
+    /// it lies in a live buffer's import ([`keep_alive`]), or at once where the call was
     /// refused. The alias is freed once nothing else holds it.
     ///
     /// The runtime imports the alias's pages, or, where the host's runtime cannot import them as
     /// they are mapped (read-only, on Linux), a writable twin of them ([`crate::os::import_view`]),
     /// whose first byte this answers, and which the keep-alive holds too: the GPU's writes then
     /// reach the pages, where Metal drops them ([`Alias::writes_kept`]).
-    pub(crate) fn into_runtime(self: Arc<Self>) -> (NonNull<u8>, rt::KeepAlive) {
+    pub(crate) fn into_runtime(self: Arc<Self>, site: ImportSite) -> (NonNull<u8>, rt::KeepAlive) {
         let first = self.at;
         let view = crate::os::import_view(first, self.length);
         let imported = view.at();
         self.kept.store(view.writes_kept(), Ordering::Release);
         let (_, twin) = view.release(first, None);
-        (imported, keep_alive((twin, self)))
+        let traced = ImportTrace::new(site, first, self.length, imported);
+        (imported, keep_alive((twin, self, traced)))
     }
 
     /// Whether the runtime imports the alias through a writable twin of read-only pages, whose
@@ -881,11 +884,75 @@ impl Drop for Alias {
     }
 }
 
+/// Where host memory was handed to the runtime, as the trace names it ([`ImportTrace`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ImportSite {
+    /// A no-copy buffer over host memory core gives (`newBufferWithBytesNoCopy`: task pages, the
+    /// EFI framebuffer).
+    NoCopyBytes,
+    /// A no-copy buffer a descriptor names (a detached buffer).
+    NoCopyDescriptor,
+    /// A buffer over a surface's alias.
+    Surface,
+    /// A heap over guest ranges.
+    Heap,
+    /// A buffer's replaced backing.
+    Replace,
+    /// A buffer over a surface, at its base address.
+    SurfaceBase,
+}
+
+impl ImportSite {
+    /// The site's number in the trace.
+    fn code(self) -> u64 {
+        match self {
+            Self::NoCopyBytes => 1,
+            Self::NoCopyDescriptor => 2,
+            Self::Surface => 3,
+            Self::Heap => 4,
+            Self::Replace => 5,
+            Self::SurfaceBase => 6,
+        }
+    }
+}
+
+/// The trace of the host memory this platform hands the runtime for one no-copy buffer, heap or
+/// rebind, with `REIMS_VGPU_TRACE` set ([`reims_vgpu_core::trace`]): `imp` as its keep-alive is
+/// made (the site, the first byte given, its length, the first byte handed over), and `impfree`
+/// as the keep-alive goes ([`keep_alive`]). It marks each buffer, not each import: a buffer
+/// made over exactly the bytes a live no-copy buffer was made over lies in that one's import
+/// (the runtime's `host_aliases.rs`), and its keep-alive goes at its release; the runtime's
+/// `WorkCounts` count those (`host_keep_alives_covered`). A diagnostic: it holds nothing and
+/// reads nothing with an effect, and the keep-alive drops it last.
+pub(crate) struct ImportTrace(u64);
+
+impl ImportTrace {
+    pub(crate) fn new(
+        site: ImportSite,
+        given: NonNull<u8>,
+        length: u64,
+        imported: NonNull<u8>,
+    ) -> Self {
+        let at = imported.as_ptr().addr().to_u64();
+        let given = given.as_ptr().addr().to_u64();
+        reims_vgpu_core::trace::event("imp", &[site.code(), given, length, at]);
+        Self(at)
+    }
+}
+
+impl Drop for ImportTrace {
+    fn drop(&mut self) {
+        reims_vgpu_core::trace::event("impfree", &[self.0]);
+    }
+}
+
 /// The runtime's keep-alive of `kept`, what keeps the memory of a no-copy buffer's or heap's
 /// import mapped (an [`Alias`], a twin, an [`UnmapHold`](crate::remap::UnmapHold)): the runtime
 /// drops it once it freed the device's import of the memory, after the deallocator ran, on
-/// the thread that frees the import, which may be one of the runtime's. Its drop runs
-/// marked ours, so a panic there aborts.
+/// the thread that frees the import, which may be one of the runtime's; or, for a buffer whose
+/// import keeps another buffer's keep-alive already (one that lies in a live buffer's import),
+/// at the buffer's release, after its deallocator (the runtime's `host_memory.rs`, "A
+/// keep-alive"). Its drop runs marked ours, so a panic there aborts.
 pub(crate) fn keep_alive(kept: impl Send + 'static) -> rt::KeepAlive {
     /// `kept`, dropped marked ours.
     struct Kept<T>(Option<T>);

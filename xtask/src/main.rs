@@ -117,10 +117,20 @@ fn cmd_testkit(_args: &[String]) -> Res<bool> {
 }
 
 fn cargo(args: &[&str]) -> Res<bool> {
-    println!("$ cargo {}", args.join(" "));
+    cargo_with(args, &[])
+}
+
+/// [`cargo`], with `env` added to Cargo's environment.
+fn cargo_with(args: &[&str], env: &[(&str, &std::path::Path)]) -> Res<bool> {
+    let shown: String = env
+        .iter()
+        .map(|(k, v)| format!("{k}={} ", v.display()))
+        .collect();
+    println!("$ {shown}cargo {}", args.join(" "));
     let status =
         std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
             .args(args)
+            .envs(env.iter().copied())
             .current_dir(repo_root())
             .status()
             .map_err(|e| format!("cargo: {e}"))?;
@@ -144,6 +154,22 @@ const LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
 /// unbuilt, as a Mac has no Linux C toolchain for them and nothing links.
 const LINUX_CHECK_FEATURES: &str = "reims-vgpu-core/testkit,reims-vgpu/testkit,reims-vgpu/vulkan,\
     reims-vgpu-c/vulkan,reims-vgpu-window/sdl-no-link";
+
+/// The variable jemalloc's build script (`tikv-jemalloc-sys`, the C API's allocator on
+/// [`LINUX_TARGET`]) reads for that target as a library to link in place of the one it builds. A
+/// Mac's type-check of Linux sets it to an empty archive ([`empty_archive`]), as the Mac has no
+/// Linux C toolchain to build jemalloc with and nothing links.
+const LINUX_JEMALLOC_OVERRIDE: &str = "X86_64_UNKNOWN_LINUX_GNU_JEMALLOC_OVERRIDE";
+
+/// An archive with no members, `libjemalloc.a` under the target directory, written for
+/// [`LINUX_JEMALLOC_OVERRIDE`].
+fn empty_archive() -> Res<std::path::PathBuf> {
+    let dir = tools::target_dir(&mut tools::System)?.join("linux-check");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = dir.join("libjemalloc.a");
+    std::fs::write(&path, b"!<arch>\n").map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
 
 /// The macOS core's tests run as under Rosetta, with the x86-64 guest's pages.
 const X86_64_MACOS_TARGET: &str = "x86_64-apple-darwin";
@@ -170,21 +196,25 @@ fn cmd_check(args: &[String]) -> Res<bool> {
             TESTED_FEATURES
         };
         ok &= cargo(&["fmt", "--all", "--check"])?;
-        let clippy = |more: &[&str]| {
+        let clippy = |more: &[&str], env: &[(&str, &std::path::Path)]| {
             let mut args = vec!["clippy", "--workspace", "--all-targets"];
             args.extend_from_slice(more);
             args.extend(["--", "-D", "warnings"]);
-            cargo(&args)
+            cargo_with(&args, env)
         };
         // Every feature, SDL3's macOS window among them; then the tested features without the
         // default ones, so the macOS library without SDL (`macos-sdl` off,
         // `native/macos/sdl_off.rs`) is checked too.
-        ok &= clippy(&["--all-features"])?;
-        ok &= clippy(&["--no-default-features", "--features", features])?;
+        ok &= clippy(&["--all-features"], &[])?;
+        ok &= clippy(&["--no-default-features", "--features", features], &[])?;
         if cfg!(target_os = "macos") {
             // Every Linux file, type-checked with no Linux host: build scripts run on the Mac,
             // and nothing links.
-            ok &= clippy(&["--target", LINUX_TARGET, "--features", LINUX_CHECK_FEATURES])?;
+            let jemalloc = empty_archive()?;
+            ok &= clippy(
+                &["--target", LINUX_TARGET, "--features", LINUX_CHECK_FEATURES],
+                &[(LINUX_JEMALLOC_OVERRIDE, &jemalloc)],
+            )?;
         }
         ok &= cargo(&[
             "nextest",
