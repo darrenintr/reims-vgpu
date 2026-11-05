@@ -1,0 +1,188 @@
+name: Three Linux QEMU performance builds
+
+# Independent experiment variants, never overwrite v0.1.0 or Testing.
+on:
+  push:
+    branches:
+      - feature/experimental-bundles-and-launcher
+
+permissions:
+  contents: write
+
+concurrency:
+  group: reims-experiments-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-launcher:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify scripts and release manager CLI
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/reims-release.py
+          bash -n scripts/tahoe-launch-remote
+          python3 scripts/reims-release.py --help > /dev/null
+          python3 scripts/reims-release.py --list --offline --json > "$RUNNER_TEMP/empty.json" || test $? -eq 1
+          python3 -m json.tool "$RUNNER_TEMP/empty.json" > /dev/null
+          python3 - <<'PY'
+          import importlib.util
+          path='scripts/reims-release.py'
+          spec=importlib.util.spec_from_file_location('reims_release',path)
+          module=importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          assert module.safe_tag('exp-native-v3-123-abc') == 'exp-native-v3-123-abc'
+          for unsafe in ('../escape','a/b','', 'a b'):
+              try: module.safe_tag(unsafe)
+              except RuntimeError: pass
+              else: raise AssertionError(f'accepted unsafe tag {unsafe!r}')
+          assert module.channel_for({'tag_name':'exp-fatlto-1','prerelease':True}) == 'experimental'
+          assert module.channel_for({'tag_name':'v0.1.0','prerelease':False}) == 'stable'
+          print('Release manager basic checks passed')
+          PY
+
+  build-variants:
+    name: Linux x86_64 / ${{ matrix.variant }}
+    needs: validate-launcher
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - variant: native-v3
+            rustflags: '-C target-cpu=x86-64-v3'
+            lto: thin
+            codegen: '16'
+            debug: line-tables-only
+          - variant: fat-lto
+            rustflags: ''
+            lto: fat
+            codegen: '1'
+            debug: line-tables-only
+          - variant: profiler
+            rustflags: '-C force-frame-pointers=yes'
+            lto: thin
+            codegen: '16'
+            debug: full
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TARGET_DIR: /home/runner/work/_temp/reims-cargo-target
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      CARGO_PROFILE_RELEASE_LTO: ${{ matrix.lto }}
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ matrix.codegen }}
+      CARGO_PROFILE_RELEASE_DEBUG: ${{ matrix.debug }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          df -h .
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git curl ca-certificates pkg-config python3 python3-venv \
+            ninja-build flex bison bzip2 cmake clang lld binutils \
+            libglib2.0-dev libpixman-1-dev libslirp-dev zlib1g-dev libfdt-dev \
+            libpipewire-0.3-dev libpulse-dev libasound2-dev libvulkan1 \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxfixes-dev libxss-dev libxtst-dev libxkbcommon-dev \
+            libwayland-dev libwayland-bin libdecor-0-dev \
+            libegl-dev libgl-dev libdrm-dev libgbm-dev libdbus-1-dev libudev-dev libusb-1.0-0-dev
+
+      - name: Fetch patched QEMU
+        run: |
+          git submodule update --init --depth 1 vendor/qemu ||
+            git submodule update --init vendor/qemu
+          test -f vendor/qemu/configure
+
+      - name: Compile pinned Metal2Vulkan and Vulkan option ROM
+        run: |
+          cargo --version
+          cargo fetch --locked
+          cargo xtask dist
+          test -f "$CARGO_TARGET_DIR/dist-vulkan/lib/pkgconfig/reims-vgpu.pc"
+          test -f "$CARGO_TARGET_DIR/dist-vulkan/lib/libreims_vgpu.a"
+
+      - name: Compile and install patched QEMU
+        run: |
+          mkdir -p "$RUNNER_TEMP/qemu-build"
+          cd "$RUNNER_TEMP/qemu-build"
+          PKG_CONFIG_PATH="$CARGO_TARGET_DIR/dist-vulkan/lib/pkgconfig" \
+            "$GITHUB_WORKSPACE/vendor/qemu/configure" \
+              --prefix=/reims-ctl-qemu \
+              --target-list=x86_64-softmmu \
+              --enable-kvm --disable-sdl --disable-gtk --enable-slirp --enable-libusb \
+              --enable-pvg --disable-docs --disable-tests --disable-werror
+          ninja -j2
+          DESTDIR="$RUNNER_TEMP/qemu-install" ninja install
+          test -x "$RUNNER_TEMP/qemu-install/reims-ctl-qemu/bin/qemu-system-x86_64"
+          test -x "$RUNNER_TEMP/qemu-install/reims-ctl-qemu/bin/qemu-img"
+          find "$RUNNER_TEMP/qemu-install/reims-ctl-qemu" \
+            -type f -name ReimsVgpu.rom | grep -q .
+
+      - name: Test and install reims-ctl
+        run: |
+          cargo test --locked --manifest-path crates/reims-ctl/Cargo.toml
+          cargo install --locked --path crates/reims-ctl --root "$RUNNER_TEMP/ctl-install"
+          install -m 755 "$RUNNER_TEMP/ctl-install/bin/reims-ctl" \
+            "$RUNNER_TEMP/qemu-install/reims-ctl-qemu/bin/reims-ctl"
+
+      - name: Smoke-test and package variant
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/qemu-install/reims-ctl-qemu"
+          "$prefix/bin/reims-ctl" --help >/dev/null
+          "$prefix/bin/qemu-system-x86_64" --version
+          "$prefix/bin/qemu-img" --version
+          "$prefix/bin/qemu-system-x86_64" -device help | grep -q 'usb-host'
+          mkdir -p out
+          {
+            echo "reims-vgpu commit: $GITHUB_SHA"
+            echo "Variant: ${{ matrix.variant }}"
+            echo "RUSTFLAGS=$RUSTFLAGS"
+            echo "CARGO_PROFILE_RELEASE_LTO=$CARGO_PROFILE_RELEASE_LTO"
+            echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=$CARGO_PROFILE_RELEASE_CODEGEN_UNITS"
+            echo "CARGO_PROFILE_RELEASE_DEBUG=$CARGO_PROFILE_RELEASE_DEBUG"
+            rustc --version
+            "$prefix/bin/qemu-system-x86_64" --version
+            echo "Linked libraries:"
+            ldd "$prefix/bin/qemu-system-x86_64"
+          } > "$prefix/BUILD-INFO.txt"
+          tar -czf out/reims-vgpu-linux-x86_64.tar.gz -C "$prefix" .
+          (cd out && sha256sum reims-vgpu-linux-x86_64.tar.gz > SHA256SUMS)
+          du -h out/*
+
+      - name: Keep test Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reims-vgpu-${{ matrix.variant }}
+          path: |
+            out/reims-vgpu-linux-x86_64.tar.gz
+            out/SHA256SUMS
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Publish independent experimental GitHub Release
+        if: github.repository == 'darrenintr/reims-vgpu'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          short_sha="$(echo "$GITHUB_SHA" | cut -c1-12)"
+          tag="exp-${{ matrix.variant }}-$GITHUB_RUN_NUMBER-$short_sha"
+          gh release create "$tag" out/reims-vgpu-linux-x86_64.tar.gz \
+            out/SHA256SUMS --target "$GITHUB_SHA" \
+            --title "Experiment: ${{ matrix.variant }} ($short_sha)" \
+            --notes "Experimental Linux QEMU build. Variant: ${{ matrix.variant }}. Source commit: $GITHUB_SHA. Compare against v0.1.0 with the same VM, guest disk and workload. Not validated on RX 7600; build success does not imply improved FPS." \
+            --prerelease
