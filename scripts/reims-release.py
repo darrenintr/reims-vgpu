@@ -25,6 +25,11 @@ DATA = Path(os.environ.get("REIMS_CTL_DATA_DIR") or
             Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "reims-ctl")
 ROOT = DATA / "qemu"
 STATE = DATA / "release-manager.json"
+INVALID_MANIFEST_URL = (
+    f"https://raw.githubusercontent.com/{REPO}/testing/scripts/invalid-releases.json"
+)
+INVALID_CACHE = DATA / "invalid-releases-cache.json"
+LOCAL_INVALID = DATA / "invalid-releases-local.json"
 
 def fetch(url):
     headers = {
@@ -41,34 +46,40 @@ def fetch(url):
         return response.read()
 
 def release_index():
-    """Prefer the authenticated GitHub CLI to avoid the anonymous 60/hour IP limit.
-
-    The CLI uses its existing credential store; no token is printed, persisted
-    by this script or passed to asset-download redirects.
-    """
+    """Read ALL pages of the live GitHub Releases catalog."""
+    endpoint = f"repos/{REPO}/releases?per_page=100"
     if shutil.which("gh"):
         try:
             result = subprocess.run(
-                ["gh", "api", f"repos/{REPO}/releases?per_page=100"],
-                check=True, capture_output=True, text=True, timeout=40,
+                ["gh", "api", "--paginate", "--slurp", endpoint],
+                check=True, capture_output=True, text=True, timeout=90,
             )
-            return json.loads(result.stdout)
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
-            # GitHub CLI may be installed but not logged in. A GH_TOKEN,
-            # GITHUB_TOKEN, or unauthed API request can still work.
+            pages = json.loads(result.stdout)
+            if not isinstance(pages, list):
+                raise ValueError("unexpected gh API result")
+            if pages and isinstance(pages[0], dict):
+                return pages
+            return [release for page in pages for release in page]
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                ValueError, TypeError):
             pass
+
+    rows = []
     try:
-        return json.loads(fetch(API + "?per_page=100"))
+        for page in range(1, 51):
+            releases = json.loads(fetch(f"{API}?per_page=100&page={page}"))
+            if not isinstance(releases, list):
+                raise RuntimeError("unexpected GitHub Releases response")
+            rows.extend(releases)
+            if len(releases) < 100:
+                return rows
+        raise RuntimeError("Too many Releases (>5000); refusing to truncate")
     except urllib.error.HTTPError as exc:
         if exc.code in (403, 429):
             raise RuntimeError(
-                "GitHub API rate limited (HTTP 403/429). Log in with "
-                "`gh auth login` and retry; the downloader will use "
-                "authenticated `gh api` automatically. Alternatively set "
-                "GH_TOKEN or wait for GitHub's rate-limit reset."
+                "GitHub API rate limited. Use gh auth login or set GH_TOKEN."
             ) from exc
         raise
-
 
 def channel_for(release):
     tag = release.get("tag_name", "")
@@ -266,15 +277,34 @@ def selectable_releases():
     return results
 
 
+def catalog_releases():
+    """List all published Releases, including source-only ones."""
+    rows = []
+    for release in release_index():
+        if release.get("draft"):
+            continue
+        tag = release.get("tag_name") or ""
+        try:
+            safe_tag(tag)
+        except RuntimeError:
+            continue
+        assets = {asset["name"]: asset for asset in release.get("assets", [])}
+        rows.append((release, assets))
+    rows.sort(key=lambda item: item[0].get("published_at") or "", reverse=True)
+    return rows
+
+
 def record(release, assets, state):
     tag = release["tag_name"]
+    downloadable = ASSET in assets and "SHA256SUMS" in assets
     return describe_release({
         "tag": tag,
         "name": release.get("name") or tag,
         "channel": channel_for(release),
         "prerelease": bool(release.get("prerelease")),
         "published_at": release.get("published_at"),
-        "size_bytes": assets[ASSET].get("size", 0),
+        "size_bytes": assets.get(ASSET, {}).get("size", 0),
+        "downloadable": downloadable,
         "installed": valid_install(tag),
         "current": (ROOT / "current").resolve() == (ROOT / tag).resolve(),
         "description": (release.get("body") or "").splitlines()[0][:180] if release.get("body") else "",
@@ -295,6 +325,7 @@ def cached_records():
             ),
             "prerelease": not tag.startswith("v"),
             "published_at": "", "size_bytes": 0, "installed": True,
+            "downloadable": False,
             "current": (ROOT / "current").resolve() == folder.resolve(),
             "description": "Available offline (already installed)",
         })
