@@ -236,6 +236,20 @@ impl Cursor {
     pub fn read_bytes(&mut self, into: &mut [u8]) -> Result<(), CursorError> {
         let mut bytes = into.len().to_u64();
         validate_operation_size(self.offset, self.length, bytes, "read")?;
+        // A read inside the current range, short of its end, as nearly every record's is: one
+        // copy, and the cursor moves as the loop below would move it.
+        if let Some(range) = self.ranges.get(self.range_index.to_usize())
+            && bytes < range.length.wrapping_sub(self.range_offset)
+        {
+            GuestPtr::new(range.address.wrapping_add(self.range_offset)).copy_to(
+                0,
+                into,
+                DeathKind::CursorReadNull,
+            );
+            self.range_offset = self.range_offset.wrapping_add(bytes);
+            self.offset = self.offset.wrapping_add(bytes);
+            return Ok(());
+        }
         let mut into = into;
         while bytes != 0 {
             let range = self.range_at(self.range_index);

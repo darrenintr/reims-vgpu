@@ -8,13 +8,16 @@
 //!   never reset, so a leaked range moves every later offset.
 //! - [`LookupMap`]: maps that are only looked up. No iteration, and a fixed hasher, so its drop
 //!   order is the same in every run.
+//! - [`KeyHasher`]: the fixed hasher of both hash maps.
 
 pub mod bucket_order;
 pub mod first_fit;
+pub mod hasher;
 pub mod list_order;
 pub mod lookup;
 
 pub use bucket_order::BucketOrderMap;
 pub use first_fit::{FirstFitVa, FreeRange};
+pub use hasher::KeyHasher;
 pub use list_order::ListOrderMap;
 pub use lookup::LookupMap;

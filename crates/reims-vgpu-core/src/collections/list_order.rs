@@ -2,17 +2,18 @@
 //!
 //! The resource caches are these maps. A flush walks one to sort its resources into evictions,
 //! and a teardown drains each kind's objects to release them. Nothing the guest or host sees
-//! depends on that order. The hasher is fixed, so the order is a function of the keys and the
-//! insert and remove history, the same in every run.
+//! depends on that order. The hasher is fixed ([`super::KeyHasher`]), so the order is a function
+//! of the keys and the insert and remove history, the same in every run.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::hash::{BuildHasherDefault, DefaultHasher};
+
+use super::hasher::KeyBuild;
 
 /// A map from `u32` keys, walked and drained in its hash table's order.
 #[derive(Debug)]
 pub struct ListOrderMap<V> {
-    map: HashMap<u32, V, BuildHasherDefault<DefaultHasher>>,
+    map: HashMap<u32, V, KeyBuild>,
 }
 
 impl<V> Default for ListOrderMap<V> {
@@ -25,7 +26,7 @@ impl<V> ListOrderMap<V> {
     /// An empty map.
     pub fn new() -> Self {
         ListOrderMap {
-            map: HashMap::with_hasher(BuildHasherDefault::default()),
+            map: HashMap::with_hasher(KeyBuild::default()),
         }
     }
 

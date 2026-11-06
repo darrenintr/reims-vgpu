@@ -1,25 +1,27 @@
 //! [`LookupMap`]: a hash map that is only looked up.
 //!
-//! Its hasher is fixed (SipHash-1-3 with zero keys, `BuildHasherDefault<DefaultHasher>`), so the
-//! order it drops its values in is a function of the keys and the insert and remove history, the
-//! same in every run. It has no iteration API: nothing depends on its order.
+//! Its hasher is fixed ([`super::KeyHasher`]), so the order it drops its values in is a function
+//! of the keys and the insert and remove history, the same in every run. It has no iteration
+//! API: nothing depends on its order.
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fmt;
-use std::hash::{BuildHasherDefault, DefaultHasher, Hash};
+use std::hash::Hash;
 use std::ops::Index;
+
+use super::hasher::KeyBuild;
 
 /// A hash map with a fixed hasher and no iteration.
 pub struct LookupMap<K, V> {
-    map: HashMap<K, V, BuildHasherDefault<DefaultHasher>>,
+    map: HashMap<K, V, KeyBuild>,
 }
 
 impl<K: Hash + Eq, V> LookupMap<K, V> {
     /// An empty map.
     pub fn new() -> Self {
         LookupMap {
-            map: HashMap::with_hasher(BuildHasherDefault::default()),
+            map: HashMap::with_hasher(KeyBuild::default()),
         }
     }
 
