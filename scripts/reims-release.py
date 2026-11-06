@@ -722,6 +722,12 @@ def main():
                              help="Preview obsolete downloaded builds; never deletes")
     maintenance.add_argument("--cleanup-apply", action="store_true",
                              help="Delete only previewed obsolete builds, with --confirm and --plan-id")
+    maintenance.add_argument("--prune-invalid", action="store_true",
+                             help="Sync GitHub invalid tags and remove safe invalid local builds")
+    maintenance.add_argument("--mark-invalid", metavar="TAG",
+                             help="Mark a release invalid locally (does not edit GitHub)")
+    maintenance.add_argument("--unmark-invalid", metavar="TAG",
+                             help="Remove a local invalid mark (GitHub mark still applies)")
     parser.add_argument("--confirm", action="store_true",
                         help="Required explicit confirmation for --cleanup-apply")
     parser.add_argument("--plan-id",
@@ -732,6 +738,22 @@ def main():
     args = parser.parse_args()
     if sys.platform != "linux" or os.uname().machine != "x86_64":
         parser.error("Prebuilt releases currently support Linux x86_64 only")
+    if args.mark_invalid or args.unmark_invalid:
+        tag = args.mark_invalid or args.unmark_invalid
+        set_local_invalid(tag, bool(args.mark_invalid))
+        print(f"Local release mark updated: {tag}")
+        return 0
+    if args.prune_invalid:
+        result = prune_invalid_installs(offline=args.offline)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            print(f"Removed {len(result['removed'])} explicitly invalid builds")
+            for tag in result["removed"]:
+                print("Removed: " + tag)
+            for message in result["skipped"]:
+                print("Skipped: " + message)
+        return 0
     if args.list:
         return show_releases(offline=args.offline or args.no_check,
                              as_json=args.json, curated=args.curated,
@@ -763,6 +785,8 @@ def main():
     tag = args.tag
     if tag:
         tag = safe_tag(tag)
+        if tag in invalid_tags(offline=args.no_check):
+            raise RuntimeError(f"Invalid release {tag}: launch blocked")
     elif not channel:
         if sys.stdin.isatty():
             choice = input("Release: [s]table / [t]esting (or supply --tag): ").strip().lower()
@@ -771,6 +795,8 @@ def main():
             channel = state.get("current_channel", "stable")
     if not tag:
         tag = state.get(channel) if args.no_check else None
+    if tag and tag in invalid_tags(offline=args.no_check):
+        raise RuntimeError(f"Invalid release {tag}: launch blocked")
     target = ROOT / tag if tag else None
     if args.no_check:
         if not tag:
@@ -781,6 +807,8 @@ def main():
         try:
             release, assets = fetch_releases(channel=channel, tag=tag)
             wanted = safe_tag(release["tag_name"])
+            if wanted in invalid_tags(offline=args.no_check):
+                raise RuntimeError(f"Invalid release {wanted}: launch blocked")
             if valid_install(wanted):
                 target = activate_cached(wanted, channel)
             else:
