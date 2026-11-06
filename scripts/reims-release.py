@@ -334,32 +334,43 @@ def cached_records():
 
 
 def show_releases(offline=False, as_json=False, curated=False, diagnostics=False):
+    invalid = invalid_tags(offline=offline)
+    local_rows = cached_records()
     if offline:
-        rows = cached_records()
+        rows = local_rows
     else:
         try:
-            rows = [record(r, assets, read_state()) for r, assets in selectable_releases()]
+            rows = [record(release, assets, read_state())
+                    for release, assets in catalog_releases()]
+            known = {row["tag"] for row in rows}
+            rows.extend(row for row in local_rows if row["tag"] not in known)
         except (OSError, RuntimeError, ValueError, urllib.error.URLError) as exc:
-            print(f"GitHub release listing unavailable: {exc}; showing installed builds", file=sys.stderr)
-            rows = cached_records()
-    recommended = curated_releases(rows)
-    latest_tags = {row["tag"] for row in recommended}
+            print(f"GitHub catalog unavailable: {exc}; using local builds",
+                  file=sys.stderr)
+            rows = local_rows
     for row in rows:
-        row["historical"] = row["tag"] not in latest_tags
+        row["invalid"] = row["tag"] in invalid
+        if row["invalid"]:
+            row["test_label"] = "【已失效】 " + row["test_label"]
+    safe_rows = [row for row in rows if not row["invalid"]]
+    recommended = curated_releases(safe_rows)
+    selected_tags = {row["tag"] for row in recommended}
+    for row in rows:
+        row["historical"] = row["tag"] not in selected_tags
     if curated:
         rows = recommended
     elif diagnostics:
-        rows = diagnostic_releases(rows)
+        rows = diagnostic_releases(safe_rows)
     if as_json:
         print(json.dumps(rows, ensure_ascii=False))
     else:
         for item in rows:
-            installed = " [downloaded]" if item["installed"] else ""
-            selected = " [selected]" if item["current"] else ""
-            historical = " [history]" if item.get("historical") else ""
-            print(f"{item['tag']:47} {item['test_label']}{installed}{selected}{historical}")
+            local = " [local]" if item["installed"] else ""
+            missing = (" [source-only]" if not item["installed"]
+                       and not item.get("downloadable") else "")
+            invalid_mark = " [invalid]" if item["invalid"] else ""
+            print(f"{item['tag']:47} {item['test_label']}{local}{missing}{invalid_mark}")
     return 0 if rows else 1
-
 
 def qemu_running():
     """Do not delete any cached build while *any* QEMU system VM is running."""
