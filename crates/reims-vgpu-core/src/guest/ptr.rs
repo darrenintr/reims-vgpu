@@ -286,7 +286,8 @@ impl GuestPtr {
         let a = check(self.addr, off, dst.len(), death);
         let mut i: usize = 0;
         let mut rest = dst;
-        // Bytes up to an 8-byte boundary, then words, then the tail: each a volatile load.
+        // Each a volatile load of the widest naturally aligned unit that fits: 8, 4, 2 or 1
+        // bytes. A load never crosses a page, so a fault comes at the same first byte.
         while !rest.is_empty() {
             let at = a.wrapping_add(i.to_u64());
             let taken = std::mem::take(&mut rest);
@@ -295,6 +296,16 @@ impl GuestPtr {
                 w.copy_from_slice(&raw::load_u64(at).to_ne_bytes());
                 rest = tail;
                 i = i.wrapping_add(8);
+            } else if aligned(at, 4) && taken.len() >= 4 {
+                let (w, tail) = taken.split_at_mut(4);
+                w.copy_from_slice(&raw::load_u32(at).to_ne_bytes());
+                rest = tail;
+                i = i.wrapping_add(4);
+            } else if aligned(at, 2) && taken.len() >= 2 {
+                let (w, tail) = taken.split_at_mut(2);
+                w.copy_from_slice(&raw::load_u16(at).to_ne_bytes());
+                rest = tail;
+                i = i.wrapping_add(2);
             } else if let Some((b, tail)) = taken.split_first_mut() {
                 *b = raw::load_u8(at);
                 rest = tail;

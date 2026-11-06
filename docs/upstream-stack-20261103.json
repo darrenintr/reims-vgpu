@@ -1,0 +1,203 @@
+{
+  "assembled": true,
+  "baseline": "c8838347f0e5500c0950d2b15695a78a2ff165f8",
+  "qemu": "b9d3bd5a9dd427ac42f6a2249c26a0b342f8f16e",
+  "qemu_changes": [
+    "THP alignment",
+    "cfa70f3a",
+    "59cb5109",
+    "a8633856"
+  ],
+  "metal2vulkan_base": "6d6f5d92326361562ac5d482eb017f41d80c82d9",
+  "metal2vulkan_tree": "0bacb78e6b6c41452b0968d7db2d9cd71939a76b",
+  "translator_cache_semantics": 2026110301,
+  "applied": [
+    {
+      "component": "reims-vgpu",
+      "commit": "43b7caa200b8ed49ac56c8528b89a65cc346e583",
+      "files": [
+        "crates/reims-vgpu-core/src/collections.rs",
+        "crates/reims-vgpu-core/src/collections/hasher.rs",
+        "crates/reims-vgpu-core/src/collections/list_order.rs",
+        "crates/reims-vgpu-core/src/collections/lookup.rs",
+        "crates/reims-vgpu-core/src/deserializer.rs",
+        "crates/reims-vgpu-core/src/deserializer/compute.rs",
+        "crates/reims-vgpu-core/src/deserializer/render.rs",
+        "crates/reims-vgpu-core/src/deserializer/render/draw.rs",
+        "crates/reims-vgpu-core/src/deserializer/render/state.rs",
+        "crates/reims-vgpu-core/src/deserializer/short_list.rs",
+        "crates/reims-vgpu-core/src/guest/ptr.rs",
+        "crates/reims-vgpu-core/src/memory/cursor.rs"
+      ]
+    },
+    {
+      "component": "reims-vgpu",
+      "commit": "422eab5b82ebbb085cbff3dc434384406c0fffc3",
+      "files": [
+        "crates/reims-vgpu-core/src/fifo/thread.rs",
+        "crates/reims-vgpu-core/src/gpu_task/exec.rs",
+        "crates/reims-vgpu-core/src/gpu_task/service.rs",
+        "crates/reims-vgpu-core/src/rt/held.rs",
+        "crates/reims-vgpu-core/src/rt/queue.rs",
+        "crates/reims-vgpu-core/src/rt/thread.rs",
+        "crates/reims-vgpu-core/src/tasks/isolation.rs",
+        "crates/reims-vgpu-core/src/tasks/isolation/life.rs",
+        "crates/reims-vgpu-core/src/tasks/isolation/link.rs",
+        "crates/reims-vgpu-core/src/tasks/launcher.rs",
+        "crates/reims-vgpu-core/src/tasks/remote.rs"
+      ]
+    },
+    {
+      "component": "metal2vulkan",
+      "commit": "510cb01c4cad473ade0e661b8c08a69a6e9e3eee",
+      "files": [
+        "crates/metal2vulkan-air/src/abi/module.rs",
+        "crates/metal2vulkan-air/src/abi/tests.rs",
+        "crates/metal2vulkan/src/cache/mod.rs",
+        "crates/metal2vulkan/src/tests/engine_debug_info.rs",
+        "crates/metal2vulkan/src/tests/mod.rs"
+      ]
+    },
+    {
+      "component": "metal2vulkan",
+      "commit": "ec6b322bb5e794d42ee62498f60c9c35b78aa9c8",
+      "files": [
+        "crates/metal2vulkan-air/src/container/mod.rs",
+        "crates/metal2vulkan-air/src/container/mtlb.rs",
+        "crates/metal2vulkan-air/src/container/tests.rs",
+        "crates/metal2vulkan-air/src/error.rs",
+        "crates/metal2vulkan-devtools/src/metallib.rs",
+        "crates/metal2vulkan-runtime/src/dynamic_library.rs",
+        "crates/metal2vulkan/src/library/function.rs",
+        "crates/metal2vulkan/src/main.rs",
+        "crates/metal2vulkan/src/tests/engine_dynamic_libraries.rs"
+      ]
+    },
+    {
+      "component": "metal2vulkan",
+      "commit": "bf3ce3813c029c96d02594f8568f2ee8343c0ed8",
+      "files": [
+        "crates/metal2vulkan-air/src/abi/check.rs",
+        "crates/metal2vulkan-air/src/abi/tests.rs",
+        "crates/metal2vulkan-air/src/canon/aggregates.rs",
+        "crates/metal2vulkan-air/src/canon/mod.rs",
+        "crates/metal2vulkan-air/src/canon/tests.rs",
+        "crates/metal2vulkan-air/src/canon/tests/aggregates.rs",
+        "crates/metal2vulkan-air/src/container/mod.rs",
+        "crates/metal2vulkan-air/src/container/mtlb.rs",
+        "crates/metal2vulkan-air/src/container/tests.rs",
+        "crates/metal2vulkan-air/src/error.rs",
+        "crates/metal2vulkan-air/src/metal/generated.rs",
+        "crates/metal2vulkan-devtools/src/metallib.rs",
+        "crates/metal2vulkan-runtime/src/library.rs",
+        "crates/metal2vulkan-runtime/src/tests/core_image_libraries.rs",
+        "crates/metal2vulkan-runtime/src/tests/mod.rs",
+        "crates/metal2vulkan/src/error/mod.rs",
+        "crates/metal2vulkan/src/library/function.rs",
+        "crates/metal2vulkan/src/metal/generated.rs",
+        "crates/metal2vulkan/src/pipeline/compile.rs",
+        "crates/metal2vulkan/src/reflection/function.rs",
+        "crates/metal2vulkan/src/tests/core_image_libraries.rs",
+        "crates/metal2vulkan/src/tests/engine_aggregate_access.rs",
+        "crates/metal2vulkan/src/tests/mod.rs"
+      ]
+    }
+  ],
+  "deferred": [],
+  "context_adaptations": [
+    {
+      "file": "crates/reims-vgpu-core/src/rt/thread.rs",
+      "hunk": 1,
+      "resolution": "unique exact anchored match",
+      "outer_context_removed": [
+        2,
+        0
+      ]
+    },
+    {
+      "file": "crates/reims-vgpu-core/src/tasks/isolation/link.rs",
+      "hunk": 2,
+      "resolution": "unique exact anchored match",
+      "outer_context_removed": [
+        1,
+        0
+      ]
+    },
+    {
+      "file": "crates/reims-vgpu-core/src/tasks/remote.rs",
+      "hunk": 3,
+      "resolution": "unique exact anchored match",
+      "outer_context_removed": [
+        3,
+        0
+      ]
+    },
+    {
+      "file": "crates/metal2vulkan/src/tests/mod.rs",
+      "resolution": "append independent Rust test-module declarations",
+      "declarations": [
+        "mod engine_debug_info;"
+      ]
+    },
+    {
+      "file": "crates/metal2vulkan-air/src/canon/mod.rs",
+      "hunk": 2,
+      "resolution": "unique exact anchored match",
+      "outer_context_removed": [
+        0,
+        2
+      ]
+    },
+    {
+      "file": "crates/metal2vulkan-runtime/src/library.rs",
+      "hunk": 1,
+      "resolution": "unique exact anchored match",
+      "outer_context_removed": [
+        1,
+        0
+      ]
+    },
+    {
+      "file": "crates/metal2vulkan-runtime/src/tests/mod.rs",
+      "hunk": 1,
+      "resolution": "unique exact anchored match",
+      "outer_context_removed": [
+        1,
+        3
+      ]
+    },
+    {
+      "file": "crates/metal2vulkan/src/tests/mod.rs",
+      "resolution": "append independent Rust test-module declarations",
+      "declarations": [
+        "mod core_image_libraries;",
+        "mod engine_aggregate_access;"
+      ]
+    }
+  ],
+  "compiler": {
+    "rust": "1.98.1",
+    "target_cpu": "x86-64-v3",
+    "lto": "fat",
+    "codegen_units": 1
+  },
+  "not_included": [
+    "APV guest-driver / IOSurface migration",
+    "video acceleration devices",
+    "KVM dirty-page copying",
+    "pipeline timeout behavior",
+    "Rust / SDL upgrades"
+  ],
+  "validation": "Source assembly only. CI compilation and tests are separate gates. No RX 7600 or Tahoe boot claim.",
+  "test_adaptations": [
+    {
+      "file": "vendor/metal2vulkan/crates/metal2vulkan/src/tests/engine_debug_info.rs",
+      "reason": "Use test-local labeled RAII scratch helper; upstream assertions unchanged."
+    },
+    {
+      "file": "vendor/metal2vulkan/crates/metal2vulkan/src/tests/engine_aggregate_access.rs",
+      "reason": "Use test-local labeled RAII scratch helper; upstream assertions unchanged."
+    }
+  ],
+  "metal2vulkan_tree_scope": "Pinned port tree before documented test-only adaptations; final exact sources are in the candidate Git commit."
+}

@@ -51,6 +51,7 @@ pub mod info;
 pub mod rate_map;
 pub mod records;
 pub mod render;
+pub(crate) mod short_list;
 pub mod texture_descriptor;
 pub mod walk;
 
