@@ -168,14 +168,14 @@ class VenturaLauncherTests(unittest.TestCase):
     def test_automatic_cleanup_is_requested_before_catalog(self):
         result = self.run_launcher("--list-remote")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(self.manager_calls().startswith("--prune-invalid --json\\n"))
+        self.assertTrue(self.manager_calls().startswith("--prune-invalid --json\n"))
         self.assertIn("--list --json", self.manager_calls())
 
     def test_single_live_menu_selects_cached_version(self):
         gui = self.home / "bin"
         gui.mkdir()
         kdialog = gui / "kdialog"
-        kdialog.write_text("#!/bin/sh\\nprintf 'v0.1.3\\n'\\n")
+        kdialog.write_text("#!/bin/sh\nprintf 'v0.1.3\n'\n")
         kdialog.chmod(0o755)
         self.env["PATH"] = str(gui) + os.pathsep + self.env.get("PATH", "")
         result = self.run_launcher()
