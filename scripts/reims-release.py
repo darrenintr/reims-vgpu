@@ -521,6 +521,106 @@ def save_state(data):
     temp.write_text(json.dumps(data, indent=2) + "\n")
     os.replace(temp, STATE)
 
+def parse_invalid_manifest(data):
+    if not isinstance(data, dict) or data.get("schema_version") != 1:
+        raise ValueError("Invalid invalid-releases manifest schema")
+    values = data.get("invalid_tags")
+    if not isinstance(values, list) or len(values) > 5000:
+        raise ValueError("Invalid invalid-tags array")
+    if any(not isinstance(value, str) for value in values):
+        raise ValueError("Invalid release tag type")
+    return {safe_tag(value) for value in values}
+
+
+def read_invalid_file(path):
+    try:
+        return parse_invalid_manifest(json.loads(path.read_text()))
+    except (OSError, ValueError, RuntimeError):
+        return set()
+
+
+def invalid_tags(offline=False):
+    """Fetch explicit owner-managed invalid tags, fall back to last valid sync."""
+    if not offline:
+        try:
+            req = urllib.request.Request(INVALID_MANIFEST_URL, headers={
+                "User-Agent": "reims-release-manager/2",
+                "Cache-Control": "no-cache",
+            })
+            with urllib.request.urlopen(req, timeout=7) as response:
+                payload = json.loads(response.read())
+            marks = parse_invalid_manifest(payload)
+            INVALID_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = INVALID_CACHE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False) + "\n")
+            os.replace(tmp, INVALID_CACHE)
+        except (OSError, ValueError, RuntimeError, urllib.error.URLError) as exc:
+            print(f"Invalid-tag sync failed; using last cached marks: {exc}",
+                  file=sys.stderr)
+            marks = read_invalid_file(INVALID_CACHE)
+    else:
+        marks = read_invalid_file(INVALID_CACHE)
+    return marks | read_invalid_file(LOCAL_INVALID)
+
+
+def set_local_invalid(tag, obsolete):
+    """Mark/unmark a release on this device; remote marks remain authoritative."""
+    tag = safe_tag(tag)
+    entries = read_invalid_file(LOCAL_INVALID)
+    if obsolete:
+        entries.add(tag)
+    else:
+        entries.discard(tag)
+    LOCAL_INVALID.parent.mkdir(parents=True, exist_ok=True)
+    tmp = LOCAL_INVALID.with_suffix(".tmp")
+    tmp.write_text(json.dumps({
+        "schema_version": 1, "invalid_tags": sorted(entries)
+    }, indent=2, ensure_ascii=False) + "\n")
+    os.replace(tmp, LOCAL_INVALID)
+
+
+def prune_invalid_installs(offline=False):
+    """Auto-delete only known complete installations tagged explicitly invalid."""
+    marks = invalid_tags(offline=offline)
+    report = {"marked": sorted(marks), "removed": [], "skipped": []}
+    if not marks or not ROOT.exists():
+        return report
+    if ROOT.is_symlink() or not ROOT.is_dir():
+        raise RuntimeError("Refusing cleanup: unexpected qemu root")
+    if qemu_running():
+        report["skipped"].append("A QEMU VM is running; cleanup deferred")
+        return report
+    current = ROOT / "current"
+    if current.exists() and not current.is_symlink():
+        report["skipped"].append("qemu/current is not a symlink")
+        return report
+    for tag in sorted(marks):
+        folder = ROOT / tag
+        if not folder.exists() and not folder.is_symlink():
+            continue
+        if (folder.is_symlink() or not folder.is_dir()
+                or folder.resolve().parent != ROOT.resolve()
+                or not valid_install(tag)):
+            report["skipped"].append(f"{tag}: not a safe complete installation")
+            continue
+        if qemu_running():
+            report["skipped"].append("A QEMU VM started; stopping cleanup")
+            break
+        if current.is_symlink() and current.resolve() == folder.resolve():
+            # Fail closed for a selected build. User must switch to another
+            # working version before removing the old binaries.
+            report["skipped"].append(f"{tag}: selected; switch builds first")
+            continue
+        shutil.rmtree(folder)
+        state = read_state()
+        for key in ("stable", "testing", "current_tag"):
+            if state.get(key) == tag:
+                state.pop(key, None)
+        save_state(state)
+        report["removed"].append(tag)
+    return report
+
+
 def install(release, assets, channel):
     tag = safe_tag(release["tag_name"])
     dest = ROOT / tag
