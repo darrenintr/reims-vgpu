@@ -9,6 +9,9 @@ on:
       - scripts/reims-release.py
       - scripts/tahoe-launch-remote
       - tests/test_release_picker.py
+      - tests/test_live_releases.py
+      - tests/test_ventura_launcher.py
+      - scripts/invalid-releases.json
       - .github/workflows/release-picker-checks.yml
   pull_request:
     branches:
@@ -17,6 +20,9 @@ on:
       - scripts/reims-release.py
       - scripts/tahoe-launch-remote
       - tests/test_release_picker.py
+      - tests/test_live_releases.py
+      - tests/test_ventura_launcher.py
+      - scripts/invalid-releases.json
       - .github/workflows/release-picker-checks.yml
 
 permissions:
@@ -33,4 +39,7 @@ jobs:
           python3 -m py_compile scripts/reims-release.py
           bash -n scripts/tahoe-launch-remote
       - name: Release-picker regression tests
-        run: python3 -m unittest discover -s tests -p test_release_picker.py -v
+        run: |
+          python3 -m unittest discover -s tests -p test_release_picker.py -v
+          python3 -m unittest discover -s tests -p test_live_releases.py -v
+          python3 -m unittest discover -s tests -p test_ventura_launcher.py -v
