@@ -95,6 +95,11 @@ jobs:
       - name: Validate Metal2Vulkan translator ports
         run: |
           set -euo pipefail
+          # The vendored Metal2Vulkan workspace is excluded from the Reims
+          # workspace and has no committed Cargo.lock. Create its own
+          # resolution before enforcing --locked; root Cargo.lock is unaffected.
+          cargo generate-lockfile --manifest-path vendor/metal2vulkan/Cargo.toml
+          test -s vendor/metal2vulkan/Cargo.lock
           cargo test --locked --manifest-path vendor/metal2vulkan/Cargo.toml \
             -p metal2vulkan-air --lib debug_info -- --test-threads=1
           cargo test --locked --manifest-path vendor/metal2vulkan/Cargo.toml \
@@ -133,6 +138,7 @@ jobs:
           grep -q 'usb-host' "$RUNNER_TEMP/devices.txt"
           find "$prefix" -type f -name ReimsVgpu.rom | grep -q .
           cp docs/upstream-stack-20261103.json "$prefix/UPSTREAM-STACK.json"
+          cp vendor/metal2vulkan/Cargo.lock "$prefix/METAL2VULKAN-CARGO.lock"
           {
             echo "Testing integration; not validated on RX 7600/Ventura/Tahoe"
             echo "Reims source: $GITHUB_SHA"
@@ -156,15 +162,16 @@ jobs:
             out/reims-combined-source.tar.gz
             out/SHA256SUMS
           retention-days: 14
+          if-no-files-found: error
       - name: Publish new immutable Testing prerelease after merging to testing
         if: github.event_name == 'push' && github.ref == 'refs/heads/testing'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="testing-combined-$GITHUB_RUN_NUMBER-${GITHUB_SHA:0:12}"
+          tag="ventura-upstream-20261106"
           gh release create "$tag" out/reims-vgpu-linux-x86_64.tar.gz \
             out/reims-combined-source.tar.gz out/SHA256SUMS \
             --target "$GITHUB_SHA" --prerelease --latest=false \
-            --title "Testing: Reims upstream stack + QEMU USB safety + Ventura picker" \
+            --title "Ventura upstream 2026-11-06: combined Reims + QEMU + Metal2Vulkan" \
             --notes "Experimental integration of Reims FIFO/decoder and Metal2Vulkan ports with QEMU THP/USB fixes. This build has passed CI but has not been validated on RX 7600 or macOS guests. Stable v0.1.3 is unchanged."
