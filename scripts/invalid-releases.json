@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "invalid_tags": [],
+  "notes": "Only add an exact release tag after the owner explicitly declares it invalid. This file is synced when launcher starts. Automatic local pruning will not remove active QEMU binaries or VM images."
+}
