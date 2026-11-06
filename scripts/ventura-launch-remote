@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# Reims-vGPU macOS Ventura release picker and launcher.
+# Online: install a published, checksum-verified GitHub Release.
+# Offline: activate a complete local bundle without contacting GitHub.
+# Never touches the VM disk, OpenCore image, existing Release tags, or Stable.
+set -euo pipefail
+
+VM=${VENTURA_VM:-ventura}
+DATA=${REIMS_CTL_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/reims-ctl}
+QEMU_ROOT="$DATA/qemu"
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/ventura-launch.log"
+PIDFILE="$DATA/vms/$VM/qemu.pid"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+mkdir -p -- "$(dirname -- "$LOG")"
+
+if [[ ! "$VM" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  echo "Invalid Ventura VM name: $VM" >&2
+  exit 2
+fi
+
+if [[ -n ${VENTURA_RELEASE_MANAGER:-} ]]; then
+  MANAGER=("$VENTURA_RELEASE_MANAGER")
+elif [[ -x $HOME/.local/bin/reims-release ]]; then
+  MANAGER=("$HOME/.local/bin/reims-release")
+elif [[ -f "$SCRIPT_DIR/reims-release.py" ]]; then
+  MANAGER=(python3 "$SCRIPT_DIR/reims-release.py")
+else
+  echo "Missing reims-release. Install scripts/reims-release.py as ~/.local/bin/reims-release." >&2
+  exit 1
+fi
+
+notify() {
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a 'macOS Ventura' "$@" >/dev/null 2>&1 || true
+  fi
+}
+
+die() {
+  echo "Ventura: $*" >&2
+  notify "Ventura launcher error" "$*"
+  exit 1
+}
+
+running() {
+  local pid
+  [[ -f "$PIDFILE" ]] || return 1
+  read -r pid < "$PIDFILE" || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null
+}
+
+valid_tag() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]+$ && "$1" != . && "$1" != .. ]]
+}
+
+cached_build() {
+  local tag=$1 folder="$QEMU_ROOT/$1"
+  valid_tag "$tag" || return 1
+  [[ -d "$folder" && ! -L "$folder" ]] || return 1
+  [[ -f "$folder/bin/reims-ctl" && -f "$folder/bin/qemu-system-x86_64" &&
+     -f "$folder/bin/qemu-img" ]]
+}
+
+index_json() {
+  local source=$1
+  if [[ "$source" == local ]]; then
+    "${MANAGER[@]}" --list --offline --json
+  else
+    "${MANAGER[@]}" --list --json
+  fi
+}
+
+show_index() {
+  local source=$1 data
+  data=$(index_json "$source") || return 1
+  printf '%s' "$data" | python3 -c '
+import json,sys
+for row in json.load(sys.stdin):
+    tag = str(row.get("tag") or "")
+    label = str(row.get("test_label") or row.get("name") or tag).replace("\n"," ").replace("\t"," ")
+    flags = (" [local]" if row.get("installed") else " [download]") + (" [selected]" if row.get("current") else "")
+    print(tag + "\t" + label + flags)
+'
+}
+
+menu() {
+  local prompt=$1
+  shift
+  local -a choices=("$@")
+  if command -v kdialog >/dev/null 2>&1; then
+    kdialog --title 'macOS Ventura · Reims versions' --menu "$prompt" "${choices[@]}" 2>/dev/null
+  elif command -v zenity >/dev/null 2>&1; then
+    printf '%s\n' "${choices[@]}" | paste -d '\t' - - |
+      zenity --list --title='macOS Ventura · Reims versions' --width=760 --height=500 \
+        --text="$prompt" --column='Tag' --column='Description' \
+        --hide-column=1 --print-column=1 2>/dev/null
+  elif [[ -t 0 ]]; then
+    local i answer idx
+    for ((i=0; i<${#choices[@]}; i+=2)); do
+      printf '%2d. %s\n' "$((i/2 + 1))" "${choices[i+1]}" >&2
+    done
+    read -r -p 'Version number (blank to cancel): ' answer
+    [[ "$answer" =~ ^[0-9]+$ ]] || return 1
+    idx=$(( (answer - 1) * 2 ))
+    ((idx >= 0 && idx < ${#choices[@]})) || return 1
+    printf '%s\n' "${choices[idx]}"
+  else
+    echo 'No GUI picker available. Use --local TAG or --tag TAG in a terminal.' >&2
+    return 1
+  fi
+}
+
+select_from() {
+  local source=$1 data tag label choice
+  local -a choices=(__back__ 'Back to sources')
+  data=$(show_index "$source") || return 1
+  while IFS=$'\t' read -r tag label; do
+    valid_tag "$tag" || continue
+    choices+=("$tag" "$label")
+  done <<< "$data"
+  (("${#choices[@]}" > 2)) || {
+    echo "No $source versions available" >&2
+    return 1
+  }
+  choice=$(menu "Choose a $source release (Ventura VM: $VM)" "${choices[@]}") || return 1
+  [[ "$choice" != __back__ ]] || return 2
+  valid_tag "$choice" || return 1
+  printf '%s:%s\n' "$source" "$choice"
+}
+
+select_version() {
+  local source result
+  while :; do
+    source=$(menu 'Choose where to select the QEMU/Reims build:' \
+      local 'Already downloaded on this computer (works offline)' \
+      remote 'GitHub Releases (download if missing)' \
+      __quit__ 'Cancel') || return 1
+    case "$source" in
+      __quit__) return 1 ;;
+      local|remote)
+        result=$(select_from "$source") && {
+          printf '%s\n' "$result"
+          return 0
+        }
+        ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<'HELP'
+Usage: ventura-launch-remote [--local TAG | --tag TAG | --list-local | --list-remote | --stop | --help]
+  no arguments : graphical/terminal selector (source then version)
+  --local TAG  : choose a downloaded build without any GitHub network check
+  --tag TAG    : choose an exact published GitHub Release, downloading if missing
+  --list-local : list all complete versions already stored locally
+  --list-remote: list GitHub Releases and their local install status
+  --stop       : shut down the existing Ventura VM (does not change versions)
+Environment:
+  VENTURA_VM=ventura                   name of an existing reims-ctl VM
+  VENTURA_RELEASE_MANAGER=/path/to/reims-release
+  REIMS_CTL_DATA_DIR=/path/to/reims-ctl
+  VENTURA_STATS=1                      enable per-frame statistics
+HELP
+}
+
+source='' tag=''
+case ${1:-} in
+  '') selection=$(select_version) || exit 0
+      source=${selection%%:*}; tag=${selection#*:} ;;
+  --local) [[ $# == 2 ]] || { usage >&2; exit 2; }
+           source=local; tag=$2 ;;
+  --tag) [[ $# == 2 ]] || { usage >&2; exit 2; }
+         source=remote; tag=$2 ;;
+  --list-local) show_index local; exit $? ;;
+  --list-remote) show_index remote; exit $? ;;
+  --stop)
+    [[ $# == 1 ]] || { usage >&2; exit 2; }
+    if ! running; then echo "Ventura is not running"; exit 0; fi
+    ctl="$QEMU_ROOT/current/bin/reims-ctl"
+    [[ -x "$ctl" ]] || die "Cannot find current reims-ctl to stop $VM"
+    "$ctl" stop "$VM"
+    exit $? ;;
+  -h|--help) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+valid_tag "$tag" || die "Invalid version tag: $tag"
+[[ -d "$DATA/vms/$VM" ]] || die "No reims-ctl VM named '$VM'. Import/create the Ventura VM before launching."
+if running; then
+  die "Ventura is already running. Stop it before changing the selected Reims version."
+fi
+
+if [[ "$source" == local ]]; then
+  cached_build "$tag" || die "No complete local installation: $tag"
+  "${MANAGER[@]}" --tag "$tag" --no-check --install-only >>"$LOG" 2>&1 ||
+    die "Could not activate cached build $tag (see $LOG)"
+else
+  if ! cached_build "$tag"; then
+    # Selecting --tag explicitly is sufficient permission in a noninteractive script.
+    if [[ -t 0 ]] && ! command -v kdialog >/dev/null && ! command -v zenity >/dev/null; then
+      read -r -p "Download verified GitHub Release '$tag'? [Y/n] " response
+      case "$response" in ''|y|Y|yes|YES) ;; *) exit 0 ;; esac
+    fi
+  fi
+  "${MANAGER[@]}" --tag "$tag" --install-only >>"$LOG" 2>&1 ||
+    die "Cannot download/select $tag (see $LOG)"
+fi
+
+ctl="$QEMU_ROOT/current/bin/reims-ctl"
+[[ -x "$ctl" ]] || die "Selected build is missing reims-ctl: $tag"
+[[ "$("$ctl" --version 2>/dev/null)" != '' ]] || die "reims-ctl did not respond"
+if [[ ${VENTURA_STATS:-0} == 1 ]]; then
+  export REIMS_VGPU_STATS=1 REIMS_CTL_SESSION_STATS=1
+fi
+unset REIMS_CTL_QEMU
+printf '%s %s source=%s tag=%s vm=%s binary=%s\n' \
+  "$(date -Is)" 'START' "$source" "$tag" "$VM" "$(readlink -f "$ctl")" >> "$LOG"
+notify 'Starting macOS Ventura' "$tag ($source)"
+if ! "$ctl" start "$VM" >>"$LOG" 2>&1; then
+  die "reims-ctl failed to start Ventura; check $LOG"
+fi
+echo "Started $VM using $tag ($source)"
