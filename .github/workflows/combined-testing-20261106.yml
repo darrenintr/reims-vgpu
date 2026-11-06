@@ -1,0 +1,165 @@
+name: Reims combined testing build and Ventura launcher
+on:
+  push:
+    branches:
+      - integration/ventura-upstream-20261106
+      - testing
+  pull_request:
+    branches:
+      - testing
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: reims-combined-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.reims-target
+      RUSTFLAGS: '-C target-cpu=x86-64-v3'
+      CARGO_PROFILE_RELEASE_LTO: fat
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '1'
+      CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+      - name: Check launcher source and release-manager tests
+        run: |
+          set -euo pipefail
+          bash -n scripts/ventura-launch-remote
+          bash -n scripts/tahoe-launch-remote
+          python3 -m py_compile scripts/reims-release.py
+          python3 -m unittest discover -s tests -p test_release_picker.py -v
+          python3 -m unittest discover -s tests -p test_ventura_launcher.py -v
+      - name: Verify pinned source and QEMU safety backports
+        run: |
+          set -euo pipefail
+          test -f docs/upstream-stack-20261103.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          m = json.loads(Path('docs/upstream-stack-20261103.json').read_text())
+          assert m["assembled"] and not m["deferred"]
+          assert "422eab5b82ebbb085cbff3dc434384406c0fffc3" in [x["commit"] for x in m["applied"]]
+          assert Path("vendor/metal2vulkan/crates/metal2vulkan-runtime/Cargo.toml").exists()
+          PY
+          git submodule update --init --depth 1 vendor/qemu ||
+            git submodule update --init vendor/qemu
+          test "$(git -C vendor/qemu rev-parse HEAD)" = b9d3bd5a9dd427ac42f6a2249c26a0b342f8f16e
+          grep -q xhci_engage_reentrancy_guard vendor/qemu/hw/usb/hcd-xhci.c
+      - name: Reclaim runner storage and install build dependencies
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git curl ca-certificates pkg-config python3 python3-venv \
+            ninja-build flex bison bzip2 cmake clang lld binutils \
+            libglib2.0-dev libpixman-1-dev libslirp-dev zlib1g-dev libfdt-dev \
+            libpipewire-0.3-dev libpulse-dev libasound2-dev libvulkan1 \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxfixes-dev libxss-dev libxtst-dev libxkbcommon-dev \
+            libwayland-dev libwayland-bin libdecor-0-dev \
+            libegl-dev libgl-dev libdrm-dev libgbm-dev libdbus-1-dev \
+            libudev-dev libusb-1.0-0-dev
+      - name: Validate lockfiles, focused modified-core tests, and controller tests
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+          cargo metadata --locked --no-deps --format-version=1 >/dev/null
+          # The old all-core suite is not a valid CI gate yet: it contains an
+          # allocation-abort case (32 GiB on the standard Actions runner).
+          # Run focused tests for each ported subsystem instead of hiding an
+          # abort inside an apparently successful full-suite status.
+          cargo test --locked -p reims-vgpu-core --lib collections -- --test-threads=2
+          cargo test --locked -p reims-vgpu-core --lib deserializer -- --test-threads=2
+          cargo test --locked -p reims-vgpu-core --lib fifo -- --test-threads=2
+          cargo test --locked -p reims-vgpu-core --lib gpu_task -- --test-threads=2
+          cargo test --locked -p reims-vgpu-core --lib rt -- --test-threads=2
+          cargo test --locked --manifest-path crates/reims-ctl/Cargo.toml
+      - name: Validate Metal2Vulkan translator ports
+        run: |
+          set -euo pipefail
+          cargo test --locked --manifest-path vendor/metal2vulkan/Cargo.toml \
+            -p metal2vulkan-air --lib debug_info -- --test-threads=2
+          cargo test --locked --manifest-path vendor/metal2vulkan/Cargo.toml \
+            -p metal2vulkan --lib engine_debug_info -- --test-threads=2
+          cargo test --locked --manifest-path vendor/metal2vulkan/Cargo.toml \
+            -p metal2vulkan --lib core_image_libraries -- --test-threads=2
+      - name: Build Vulkan library, ROM, QEMU and reims-ctl
+        run: |
+          set -euo pipefail
+          cargo xtask dist
+          prefix_lib="$CARGO_TARGET_DIR/dist-vulkan"
+          test -f "$prefix_lib/lib/pkgconfig/reims-vgpu.pc"
+          test -f "$prefix_lib/lib/libreims_vgpu.a"
+          mkdir -p "$RUNNER_TEMP/qemu-build"
+          cd "$RUNNER_TEMP/qemu-build"
+          PKG_CONFIG_PATH="$prefix_lib/lib/pkgconfig" \
+            "$GITHUB_WORKSPACE/vendor/qemu/configure" \
+              --prefix=/reims-ctl-qemu --target-list=x86_64-softmmu \
+              --enable-kvm --disable-sdl --disable-gtk --enable-slirp \
+              --enable-libusb --enable-pvg --disable-docs --disable-tests --disable-werror
+          ninja -j2
+          DESTDIR="$RUNNER_TEMP/qemu-install" ninja install
+          cd "$GITHUB_WORKSPACE"
+          cargo install --locked --path crates/reims-ctl --root "$RUNNER_TEMP/ctl-install"
+          install -m 755 "$RUNNER_TEMP/ctl-install/bin/reims-ctl" \
+            "$RUNNER_TEMP/qemu-install/reims-ctl-qemu/bin/reims-ctl"
+      - name: Smoke-test binary and package exact candidate
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/qemu-install/reims-ctl-qemu"
+          "$prefix/bin/reims-ctl" --help >/dev/null
+          "$prefix/bin/qemu-system-x86_64" --version
+          "$prefix/bin/qemu-img" --version
+          "$prefix/bin/qemu-system-x86_64" -device help > "$RUNNER_TEMP/devices.txt"
+          grep -q 'apple-gfx-pci' "$RUNNER_TEMP/devices.txt"
+          grep -q 'usb-host' "$RUNNER_TEMP/devices.txt"
+          find "$prefix" -type f -name ReimsVgpu.rom | grep -q .
+          cp docs/upstream-stack-20261103.json "$prefix/UPSTREAM-STACK.json"
+          {
+            echo "Testing integration; not validated on RX 7600/Ventura/Tahoe"
+            echo "Reims source: $GITHUB_SHA"
+            echo "QEMU: $(git -C vendor/qemu rev-parse HEAD)"
+            echo 'Metal2Vulkan: vendored, see UPSTREAM-STACK.json'
+            rustc --version
+            "$prefix/bin/qemu-system-x86_64" --version
+            echo 'Validation: selected core, controller, translator tests; static and binary smoke tests'
+            echo 'NOT checked: full core suite, guest boot, guest drivers, performance, audio/video correctness'
+          } > "$prefix/BUILD-INFO.txt"
+          mkdir -p out
+          tar -czf out/reims-vgpu-linux-x86_64.tar.gz -C "$prefix" .
+          (cd out && sha256sum reims-vgpu-linux-x86_64.tar.gz > SHA256SUMS)
+          git archive --format=tar.gz -o out/reims-combined-source.tar.gz HEAD
+      - name: Retain candidate artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reims-combined-testing-linux-x86_64
+          path: |
+            out/reims-vgpu-linux-x86_64.tar.gz
+            out/reims-combined-source.tar.gz
+            out/SHA256SUMS
+          retention-days: 14
+      - name: Publish new immutable Testing prerelease after merging to testing
+        if: github.event_name == 'push' && github.ref == 'refs/heads/testing'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="testing-combined-$GITHUB_RUN_NUMBER-${GITHUB_SHA:0:12}"
+          gh release create "$tag" out/reims-vgpu-linux-x86_64.tar.gz \
+            out/reims-combined-source.tar.gz out/SHA256SUMS \
+            --target "$GITHUB_SHA" --prerelease --latest=false \
+            --title "Testing: Reims upstream stack + QEMU USB safety + Ventura picker" \
+            --notes "Experimental integration of Reims FIFO/decoder and Metal2Vulkan ports with QEMU THP/USB fixes. This build has passed CI but has not been validated on RX 7600 or macOS guests. Stable v0.1.3 is unchanged."
