@@ -79,23 +79,24 @@ jobs:
           cargo metadata --locked --no-deps --format-version=1 >/dev/null
           # The old all-core suite is not a valid CI gate yet: it contains an
           # allocation-abort case (32 GiB on the standard Actions runner).
-          # Run focused tests for each ported subsystem instead of hiding an
-          # abort inside an apparently successful full-suite status.
-          cargo test --locked -p reims-vgpu-core --lib collections -- --test-threads=2
-          cargo test --locked -p reims-vgpu-core --lib deserializer -- --test-threads=2
-          cargo test --locked -p reims-vgpu-core --lib fifo -- --test-threads=2
-          cargo test --locked -p reims-vgpu-core --lib gpu_task -- --test-threads=2
-          cargo test --locked -p reims-vgpu-core --lib rt -- --test-threads=2
+          # Run focused tests serially: existing Lines::capture is process-global
+          # and parallel test logs can be mistaken for the selected case.
+          # Do not hide an abort inside an apparently successful full-suite status.
+          cargo test --locked -p reims-vgpu-core --lib collections -- --test-threads=1
+          cargo test --locked -p reims-vgpu-core --lib deserializer -- --test-threads=1
+          cargo test --locked -p reims-vgpu-core --lib fifo -- --test-threads=1
+          cargo test --locked -p reims-vgpu-core --lib gpu_task -- --test-threads=1
+          cargo test --locked -p reims-vgpu-core --lib rt -- --test-threads=1
           cargo test --locked --manifest-path crates/reims-ctl/Cargo.toml
       - name: Validate Metal2Vulkan translator ports
         run: |
           set -euo pipefail
           cargo test --locked --manifest-path vendor/metal2vulkan/Cargo.toml \
-            -p metal2vulkan-air --lib debug_info -- --test-threads=2
+            -p metal2vulkan-air --lib debug_info -- --test-threads=1
           cargo test --locked --manifest-path vendor/metal2vulkan/Cargo.toml \
-            -p metal2vulkan --lib engine_debug_info -- --test-threads=2
+            -p metal2vulkan --lib engine_debug_info -- --test-threads=1
           cargo test --locked --manifest-path vendor/metal2vulkan/Cargo.toml \
-            -p metal2vulkan --lib core_image_libraries -- --test-threads=2
+            -p metal2vulkan --lib core_image_libraries -- --test-threads=1
       - name: Build Vulkan library, ROM, QEMU and reims-ctl
         run: |
           set -euo pipefail
