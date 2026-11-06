@@ -41,6 +41,7 @@ jobs:
           python3 -m py_compile scripts/reims-release.py
           python3 -m unittest discover -s tests -p test_release_picker.py -v
           python3 -m unittest discover -s tests -p test_ventura_launcher.py -v
+          python3 -m unittest discover -s tests -p test_live_releases.py -v
       - name: Verify pinned source and QEMU safety backports
         run: |
           set -euo pipefail
