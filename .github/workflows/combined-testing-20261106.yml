@@ -14,7 +14,7 @@ permissions:
 
 concurrency:
   group: reims-combined-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   linux-x86_64:
