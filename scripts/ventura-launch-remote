@@ -77,7 +77,11 @@ import json,sys
 for row in json.load(sys.stdin):
     tag = str(row.get("tag") or "")
     label = str(row.get("test_label") or row.get("name") or tag).replace("\n"," ").replace("\t"," ")
-    flags = (" [local]" if row.get("installed") else " [download]") + (" [selected]" if row.get("current") else "")
+    flags = (" [local - ready]" if row.get("installed") else " [download]" if row.get("downloadable", True) else " [source only]")
+    if row.get("current"):
+        flags += " [selected]"
+    if row.get("invalid"):
+        flags += " [INVALID]"
     print(tag + "\t" + label + flags)
 '
 }
@@ -109,48 +113,27 @@ menu() {
   fi
 }
 
-select_from() {
-  local source=$1 data tag label choice
-  local -a choices=(__back__ 'Back to sources')
-  data=$(show_index "$source") || return 1
+select_version() {
+  local data tag label choice
+  local -a choices=()
+  data=$(show_index remote) || return 1
   while IFS=$'\t' read -r tag label; do
     valid_tag "$tag" || continue
+    [[ "$label" == *'[INVALID]'* ]] && continue
+    [[ "$label" == *'[source only]'* ]] && continue
     choices+=("$tag" "$label")
   done <<< "$data"
-  (("${#choices[@]}" > 2)) || {
-    echo "No $source versions available" >&2
-    return 1
-  }
-  choice=$(menu "Choose a $source release (Ventura VM: $VM)" "${choices[@]}") || return 1
-  [[ "$choice" != __back__ ]] || return 2
+  (("${#choices[@]}" > 0)) || return 1
+  choice=$(menu 'GitHub Releases · downloaded versions start locally, others download once' "${choices[@]}") || return 1
   valid_tag "$choice" || return 1
-  printf '%s:%s\n' "$source" "$choice"
-}
-
-select_version() {
-  local source result
-  while :; do
-    source=$(menu 'Choose where to select the QEMU/Reims build:' \
-      local 'Already downloaded on this computer (works offline)' \
-      remote 'GitHub Releases (download if missing)' \
-      __quit__ 'Cancel') || return 1
-    case "$source" in
-      __quit__) return 1 ;;
-      local|remote)
-        result=$(select_from "$source") && {
-          printf '%s\n' "$result"
-          return 0
-        }
-        ;;
-      *) return 1 ;;
-    esac
-  done
+  printf '%s\n' "$choice"
 }
 
 usage() {
   cat <<'HELP'
 Usage: ventura-launch-remote [--local TAG | --tag TAG | --list-local | --list-remote | --stop | --help]
-  no arguments : graphical/terminal selector (source then version)
+  no arguments : refresh GitHub Releases, show one menu, reuse downloaded builds
+  invalid tags : auto-synced from GitHub; inactive locally marked builds auto-pruned
   --local TAG  : choose a downloaded build without any GitHub network check
   --tag TAG    : choose an exact published GitHub Release, downloading if missing
   --list-local : list all complete versions already stored locally
@@ -165,9 +148,17 @@ HELP
 }
 
 source='' tag=''
+# Sync invalid markers on every normal launcher invocation and prune only
+# explicitly invalid complete builds when no QEMU is running.
 case ${1:-} in
-  '') selection=$(select_version) || exit 0
-      source=${selection%%:*}; tag=${selection#*:} ;;
+  -h|--help|--stop) ;;
+  *) if ! "${MANAGER[@]}" --prune-invalid --json >>"$LOG" 2>&1; then
+       echo 'Warning: failed to sync/prune invalid release marks (see launcher log)' >&2
+     fi ;;
+esac
+case ${1:-} in
+  '') tag=$(select_version) || exit 0
+      source=remote ;;
   --local) [[ $# == 2 ]] || { usage >&2; exit 2; }
            source=local; tag=$2 ;;
   --tag) [[ $# == 2 ]] || { usage >&2; exit 2; }
@@ -196,15 +187,14 @@ if [[ "$source" == local ]]; then
   "${MANAGER[@]}" --tag "$tag" --no-check --install-only >>"$LOG" 2>&1 ||
     die "Could not activate cached build $tag (see $LOG)"
 else
-  if ! cached_build "$tag"; then
-    # Selecting --tag explicitly is sufficient permission in a noninteractive script.
-    if [[ -t 0 ]] && ! command -v kdialog >/dev/null && ! command -v zenity >/dev/null; then
-      read -r -p "Download verified GitHub Release '$tag'? [Y/n] " response
-      case "$response" in ''|y|Y|yes|YES) ;; *) exit 0 ;; esac
-    fi
+  if cached_build "$tag"; then
+    # Local binaries are reused without a second GitHub download.
+    "${MANAGER[@]}" --tag "$tag" --no-check --install-only >>"$LOG" 2>&1 ||
+      die "Cached build $tag is invalid or cannot be activated (see $LOG)"
+  else
+    "${MANAGER[@]}" --tag "$tag" --install-only >>"$LOG" 2>&1 ||
+      die "Cannot download/select $tag (see $LOG)"
   fi
-  "${MANAGER[@]}" --tag "$tag" --install-only >>"$LOG" 2>&1 ||
-    die "Cannot download/select $tag (see $LOG)"
 fi
 
 ctl="$QEMU_ROOT/current/bin/reims-ctl"
