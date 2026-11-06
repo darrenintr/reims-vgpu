@@ -25,6 +25,11 @@ DATA = Path(os.environ.get("REIMS_CTL_DATA_DIR") or
             Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "reims-ctl")
 ROOT = DATA / "qemu"
 STATE = DATA / "release-manager.json"
+INVALID_MANIFEST_URL = (
+    f"https://raw.githubusercontent.com/{REPO}/testing/scripts/invalid-releases.json"
+)
+INVALID_CACHE = DATA / "invalid-releases-cache.json"
+LOCAL_INVALID = DATA / "invalid-releases-local.json"
 
 def fetch(url):
     headers = {
@@ -41,34 +46,40 @@ def fetch(url):
         return response.read()
 
 def release_index():
-    """Prefer the authenticated GitHub CLI to avoid the anonymous 60/hour IP limit.
-
-    The CLI uses its existing credential store; no token is printed, persisted
-    by this script or passed to asset-download redirects.
-    """
+    """Read ALL pages of the live GitHub Releases catalog."""
+    endpoint = f"repos/{REPO}/releases?per_page=100"
     if shutil.which("gh"):
         try:
             result = subprocess.run(
-                ["gh", "api", f"repos/{REPO}/releases?per_page=100"],
-                check=True, capture_output=True, text=True, timeout=40,
+                ["gh", "api", "--paginate", "--slurp", endpoint],
+                check=True, capture_output=True, text=True, timeout=90,
             )
-            return json.loads(result.stdout)
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
-            # GitHub CLI may be installed but not logged in. A GH_TOKEN,
-            # GITHUB_TOKEN, or unauthed API request can still work.
+            pages = json.loads(result.stdout)
+            if not isinstance(pages, list):
+                raise ValueError("unexpected gh API result")
+            if pages and isinstance(pages[0], dict):
+                return pages
+            return [release for page in pages for release in page]
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                ValueError, TypeError):
             pass
+
+    rows = []
     try:
-        return json.loads(fetch(API + "?per_page=100"))
+        for page in range(1, 51):
+            releases = json.loads(fetch(f"{API}?per_page=100&page={page}"))
+            if not isinstance(releases, list):
+                raise RuntimeError("unexpected GitHub Releases response")
+            rows.extend(releases)
+            if len(releases) < 100:
+                return rows
+        raise RuntimeError("Too many Releases (>5000); refusing to truncate")
     except urllib.error.HTTPError as exc:
         if exc.code in (403, 429):
             raise RuntimeError(
-                "GitHub API rate limited (HTTP 403/429). Log in with "
-                "`gh auth login` and retry; the downloader will use "
-                "authenticated `gh api` automatically. Alternatively set "
-                "GH_TOKEN or wait for GitHub's rate-limit reset."
+                "GitHub API rate limited. Use gh auth login or set GH_TOKEN."
             ) from exc
         raise
-
 
 def channel_for(release):
     tag = release.get("tag_name", "")
@@ -266,15 +277,34 @@ def selectable_releases():
     return results
 
 
+def catalog_releases():
+    """List all published Releases, including source-only ones."""
+    rows = []
+    for release in release_index():
+        if release.get("draft"):
+            continue
+        tag = release.get("tag_name") or ""
+        try:
+            safe_tag(tag)
+        except RuntimeError:
+            continue
+        assets = {asset["name"]: asset for asset in release.get("assets", [])}
+        rows.append((release, assets))
+    rows.sort(key=lambda item: item[0].get("published_at") or "", reverse=True)
+    return rows
+
+
 def record(release, assets, state):
     tag = release["tag_name"]
+    downloadable = ASSET in assets and "SHA256SUMS" in assets
     return describe_release({
         "tag": tag,
         "name": release.get("name") or tag,
         "channel": channel_for(release),
         "prerelease": bool(release.get("prerelease")),
         "published_at": release.get("published_at"),
-        "size_bytes": assets[ASSET].get("size", 0),
+        "size_bytes": assets.get(ASSET, {}).get("size", 0),
+        "downloadable": downloadable,
         "installed": valid_install(tag),
         "current": (ROOT / "current").resolve() == (ROOT / tag).resolve(),
         "description": (release.get("body") or "").splitlines()[0][:180] if release.get("body") else "",
@@ -295,6 +325,7 @@ def cached_records():
             ),
             "prerelease": not tag.startswith("v"),
             "published_at": "", "size_bytes": 0, "installed": True,
+            "downloadable": False,
             "current": (ROOT / "current").resolve() == folder.resolve(),
             "description": "Available offline (already installed)",
         })
@@ -303,32 +334,43 @@ def cached_records():
 
 
 def show_releases(offline=False, as_json=False, curated=False, diagnostics=False):
+    invalid = invalid_tags(offline=offline)
+    local_rows = cached_records()
     if offline:
-        rows = cached_records()
+        rows = local_rows
     else:
         try:
-            rows = [record(r, assets, read_state()) for r, assets in selectable_releases()]
+            rows = [record(release, assets, read_state())
+                    for release, assets in catalog_releases()]
+            known = {row["tag"] for row in rows}
+            rows.extend(row for row in local_rows if row["tag"] not in known)
         except (OSError, RuntimeError, ValueError, urllib.error.URLError) as exc:
-            print(f"GitHub release listing unavailable: {exc}; showing installed builds", file=sys.stderr)
-            rows = cached_records()
-    recommended = curated_releases(rows)
-    latest_tags = {row["tag"] for row in recommended}
+            print(f"GitHub catalog unavailable: {exc}; using local builds",
+                  file=sys.stderr)
+            rows = local_rows
     for row in rows:
-        row["historical"] = row["tag"] not in latest_tags
+        row["invalid"] = row["tag"] in invalid
+        if row["invalid"]:
+            row["test_label"] = "【已失效】 " + row["test_label"]
+    safe_rows = [row for row in rows if not row["invalid"]]
+    recommended = curated_releases(safe_rows)
+    selected_tags = {row["tag"] for row in recommended}
+    for row in rows:
+        row["historical"] = row["tag"] not in selected_tags
     if curated:
         rows = recommended
     elif diagnostics:
-        rows = diagnostic_releases(rows)
+        rows = diagnostic_releases(safe_rows)
     if as_json:
         print(json.dumps(rows, ensure_ascii=False))
     else:
         for item in rows:
-            installed = " [downloaded]" if item["installed"] else ""
-            selected = " [selected]" if item["current"] else ""
-            historical = " [history]" if item.get("historical") else ""
-            print(f"{item['tag']:47} {item['test_label']}{installed}{selected}{historical}")
+            local = " [local]" if item["installed"] else ""
+            missing = (" [source-only]" if not item["installed"]
+                       and not item.get("downloadable") else "")
+            invalid_mark = " [invalid]" if item["invalid"] else ""
+            print(f"{item['tag']:47} {item['test_label']}{local}{missing}{invalid_mark}")
     return 0 if rows else 1
-
 
 def qemu_running():
     """Do not delete any cached build while *any* QEMU system VM is running."""
@@ -479,6 +521,106 @@ def save_state(data):
     temp.write_text(json.dumps(data, indent=2) + "\n")
     os.replace(temp, STATE)
 
+def parse_invalid_manifest(data):
+    if not isinstance(data, dict) or data.get("schema_version") != 1:
+        raise ValueError("Invalid invalid-releases manifest schema")
+    values = data.get("invalid_tags")
+    if not isinstance(values, list) or len(values) > 5000:
+        raise ValueError("Invalid invalid-tags array")
+    if any(not isinstance(value, str) for value in values):
+        raise ValueError("Invalid release tag type")
+    return {safe_tag(value) for value in values}
+
+
+def read_invalid_file(path):
+    try:
+        return parse_invalid_manifest(json.loads(path.read_text()))
+    except (OSError, ValueError, RuntimeError):
+        return set()
+
+
+def invalid_tags(offline=False):
+    """Fetch explicit owner-managed invalid tags, fall back to last valid sync."""
+    if not offline:
+        try:
+            req = urllib.request.Request(INVALID_MANIFEST_URL, headers={
+                "User-Agent": "reims-release-manager/2",
+                "Cache-Control": "no-cache",
+            })
+            with urllib.request.urlopen(req, timeout=7) as response:
+                payload = json.loads(response.read())
+            marks = parse_invalid_manifest(payload)
+            INVALID_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = INVALID_CACHE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False) + "\n")
+            os.replace(tmp, INVALID_CACHE)
+        except (OSError, ValueError, RuntimeError, urllib.error.URLError) as exc:
+            print(f"Invalid-tag sync failed; using last cached marks: {exc}",
+                  file=sys.stderr)
+            marks = read_invalid_file(INVALID_CACHE)
+    else:
+        marks = read_invalid_file(INVALID_CACHE)
+    return marks | read_invalid_file(LOCAL_INVALID)
+
+
+def set_local_invalid(tag, obsolete):
+    """Mark/unmark a release on this device; remote marks remain authoritative."""
+    tag = safe_tag(tag)
+    entries = read_invalid_file(LOCAL_INVALID)
+    if obsolete:
+        entries.add(tag)
+    else:
+        entries.discard(tag)
+    LOCAL_INVALID.parent.mkdir(parents=True, exist_ok=True)
+    tmp = LOCAL_INVALID.with_suffix(".tmp")
+    tmp.write_text(json.dumps({
+        "schema_version": 1, "invalid_tags": sorted(entries)
+    }, indent=2, ensure_ascii=False) + "\n")
+    os.replace(tmp, LOCAL_INVALID)
+
+
+def prune_invalid_installs(offline=False):
+    """Auto-delete only known complete installations tagged explicitly invalid."""
+    marks = invalid_tags(offline=offline)
+    report = {"marked": sorted(marks), "removed": [], "skipped": []}
+    if not marks or not ROOT.exists():
+        return report
+    if ROOT.is_symlink() or not ROOT.is_dir():
+        raise RuntimeError("Refusing cleanup: unexpected qemu root")
+    if qemu_running():
+        report["skipped"].append("A QEMU VM is running; cleanup deferred")
+        return report
+    current = ROOT / "current"
+    if current.exists() and not current.is_symlink():
+        report["skipped"].append("qemu/current is not a symlink")
+        return report
+    for tag in sorted(marks):
+        folder = ROOT / tag
+        if not folder.exists() and not folder.is_symlink():
+            continue
+        if (folder.is_symlink() or not folder.is_dir()
+                or folder.resolve().parent != ROOT.resolve()
+                or not valid_install(tag)):
+            report["skipped"].append(f"{tag}: not a safe complete installation")
+            continue
+        if qemu_running():
+            report["skipped"].append("A QEMU VM started; stopping cleanup")
+            break
+        if current.is_symlink() and current.resolve() == folder.resolve():
+            # Fail closed for a selected build. User must switch to another
+            # working version before removing the old binaries.
+            report["skipped"].append(f"{tag}: selected; switch builds first")
+            continue
+        shutil.rmtree(folder)
+        state = read_state()
+        for key in ("stable", "testing", "current_tag"):
+            if state.get(key) == tag:
+                state.pop(key, None)
+        save_state(state)
+        report["removed"].append(tag)
+    return report
+
+
 def install(release, assets, channel):
     tag = safe_tag(release["tag_name"])
     dest = ROOT / tag
@@ -580,6 +722,12 @@ def main():
                              help="Preview obsolete downloaded builds; never deletes")
     maintenance.add_argument("--cleanup-apply", action="store_true",
                              help="Delete only previewed obsolete builds, with --confirm and --plan-id")
+    maintenance.add_argument("--prune-invalid", action="store_true",
+                             help="Sync GitHub invalid tags and remove safe invalid local builds")
+    maintenance.add_argument("--mark-invalid", metavar="TAG",
+                             help="Mark a release invalid locally (does not edit GitHub)")
+    maintenance.add_argument("--unmark-invalid", metavar="TAG",
+                             help="Remove a local invalid mark (GitHub mark still applies)")
     parser.add_argument("--confirm", action="store_true",
                         help="Required explicit confirmation for --cleanup-apply")
     parser.add_argument("--plan-id",
@@ -590,6 +738,22 @@ def main():
     args = parser.parse_args()
     if sys.platform != "linux" or os.uname().machine != "x86_64":
         parser.error("Prebuilt releases currently support Linux x86_64 only")
+    if args.mark_invalid or args.unmark_invalid:
+        tag = args.mark_invalid or args.unmark_invalid
+        set_local_invalid(tag, bool(args.mark_invalid))
+        print(f"Local release mark updated: {tag}")
+        return 0
+    if args.prune_invalid:
+        result = prune_invalid_installs(offline=args.offline)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            print(f"Removed {len(result['removed'])} explicitly invalid builds")
+            for tag in result["removed"]:
+                print("Removed: " + tag)
+            for message in result["skipped"]:
+                print("Skipped: " + message)
+        return 0
     if args.list:
         return show_releases(offline=args.offline or args.no_check,
                              as_json=args.json, curated=args.curated,
@@ -621,6 +785,8 @@ def main():
     tag = args.tag
     if tag:
         tag = safe_tag(tag)
+        if tag in invalid_tags(offline=args.no_check):
+            raise RuntimeError(f"Invalid release {tag}: launch blocked")
     elif not channel:
         if sys.stdin.isatty():
             choice = input("Release: [s]table / [t]esting (or supply --tag): ").strip().lower()
@@ -629,6 +795,8 @@ def main():
             channel = state.get("current_channel", "stable")
     if not tag:
         tag = state.get(channel) if args.no_check else None
+    if tag and tag in invalid_tags(offline=args.no_check):
+        raise RuntimeError(f"Invalid release {tag}: launch blocked")
     target = ROOT / tag if tag else None
     if args.no_check:
         if not tag:
@@ -639,6 +807,8 @@ def main():
         try:
             release, assets = fetch_releases(channel=channel, tag=tag)
             wanted = safe_tag(release["tag_name"])
+            if wanted in invalid_tags(offline=args.no_check):
+                raise RuntimeError(f"Invalid release {wanted}: launch blocked")
             if valid_install(wanted):
                 target = activate_cached(wanted, channel)
             else:

@@ -14,6 +14,9 @@ root = pathlib.Path(os.environ["REIMS_CTL_DATA_DIR"]) / "qemu"
 log = pathlib.Path(os.environ["VENTURA_TEST_MANAGER_CALLS"])
 with log.open("a") as f:
     f.write(" ".join(sys.argv[1:]) + "\n")
+if "--prune-invalid" in sys.argv:
+    print(json.dumps({"marked": [], "removed": [], "skipped": []}))
+    sys.exit(0)
 if "--list" in sys.argv:
     offline = "--offline" in sys.argv
     installed = []
@@ -132,20 +135,20 @@ class VenturaLauncherTests(unittest.TestCase):
         result = self.run_launcher("--local", "v0.1.3")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("No reims-ctl VM", result.stderr)
-        self.assertEqual(self.manager_calls(), "")
+        self.assertNotIn("--tag", self.manager_calls())
 
     def test_bad_tag_does_not_reach_release_manager(self):
         result = self.run_launcher("--local", "../outside")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Invalid version tag", result.stderr)
-        self.assertEqual(self.manager_calls(), "")
+        self.assertNotIn("--tag", self.manager_calls())
 
     def test_running_vm_does_not_switch_binary(self):
         (self.data / "vms" / "ventura" / "qemu.pid").write_text(str(os.getpid()))
         result = self.run_launcher("--tag", "testing-combined-1-0123456789ab")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("already running", result.stderr)
-        self.assertEqual(self.manager_calls(), "")
+        self.assertNotIn("--tag", self.manager_calls())
 
     def test_stop_preserves_current_build(self):
         (self.qemu / "current").symlink_to("v0.1.3")
@@ -154,6 +157,33 @@ class VenturaLauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("stop:ventura:", self.vm_calls())
         self.assertEqual((self.qemu / "current").resolve(), self.qemu / "v0.1.3")
+
+
+    def test_remote_selection_of_cached_version_never_redownloads(self):
+        result = self.run_launcher("--tag", "v0.1.3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--tag v0.1.3 --no-check --install-only", self.manager_calls())
+        self.assertIn("start:ventura:", self.vm_calls())
+
+    def test_automatic_cleanup_is_requested_before_catalog(self):
+        result = self.run_launcher("--list-remote")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.manager_calls().startswith("--prune-invalid --json\n"))
+        self.assertIn("--list --json", self.manager_calls())
+
+    def test_single_live_menu_selects_cached_version(self):
+        gui = self.home / "bin"
+        gui.mkdir()
+        kdialog = gui / "kdialog"
+        kdialog.write_text("#!/bin/sh\nprintf 'v0.1.3\n'\n")
+        kdialog.chmod(0o755)
+        self.env["PATH"] = str(gui) + os.pathsep + self.env.get("PATH", "")
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--list --json", self.manager_calls())
+        self.assertIn("--tag v0.1.3 --no-check --install-only", self.manager_calls())
+        self.assertEqual(self.vm_calls().count("start:ventura:"), 1)
+
 
 
 if __name__ == "__main__":
